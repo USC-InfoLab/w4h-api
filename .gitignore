@@ -1,8 +1,4 @@
 node_modules/*
-.idea
 .DS_Store
 .env
-dist/
-public/publications
-public/tmp
-data/news/*.json
+public/
