@@ -1,0 +1,32 @@
+{
+  "name": "xnn-service",
+  "version": "2.1.0",
+  "description": "Crosstown Foundry web services",
+  "repository": {
+    "type": "git",
+    "url": "https://bitbucket.org/imsc_usc/xnn2-service"
+  },
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "test": "echo \"Error: no test specified\" && exit 0"
+  },
+  "license": "© Xtown IMSC 2020-2022",
+  "dependencies": {
+    "axios": "^0.27.2",
+    "bcrypt": "^5.0.1",
+    "body-parser": "^1.20.0",
+    "boxen": "^5.0.1",
+    "chalk": "^4.1.0",
+    "cli-progress": "^3.11.2",
+    "commander": "^9.4.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.1",
+    "express": "^4.18.1",
+    "fs": "^0.0.1-security",
+    "fs-extra": "^10.1.0",
+    "jsonwebtoken": "^8.5.1",
+    "path": "^0.12.7",
+    "pg": "^8.8.0"
+  }
+}

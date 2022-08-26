@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+const program = require('commander');
+const boxen = require('boxen');
+const chalk = require('chalk');
+const info = chalk.cyan;
+const success = chalk.green;
+const warning = chalk.keyword('orange');
+const danger = chalk.bold.red;
+const important = chalk.yellow;
+const CONSOLE_DIR_OPTIONS = { showHidden: true, depth: Infinity, colors: true, maxArrayLength: Infinity };
+
+process.chdir(__dirname + '/..'); //set working directory to service dir
+
+const { exit } = require('process');
+require('dotenv').config();
+
+////////////////////////////////////////////////////////////////////////////////////
+
+const greeting = warning.bold(`W4H CLI`);
+const boxenOptions = {
+	padding: 1,
+	//margin: 1,
+	borderStyle: 'round',
+	borderColor: '#FFA500',
+	//backgroundColor: ''
+};
+const msgBox = boxen(greeting, boxenOptions);
+
+program.version('0.0.1').description(msgBox);
+
+program
+	.command('configuration')
+	.alias('conf')
+	.description('print configuration')
+	.action(() => {
+		let connection = JSON.parse(process.env.DB_CONNECTION);
+		delete connection.user;
+		delete connection.password;
+		console.log(important('cwd:', process.cwd()));
+		console.log(important('path:', __dirname + '/' + program._name));
+		console.log(info('configuration:'));
+		console.table(connection);
+	});
+
+///////////////////////////////////////////////////////////////////////
+
+const query = program.command('query <item>').description('print news, prints, neighborhoods and other information');
+
+query
+	.command('streaming-data')
+	.alias('sd')
+	.description('queries streaming data')
+	.action(async () => {
+		const { query } = require('../db');
+		const sql = `SELECT * FROM crime.all_cities_matview_neighborhoods WHERE neighborhood ='arleta' LIMIT 10 `;
+		const result = await query(sql);
+	
+		//console.log(result);
+		console.table(result.rows);
+	});
+
+query
+	.command('other-data')
+	.alias('od')
+	.description('queries other data')
+	.action(async () => {
+		const { query } = require('../db');
+		const sql = `SELECT * FROM crime.all_cities_matview_neighborhoods WHERE neighborhood ='downtown' LIMIT 10 `;
+		const result = await query(sql);
+	
+		//console.log(result);
+		console.table(result.rows);
+	});
+
+///////////////////////////////////////////////////////////////////////
+
+program.parse(process.argv);
