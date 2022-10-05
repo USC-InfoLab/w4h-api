@@ -31,8 +31,14 @@ function getData(req, res) {
     console.log(result);
     res.json(result.rows);
   });
+}
 
-  
+function fetchUsersGarmin(req, res) {
+  const sql = `SELECT * FROM public.geomts_users ORDER BY user_id ASC`;
+  const vals = query(sql).then(result => {
+    console.log(result);
+    res.json(result.rows);
+  });
 }
 
 module.exports = router;
