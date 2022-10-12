@@ -46,8 +46,11 @@ app.get('/user/calories/:id', function(req, res) {
   console.log(id);
   const sql = `SELECT * FROM public.calories WHERE user_id = '` + id.toString() +  `' ORDER BY user_id ASC`;
   const vals = query(sql).then(result => {
-    console.log(result);
-    res.json(result.rows);
+    var res_arr = []
+    result.rows.forEach(element => {
+      res_arr.push([Date.parse(element.timestamp), element.value])
+    });
+    res.json(res_arr);
   })
 });
 
@@ -56,8 +59,11 @@ app.get('/user/heartrate/:id', function(req, res) {
   console.log(id);
   const sql = `SELECT * FROM public.heart_rates WHERE user_id = '` + id.toString() +  `' ORDER BY user_id ASC`;
   const vals = query(sql).then(result => {
-    console.log(result);
-    res.json(result.rows);
+    var res_arr = []
+    result.rows.forEach(element => {
+      res_arr.push([Date.parse(element.timestamp), element.value])
+    });
+    res.json(res_arr);
   })
 });
 
