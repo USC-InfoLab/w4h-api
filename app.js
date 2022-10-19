@@ -57,7 +57,7 @@ app.get('/user/calories/:id', function(req, res) {
 app.get('/user/heartrate/:id', function(req, res) {
   const id = req.params.id;
   console.log(id);
-  const sql = `SELECT * FROM public.heart_rates WHERE user_id = '` + id.toString() +  `' ORDER BY user_id ASC`;
+  const sql = `SELECT * FROM public.heart_rates WHERE user_id = '` + id.toString() +  `' ORDER BY timestamp ASC`;
   const vals = query(sql).then(result => {
     var res_arr = []
     result.rows.forEach(element => {
@@ -68,7 +68,7 @@ app.get('/user/heartrate/:id', function(req, res) {
 });
 
 app.get('/calories', function(req, res) {
-  const sql = `SELECT * FROM public.calories ORDER BY user_id ASC`;
+  const sql = `SELECT * FROM public.calories ORDER BY timestamp ASC`;
   const vals = query(sql).then(result => {
     console.log(result);
     res.json(result.rows);
@@ -80,6 +80,33 @@ app.get('/heartrate', function(req, res) {
   const vals = query(sql).then(result => {
     console.log(result);
     res.json(result.rows);
+  })
+});
+
+app.get('/user/activity/:id', function(req, res) {
+  const id = req.params.id;
+  console.log(id);
+  const sql = `SELECT * FROM public.heart_rates WHERE user_id = '` + id.toString() +  `' ORDER BY timestamp ASC`;
+  const vals = query(sql).then(result => {
+    console.log(result);
+    var res_low = []
+    var res_mod = []
+    var res_high = []
+
+    result.rows.forEach(element => {
+      if (element.value < 60) {
+        res_low.push([Date.parse(element.timestamp), element.value])
+      } else if (element.value < 100 && element.value >= 60) {
+        res_mod.push([Date.parse(element.timestamp), element.value])
+      } else {
+        res_high.push([Date.parse(element.timestamp), element.value])
+      }
+    });
+    var ans = {}
+    ans['low'] = (res_low);
+    ans['moderate'] = (res_mod);
+    ans['high'] = (res_high);
+    res.json(ans);
   })
 });
 
