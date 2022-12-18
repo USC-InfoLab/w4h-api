@@ -187,8 +187,7 @@ app.get('/user/activity/:id', function (req, res) {
   })
 });
 
-app.use('/data', require('./routes/data'));
-app.use('/users', require('./routes/users'));
+//app.use('/subjects', require('./routes/subjects'));
 
 app.get('/', function (req, res) {
   res.send('W4H API');

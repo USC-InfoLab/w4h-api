@@ -8,6 +8,7 @@ router.get('/data', getData);
 router.get('/streaming-data', getStreamingData);
 // router.get('/streaming-data', auth.authenticate, getStreamingData);  //with auth
 
+//or use Promise.all()
 async function getStreamingData(req, res) {
   //auth
   // if (req.user.role !== 'admin' && req.user.role !== 'editor') {
@@ -15,9 +16,11 @@ async function getStreamingData(req, res) {
   // }
 
   const sql = `SELECT * FROM crime.all_cities_matview_neighborhoods WHERE neighborhood ='downtown' LIMIT 10 `;
-  const result = await query(sql);
+  const result1 = await query(sql1);
+  const result2 = await query(sql2);
+  const result3 = await query(sql3);
 
-  res.json(result);
+  res.json([result]);
 }
 
 function getData(req, res) {
