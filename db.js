@@ -14,7 +14,12 @@ pool.on('error', (err) => {
 
 module.exports = {
   async query(text, params) {
-    const res = await pool.query(text, params);
-    return res;
+    let result;
+    try {
+      result = await pool.query(text, params);
+    } catch (err) {
+      console.error(err);
+    }
+    return result;
   }
 };

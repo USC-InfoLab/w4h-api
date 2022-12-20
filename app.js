@@ -30,6 +30,11 @@ app.listen(process.env.PORT, () => {
   console.log('App running at: http://localhost:' + process.env.PORT);
 });
 
+//testing connection to db
+query('SELECT * FROM public.geomts_users ORDER BY user_id ASC').then(response => {
+  console.log(response);
+});
+
 //////////////////////////////////////////////////////////////////////
 
 app.get('/users', function (req, res) {
