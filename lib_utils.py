@@ -370,7 +370,7 @@ def get_existing_database_server(config_file='conf/db_config.yaml') -> list:
     config = load_config(config_file=config_file)
     database_number = config['database_number']
     for i in range(1, database_number + 1):
-        db_list_server += [config['database' + str(i)]['nickname'] + ' (' + config['database' + str(i)]['host'] + ')']
+        db_list_server += [config['database' + str(i)]['nickname']]
     return db_list_server
 
 
