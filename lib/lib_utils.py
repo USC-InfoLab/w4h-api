@@ -3,20 +3,93 @@ import datetime
 import yaml
 import sqlalchemy
 import urllib.parse
-import json
 import os
 import datetime
+from datetime import datetime as dt
+from datetime import timedelta
+from datetime import time as dt_time
 import sqlite3
+import json
 import pickle
+import streamlit as st
 from loguru import logger
 import pandas as pd
-from sqlalchemy import create_engine, text, MetaData, Table, Column, String, ForeignKey, DateTime, REAL, Integer, Float, \
-    Boolean
+from sqlalchemy import create_engine, text, MetaData, Table, Column, String, ForeignKey, DateTime, REAL, Integer, Float, Boolean
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy_utils import database_exists, create_database
-
 from geoalchemy2 import Geometry
 
+import plotly.express as px
+import plotly.graph_objs as go
+
+
+
+# -------------- nav.py --------------
+def createNav():
+    st.sidebar.title("W4H Integrated Toolkit")
+    # Using object notation
+    isLogin = st.session_state.get("login-state",False)
+    loginPage = st.sidebar.button('Log Out' if isLogin else 'Log In',use_container_width=True,type="primary")
+
+    st.sidebar.divider()
+    st.sidebar.caption("Import Historical Data / Instantiate a New W4H DB Instance")
+    importPage = st.sidebar.button("ImportHub",use_container_width=True,type="secondary")
+
+    st.sidebar.divider()
+    st.sidebar.caption("Dashboard / Analyze Subjects Data")
+
+    inputPage = st.sidebar.button("Input Page",use_container_width=True,type="secondary")
+    resultPage = st.sidebar.button("Result Page",use_container_width=True,type="secondary")
+    queryHistory = st.sidebar.button("Query History",use_container_width=True,type="secondary")
+
+    st.sidebar.divider()
+    st.sidebar.caption("Tutorial")
+    tutorial = st.sidebar.button("How to Start",use_container_width=True,type="secondary")
+
+    if (loginPage):
+        if(isLogin):
+            st.session_state["login-state"] = False
+        st.session_state["page"] = "login"
+        st.experimental_rerun()
+    if (importPage):
+        st.session_state["page"] = "import"
+        st.experimental_rerun()
+    if(inputPage):
+        st.session_state["page"] = "input"
+        st.experimental_rerun()
+    if(resultPage):
+        st.session_state["page"] = "result"
+        st.experimental_rerun()
+    if(queryHistory):
+        st.session_state["page"] = "query_history"
+        st.experimental_rerun()
+
+    if(tutorial):
+        st.session_state["page"] = "tutorial"
+        st.experimental_rerun()
+
+# -------------- query_history.py --------------
+class query_history:
+    def __init__(self,session):
+        self.data = {}
+        key_list = list(session.keys())
+        for key in key_list:
+            self.data[key] = session.get(key)
+
+    def set(self, key,value):
+        self.data[key] = value
+
+    def get(self,key):
+        return self.data[key]
+
+    def setSession(self,session):
+        key_list = list(self.data.keys())
+        for key in key_list:
+            session[key] = self.data.get(key)
+        return session
+
+
+# -------------- utils.py --------------
 class Singleton(type):
     """Metaclass implementing the Singleton pattern.
 
@@ -27,6 +100,7 @@ class Singleton(type):
 
     """
     _instances = {}
+
     def __call__(cls, *args, **kwargs):
         """Overrides the call behavior when creating an instance.
 
@@ -44,9 +118,6 @@ class Singleton(type):
             cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
         return cls._instances[cls]
 
-
-
-# ---- utils
 def load_config(config_file: str) -> dict:
     """Read the YAML config file
 
@@ -58,18 +129,21 @@ def load_config(config_file: str) -> dict:
             return yaml.safe_load(stream)
         except yaml.YAMLError as exc:
             print(exc)
-def save_config(config_file,config):
+
+def save_config(config_file, config):
     with open(config_file, 'w') as file:
         yaml.dump(config, file)
 
-def getServerIdByNickname(config_file: str='conf/config.yaml', nickname='local db'):
+def getServerIdByNickname(config_file: str = 'conf/db_config.yaml', nickname='local db'):
     config = load_config(config_file)
     server_number = config['database_number']
-    for i in range(1,server_number+1):
-        if(config["database"+str(i)]['nickname'] == nickname):
+    for i in range(1, server_number + 1):
+        if (config["database" + str(i)]['nickname'] == nickname):
             return i
-    raise Exception("No such nickname: \""+nickname+"\"")
-def get_db_engine(config_file: str='conf/config.yaml',db_server_id = 1, db_server_nickname = None, db_name=None,mixed_db_name=None) -> sqlalchemy.engine.base.Engine:
+    raise Exception("No such nickname: \"" + nickname + "\"")
+
+def get_db_engine(config_file: str = 'conf/db_config.yaml', db_server_id=1, db_server_nickname=None, db_name=None,
+                  mixed_db_name=None) -> sqlalchemy.engine.base.Engine:
     """Create a SQLAlchemy Engine instance based on the config file
 
     Args:
@@ -86,9 +160,12 @@ def get_db_engine(config_file: str='conf/config.yaml',db_server_id = 1, db_serve
     if mixed_db_name != None:
         db_server_nickname = mixed_db_name.split("] ")[0][1:]
         db_name = mixed_db_name.split("] ")[1]
+        print(mixed_db_name, "!")
+        print("server: ", db_server_nickname, "!")
+        print("db_name: ", db_name, "!")
     if db_server_nickname != None:
         db_server_id = getServerIdByNickname(nickname=db_server_nickname)
-    db_server = 'database'+str(db_server_id)
+    db_server = 'database' + str(db_server_id)
     dbms = config[db_server]['dbms']
     db_host = config[db_server]['host']
     db_port = config[db_server]['port']
@@ -166,21 +243,19 @@ def parse_query(query, default_values):
     try:
         client = openai.OpenAI()
         response = client.chat.completions.create(
-        model="gpt-3.5-turbo-1106",
-        response_format={ "type": "json_object" },
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
-            {"role": "user", "content": prompt}
-        ]
+            model="gpt-3.5-turbo-1106",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+                {"role": "user", "content": prompt}
+            ]
         )
         return json.loads(response.choices[0].message.content.strip())
     except Exception as e:
         print(f"Error in querying OpenAI: {e}")
         return None
 
-
-# ---- w4h_db_utils
-
+# -------------- w4h_db_utils.py --------------
 def create_tables(db_server_nickname: str, db_name: str, config_file='conf/config.yaml'):
     """Create the W4H tables in the database with the given name based on the config file
 
@@ -190,7 +265,7 @@ def create_tables(db_server_nickname: str, db_name: str, config_file='conf/confi
     """
     metadata = MetaData()
     config = load_config(config_file=config_file)
-    db_engine = get_db_engine(config_file, db_server_nickname=db_server_nickname, db_name=db_name)
+    db_engine = get_db_engine(db_server_nickname=db_server_nickname, db_name=db_name)
     # try:
     columns_config = config["mapping"]["columns"]
 
@@ -225,6 +300,7 @@ def create_tables(db_server_nickname: str, db_name: str, config_file='conf/confi
     #     db_engine.dispose()
     #     logger.error(err)
 
+
 def create_w4h_instance(db_server: str, db_name: str, config_file='conf/config.yaml'):
     """Create a new W4H database instance with the given name and initialize the tables based on the config file
 
@@ -232,7 +308,7 @@ def create_w4h_instance(db_server: str, db_name: str, config_file='conf/config.y
         db_name (str): Name of the database to create
         config_file (str, optional): Path to the config file. Defaults to 'conf/config.yaml'.
     """
-    db_engine_tmp = get_db_engine(config_file, db_server_nickname=db_server)
+    db_engine_tmp = get_db_engine(db_server_nickname=db_server)
     try:
         logger.info('Database engine created!')
         # Execute the SQL command to create the database if it doesn't exist
@@ -247,13 +323,12 @@ def create_w4h_instance(db_server: str, db_name: str, config_file='conf/config.y
     except Exception as err:
         logger.error(err)
         db_engine_tmp.dispose()
-    db_engine = get_db_engine(config_file, db_server_nickname=db_server, db_name=db_name)
+    db_engine = get_db_engine(db_server_nickname=db_server, db_name=db_name)
     try:
         # Enable PostGIS extension
         with db_engine.connect() as connection:
             connection.execute(text(f"CREATE EXTENSION postgis;"))
             logger.success(f"PostGIS extension enabled for {db_name}!")
-            connection.commit()
         db_engine.dispose()
     except Exception as err:
         logger.error(err)
@@ -263,7 +338,8 @@ def create_w4h_instance(db_server: str, db_name: str, config_file='conf/config.y
     create_tables(config_file=config_file, db_name=db_name, db_server_nickname=db_server)
     logger.success(f"W4H tables initialized!")
 
-def get_existing_databases(config_file='conf/config.yaml') -> list:
+
+def get_existing_databases(config_file='conf/db_config.yaml') -> list:
     """Get a list of all existing databases
 
     Args:
@@ -276,7 +352,7 @@ def get_existing_databases(config_file='conf/config.yaml') -> list:
     config = load_config(config_file=config_file)
     database_number = config['database_number']
     for i in range(1, database_number + 1):
-        db_engine = get_db_engine(config_file, db_server_id=i)
+        db_engine = get_db_engine(db_server_id=i)
         try:
             with db_engine.connect() as connection:
                 result = connection.execute(text("SELECT datname FROM pg_database WHERE datistemplate = false;"))
@@ -288,13 +364,15 @@ def get_existing_databases(config_file='conf/config.yaml') -> list:
             return db_list
     return db_list
 
-def get_existing_database_server(config_file='conf/config.yaml') -> list:
+
+def get_existing_database_server(config_file='conf/db_config.yaml') -> list:
     db_list_server = []
     config = load_config(config_file=config_file)
     database_number = config['database_number']
     for i in range(1, database_number + 1):
         db_list_server += [config['database' + str(i)]['nickname'] + ' (' + config['database' + str(i)]['host'] + ')']
     return db_list_server
+
 
 def populate_tables(df: pd.DataFrame, db_name: str, mappings: dict, config_path='conf/config.yaml'):
     """Populate the W4H tables in the given database with the data from the given dataframe based on
@@ -316,7 +394,7 @@ def populate_tables(df: pd.DataFrame, db_name: str, mappings: dict, config_path=
     user_table_name = config['mapping']['tables']['user_table']['name']
 
     # Create a session
-    engine = get_db_engine(config_path, db_name=db_name)
+    engine = get_db_engine(mixed_db_name=db_name)
     Session = sessionmaker(bind=engine)
     session = Session()
 
@@ -368,6 +446,7 @@ def populate_tables(df: pd.DataFrame, db_name: str, mappings: dict, config_path=
     session.close()
     engine.dispose()
 
+
 def populate_subject_table(df: pd.DataFrame, db_name: str, mappings: dict, config_path='conf/config.yaml'):
     """Populate the W4H tables in the given database with the data from the given dataframe based on
     the mappings between the CSV columns and the database tables.
@@ -382,7 +461,7 @@ def populate_subject_table(df: pd.DataFrame, db_name: str, mappings: dict, confi
     config = load_config(config_path)
 
     # Create a session
-    engine = get_db_engine(config_path, mixed_db_name=db_name)
+    engine = get_db_engine(mixed_db_name=db_name)
 
     # create a user table dataframe using the mappings
     user_tbl_name = config['mapping']['tables']['user_table']['name']
@@ -397,6 +476,7 @@ def populate_subject_table(df: pd.DataFrame, db_name: str, mappings: dict, confi
     # Commit the remaining changes and close the session
     engine.dispose()
 
+
 def getCurrentDbByUsername(username):
     with sqlite3.connect('user.db') as conn:
         cursor = conn.cursor()
@@ -404,16 +484,18 @@ def getCurrentDbByUsername(username):
         result = cursor.fetchone()
     return result[0]
 
+
 def updateCurrentDbByUsername(username, currentDb):
     with sqlite3.connect('user.db') as conn:
         cursor = conn.cursor()
         cursor.execute('''update users set current_db = ? where username = ?''', (currentDb, username,))
         conn.commit()
 
+
 def saveSessionByUsername(session):
     with sqlite3.connect('user.db') as conn:
         cursor = conn.cursor()
-        cursor.execute('''select query_history from users where username = ?''', (session.get('login-username'),))
+        cursor.execute('''select query_history from users where username = ?''', (session.data.get('login-username'),))
         result = cursor.fetchone()
         conn.commit()
     query_history = pickle.loads(result[0])
@@ -424,8 +506,9 @@ def saveSessionByUsername(session):
     with sqlite3.connect('user.db') as conn:
         cursor = conn.cursor()
         cursor.execute('''UPDATE users SET query_history = ? WHERE username = ?''',
-                       (serialized_object, session['login-username'],))
+                       (serialized_object, session.data['login-username'],))
         conn.commit()
+
 
 def getSessionByUsername(username):
     with sqlite3.connect('user.db') as conn:
@@ -433,9 +516,10 @@ def getSessionByUsername(username):
         cursor.execute('''select query_history from users where username = ?''', (username,))
         result = cursor.fetchone()
         conn.commit()
-
     return pickle.loads(result[0])
 
+
+# -------------- viz.py --------------
 def get_bar_fig(df, label='Feature'):
     fig = px.bar(
                 x=df.columns.tolist(),
