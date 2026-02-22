@@ -8,9 +8,10 @@
 			//for this one set PORT in .env
 			"type": "node",
 			"request": "launch",
-			"name": "app.js",
+			"name": "🥡 app.js",
 			"skipFiles": ["<node_internals>/**"],
-			"program": "${workspaceFolder}/app.js"
+			"program": "${workspaceFolder}/app.js",
+			"console": "integratedTerminal"			
 		},
 		{
 			"type": "node",

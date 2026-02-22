@@ -1,124 +1,200 @@
-const express = require('express');
+import express from 'express';
 const router = express.Router();
-const fs = require('fs-extra');
+import bcrypt from 'bcrypt';
+import { query } from '../lib/utils/db.js';
+import * as auth from '../auth.js';
+import jwt from 'jsonwebtoken';
+import { validatePassword } from '../lib/utils/password-validator.js';
 
-const auth = require('../auth');
+const SCHEMA = 'w4h';
+const TABLE = 'users';
 
-const jwt = require('jsonwebtoken')
 router.post('/login', login);
+router.post('/token-valid', tokenValid);
 router.get('/', auth.authenticate, list);
-router.get('/user:name', auth.authenticate, getByName);
+router.get('/user/:username', auth.authenticate, getByUsername);
 router.post('/add', auth.authenticate, addUser);
 router.post('/set', auth.authenticate, setUser);
-router.delete('/:name', auth.authenticate, del);
+router.delete('/:username', auth.authenticate, del);
 router.get('/roles', auth.authenticate, roles);
 
 function roles(req, res) {
   if (req.user.role !== 'admin') {
     return res.json(null);
   }
-  res.json(['editor', 'reporter', 'admin']);
+  res.json(['clinician', 'researcher', 'admin']);
 }
 
-function del(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.json(null);
-  }
-  let users = fs.readJSONSync(FC.users_file);
-  users = users.filter(d => d.name !== req.params.name);
-  fs.writeJSONSync(FC.users_file, users);
-  res.json('OK');
-}
-
-function setUser(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.json(null);
-  }
-  let users = fs.readJSONSync(FC.users_file);
-  let user = users.find(d => d.name === req.body.user.name);
-  if (user) {
-    user.username = req.body.user.username;
-    user.name = req.body.user.name;
-    user.email = req.body.user.email;
-    user.role = req.body.user.role;
-    if (req.body.user.password) {
-      const bcrypt = require('bcrypt');  
-      user.password = bcrypt.hashSync(req.body.user.password, 8);
+function tokenValid(req, res) {
+  try {
+    const { token } = req.body;
+    if (!token) {
+      return res.json({ tokenExpired: true });
     }
-    fs.writeJSONSync(FC.users_file, users);
-    res.json('OK');
-  } else {
-    res.json(null);
+    
+    // Verify the token (will throw if expired or invalid)
+    jwt.verify(token, process.env.TOKEN_SECRET);
+    res.json({ tokenExpired: false });
+  } catch (error) {
+    res.json({ tokenExpired: true });
   }
 }
 
-function addUser(req, res) {
+async function del(req, res) {
   if (req.user.role !== 'admin') {
     return res.json(null);
   }
-  let users = fs.readJSONSync(FC.users_file);
-  let newUser = req.body.user;
-  const bcrypt = require('bcrypt');  
-  newUser.password = bcrypt.hashSync(newUser.password, 8);
-  users.push(newUser);
-  fs.writeJSONSync(FC.users_file, users);
-  res.json('OK');
+  try {
+    await query(`DELETE FROM ${SCHEMA}.${TABLE} WHERE username = $1`, [req.params.username]);
+    res.json({ success: true, message: 'User deleted' });
+  } catch (error) {
+    console.error('Delete user error:', error);
+    res.status(500).json({ error: error.message });
+  }
 }
 
-function getByName(req, res) {
+async function setUser(req, res) {
   if (req.user.role !== 'admin') {
     return res.json(null);
   }
+  try {
+    const { user } = req.body;
+    
+    // Validate password if provided
+    if (user.password) {
+      const passwordValidation = validatePassword(user.password);
+      if (!passwordValidation.valid) {
+        return res.status(400).json({ error: passwordValidation.message });
+      }
+    }
+    
+    let updateQuery = `UPDATE ${SCHEMA}.${TABLE} SET name = $1, email = $2, role = $3`;
+    const params = [user.name, user.email, user.role, user.username];
 
-  let result = [];
-  const users = fs.readJSONSync(FC.users_file);
-  const user = users.find(d => d.name === req.params.name);
-  delete user.password;
-  res.json(user);
+    if (user.password) {
+      const hashedPassword = bcrypt.hashSync(user.password, 8);
+      updateQuery += `, password = $4`;
+      updateQuery += ` WHERE username = $5`;
+      params.push(hashedPassword);
+      params[3] = user.username;
+    } else {
+      updateQuery += ` WHERE username = $4`;
+    }
+
+    const result = await query(updateQuery, params);
+    if (result.rowCount > 0) {
+      res.json({ success: true, message: 'User updated' });
+    } else {
+      res.json({ error: 'User not found' });
+    }
+  } catch (error) {
+    console.error('Set user error:', error);
+    res.status(500).json({ error: error.message });
+  }
 }
 
-function list(req, res) {
+async function addUser(req, res) {
   if (req.user.role !== 'admin') {
     return res.json(null);
   }
+  try {
+    const { user } = req.body;
+    
+    // Validate password if provided
+    if (user.password) {
+      const passwordValidation = validatePassword(user.password);
+      if (!passwordValidation.valid) {
+        return res.status(400).json({ error: passwordValidation.message });
+      }
+    }
+    
+    const hashedPassword = bcrypt.hashSync(user.password, 8);
 
-  let result = [];
-  const users = fs.readJSONSync(FC.users_file);
-  users.forEach(d => {
-    result.push({ 
-      username: d.username, 
-      name: d.name, 
-      email: d.email, 
-      role: d.role
-    });
-  });
-  res.json(result);
+    await query(
+      `INSERT INTO ${SCHEMA}.${TABLE} (username, name, email, password, role) VALUES ($1, $2, $3, $4, $5)`,
+      [user.username, user.name, user.email, hashedPassword, user.role]
+    );
+    res.json({ success: true, message: 'User created' });
+  } catch (error) {
+    console.error('Add user error:', error);
+    res.status(500).json({ error: error.message });
+  }
 }
 
-function login(req, res) {
-  const users = fs.readJSONSync(FC.users_file);
-  const user = users.find(d => d.username == req.body.username)
-  if (!user) {
-    return res.json({ error: { message: "Invalid Username or Password!" } });
+async function getByUsername(req, res) {
+  if (req.user.role !== 'admin') {
+    return res.json(null);
   }
-  const bcrypt = require('bcrypt');
-  //const passwordIsValid = bcrypt.compareSync(req.body.password, bcrypt.hashSync('SHS3b527knbdRgg', 8));
-  if (!bcrypt.compareSync(req.body.password, user.password)) {
-    return res.json({ error: { message: "Invalid Username or Password!" } });
+  try {
+    const result = await query(
+      `SELECT id, username, name, email, role, created_at FROM ${SCHEMA}.${TABLE} WHERE username = $1`,
+      [req.params.username]
+    );
+    if (result.rows.length > 0) {
+      res.json(result.rows[0]);
+    } else {
+      res.json(null);
+    }
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ error: error.message });
   }
-
-  const userInfo = {
-    username: user.username, 
-    name: user.name, 
-    email: user.email, 
-    role: user.role
-  };
-
-  const auth = require("../auth");
-  const token = auth.sign(userInfo);
-  userInfo.token = token;
-  
-  res.json(userInfo);
 }
 
-module.exports = router;
+async function list(req, res) {
+  if (req.user.role !== 'admin') {
+    return res.json(null);
+  }
+  try {
+    const result = await query(
+      `SELECT id, username, name, email, role, created_at FROM ${SCHEMA}.${TABLE} ORDER BY username ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('List users error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function login(req, res) {
+  try {
+    const { username, password } = req.body;
+    
+    if (!username || !password) {
+      return res.json({ error: { message: 'Username and password are required' } });
+    }
+
+    const result = await query(
+      `SELECT id, username, name, email, password, role FROM ${SCHEMA}.${TABLE} WHERE username = $1`,
+      [username]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ error: { message: 'Invalid Username or Password!' } });
+    }
+
+    const user = result.rows[0];
+    
+    if (!bcrypt.compareSync(password, user.password)) {
+      return res.json({ error: { message: 'Invalid Username or Password!' } });
+    }
+
+    const userInfo = {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      email: user.email,
+      role: user.role
+    };
+
+    const token = auth.sign(userInfo);
+    userInfo.token = token;
+
+    res.json(userInfo);
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+export default router;

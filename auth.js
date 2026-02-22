@@ -1,4 +1,4 @@
-const jwt = require('jsonwebtoken');
+import jwt from 'jsonwebtoken';
 
 const authenticate = function(req, res, next) {
   const authorization = req.headers.authorization;
@@ -20,7 +20,14 @@ const sign = function(user) {
   return jwt.sign(user, process.env.TOKEN_SECRET, { expiresIn: 86400 });  //expires in 24h
 };
 
-module.exports = {
-  authenticate: authenticate,
-  sign: sign
+const requireAdmin = function(req, res, next) {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Access denied. Admin privileges required.' 
+    });
+  }
+  next();
 };
+
+export { authenticate, sign, requireAdmin };

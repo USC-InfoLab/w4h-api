@@ -1,17 +1,18 @@
 {
-  "name": "xnn-service",
-  "version": "2.1.0",
-  "description": "Crosstown Foundry web services",
+  "name": "w4h-api",
+  "version": "0.1.0",
+  "description": "W4H Toolkit web services",
+  "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://bitbucket.org/imsc_usc/xnn2-service"
+    "url": "https://bitbucket.org/imsc_usc/w4h-api"
   },
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
     "test": "echo \"Error: no test specified\" && exit 0"
   },
-  "license": "© Xtown IMSC 2020-2022",
+  "license": "© USC IMSC 2026-",
   "dependencies": {
     "axios": "^0.27.2",
     "bcrypt": "^5.0.1",
@@ -21,7 +22,9 @@
     "cli-progress": "^3.11.2",
     "commander": "^9.4.0",
     "cors": "^2.8.5",
+    "dayjs": "^1.11.19",
     "dotenv": "^16.0.1",
+    "execa": "^9.6.1",
     "express": "^4.18.1",
     "fs": "^0.0.1-security",
     "fs-extra": "^10.1.0",

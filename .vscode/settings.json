@@ -1,3 +1,9 @@
 {
-  "codesnap.showWindowControls": false
+  "codesnap.showWindowControls": false,
+  "markdownlint.config": {
+    "MD031": false,
+    "MD032": false,
+    "MD036": false,
+    "MD040": false
+  }
 }
