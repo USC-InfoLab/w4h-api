@@ -5,7 +5,7 @@ INSERT INTO w4h.docs (slug, title, card_title, description, action_label, doc_ty
 VALUES 
   (
     'home',
-    'Welcome to cW4H',
+    'Welcome to W4H',
     'Home',
     'Welcome to the W4H Toolkit',
     'Open',

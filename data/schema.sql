@@ -14,6 +14,44 @@ CREATE TABLE IF NOT EXISTS w4h.users (
 
 CREATE INDEX IF NOT EXISTS idx_users_username ON w4h.users(username);
 
+CREATE TABLE IF NOT EXISTS w4h.studies (
+  id text COLLATE pg_catalog."default" NOT NULL,
+  name text COLLATE pg_catalog."default" NOT NULL,
+  description text COLLATE pg_catalog."default",
+  CONSTRAINT studies_pkey PRIMARY KEY (id)
+);
+
+CREATE TABLE IF NOT EXISTS w4h.datasets (
+  id text COLLATE pg_catalog."default" NOT NULL,
+  study_id text COLLATE pg_catalog."default",
+  name text COLLATE pg_catalog."default",
+  description text COLLATE pg_catalog."default",
+  CONSTRAINT datasets_pkey1 PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_datasets_study_id ON w4h.datasets(study_id);
+
+CREATE TABLE IF NOT EXISTS w4h.user_studies (
+  user_id integer NOT NULL,
+  study_id text COLLATE pg_catalog."default" NOT NULL,
+  CONSTRAINT user_studies_pkey PRIMARY KEY (user_id, study_id),
+  CONSTRAINT user_studies_user_fk FOREIGN KEY (user_id)
+    REFERENCES w4h.users (id)
+    ON DELETE CASCADE,
+  CONSTRAINT user_studies_study_fk FOREIGN KEY (study_id)
+    REFERENCES w4h.studies (id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_studies_user_id ON w4h.user_studies(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_studies_study_id ON w4h.user_studies(study_id);
+
+ALTER TABLE IF EXISTS w4h.datasets
+  ADD COLUMN IF NOT EXISTS study_id text COLLATE pg_catalog."default";
+
+ALTER TABLE IF EXISTS w4h.datasets
+  DROP COLUMN IF EXISTS hidden;
+
 CREATE TABLE IF NOT EXISTS w4h.docs (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   slug text COLLATE pg_catalog."default" NOT NULL,

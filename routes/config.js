@@ -2,12 +2,16 @@ import express from 'express';
 const router = express.Router();
 import fs from 'fs-extra';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import pkg from 'pg';
 const { Pool } = pkg;
 import db from '../db.js';
 import * as auth from '../auth.js';
 import { initializeDatabase, createInitialAdmin, hasAnyUsers } from '../lib/db-init.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 function requireAdminIfConfigured(req, res, next) {
   if (!db.isConfigured()) {
@@ -197,7 +201,12 @@ router.post('/database', requireAdminIfConfigured, async (req, res) => {
     // Initialize database schema (create tables if needed)
     const initResult = await initializeDatabase();
     if (!initResult.success) {
-      console.warn('Database initialization warning:', initResult.error);
+      console.error('Database initialization failed:', initResult.error);
+      return res.status(500).json({
+        success: false,
+        error: 'Database configured but schema initialization failed',
+        details: initResult.error
+      });
     }
 
     let needsInitialAdmin = false;
@@ -270,6 +279,15 @@ router.post('/admin-setup', async (req, res) => {
   }
 
   try {
+    const initResult = await initializeDatabase();
+    if (!initResult.success) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to initialize database schema',
+        details: initResult.error
+      });
+    }
+
     const usersExist = await hasAnyUsers();
     if (usersExist) {
       return res.status(400).json({

@@ -11,25 +11,44 @@ router.get('/', authenticate, listDatasets);
 router.get('/:id', authenticate, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
+const DATASET_ALLOWED_ROLES = new Set(['admin', 'researcher', 'clinician']);
+
+function canAccessDatasets(user) {
+  return !!user && DATASET_ALLOWED_ROLES.has(user.role);
+}
 
 async function listStudies(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN) {
+  if (!canAccessDatasets(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  const sql = `SELECT id, name FROM w4h.studies ORDER BY name ASC`;
-  const result = await query(sql);
+  let sql = `
+    SELECT id, name
+    FROM w4h.studies
+  `;
+  const params = [];
+
+  if (req.user.role !== USER_ROLES.ADMIN) {
+    sql += `
+      WHERE EXISTS (
+        SELECT 1
+        FROM w4h.user_studies us
+        WHERE us.study_id = w4h.studies.id
+          AND us.user_id = $1
+      )
+    `;
+    params.push(req.user.id);
+  }
+
+  sql += ` ORDER BY name ASC`;
+  const result = await query(sql, params);
   res.json(result.rows);
 }
 
 async function tableInfo(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN && req.user.role !== USER_ROLES.EDITOR) {
+  if (!canAccessDatasets(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-
-  const city_id = req.user.role === USER_ROLES.ADMIN
-    ? (req.query.city_id || req.user.city_id)
-    : req.user.city_id;
 
   let columnIds = [];
   let columns = [];
@@ -37,7 +56,26 @@ async function tableInfo(req, res) {
   let partitions = [];
 
   try {
-    const queryMap = await getQueryMap(city_id);
+    const datasetAccessResult = req.user.role === USER_ROLES.ADMIN
+      ? await query(
+        `SELECT id, study_id FROM w4h.datasets WHERE id = $1`,
+        [req.query.dataset_id]
+      )
+      : await query(
+        `SELECT d.id, d.study_id
+         FROM w4h.datasets d
+         JOIN w4h.user_studies us
+           ON us.study_id = d.study_id
+         WHERE d.id = $1 AND us.user_id = $2`,
+        [req.query.dataset_id, req.user.id]
+      );
+
+    if (datasetAccessResult.rows.length === 0) {
+      return res.status(403).json({ error: 'Unauthorized for requested dataset' });
+    }
+
+    const studyId = req.query.study_id || datasetAccessResult.rows[0].study_id;
+    const queryMap = await getQueryMap(studyId);
     const dataset = queryMap.get(req.query.dataset_id);
 
     if (!dataset) {
@@ -218,27 +256,32 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
 }
 
 async function listDatasets(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN && req.user.role !== USER_ROLES.EDITOR) {
+  if (!canAccessDatasets(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  const cityId = req.user.role === USER_ROLES.ADMIN
-    ? (req.query.city_id || req.user.city_id)
-    : req.user.city_id;
-
-  const QUERY_MAP = await getQueryMap(cityId);
-
-  // 2. Fetch Datasets List
   let sql = `
-    SELECT id, name, description, hidden
-    FROM w4h.datasets
-    WHERE city_id = $1
+    SELECT d.id, d.study_id, d.name, d.description
+    FROM w4h.datasets d
   `;
-  const params = [cityId];
+  const params = [];
 
   if (req.user.role !== USER_ROLES.ADMIN) {
-    sql += ` AND hidden = false`;
+    sql += `
+      JOIN w4h.user_studies us
+        ON us.study_id = d.study_id
+    `;
+    params.push(req.user.id);
+    sql += ` WHERE us.user_id = $${params.length}`;
   }
+
+  if (req.query.study_id) {
+    params.push(req.query.study_id);
+    sql += params.length === 1 && req.user.role === USER_ROLES.ADMIN
+      ? ` WHERE d.study_id = $${params.length}`
+      : ` AND d.study_id = $${params.length}`;
+  }
+
   sql += ` ORDER BY name ASC`;
 
   const result = await query(sql, params);
@@ -256,28 +299,40 @@ async function listDatasets(req, res) {
 
   // Process datasets
   const datasets = [];
+  const queryMapByStudy = new Map();
+
   for (const d of result.rows) {
-    datasets.push(await processDataset(d, req.user, QUERY_MAP, tableConfigs.rows));
+    if (!queryMapByStudy.has(d.study_id)) {
+      queryMapByStudy.set(d.study_id, await getQueryMap(d.study_id));
+    }
+
+    datasets.push(await processDataset(d, req.user, queryMapByStudy.get(d.study_id), tableConfigs.rows));
   }
 
   res.json(datasets);
 }
 
 async function getDataset(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN && req.user.role !== USER_ROLES.EDITOR) {
+  if (!canAccessDatasets(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
   const { id } = req.params;
-  const cityId = req.user.role === USER_ROLES.ADMIN
-    ? (req.query.city_id || req.user.city_id)
-    : req.user.city_id;
-
-  // 1. Fetch the core dataset record
-  const result = await query(`SELECT id, name, description, hidden
-    FROM w4h.datasets
-    WHERE id = $1 AND city_id = $2 ${req.user.role === USER_ROLES.ADMIN ? '' : 'AND hidden = false'}`,
-    [id, cityId]);
+  const result = req.user.role === USER_ROLES.ADMIN
+    ? await query(
+      `SELECT id, study_id, name, description
+       FROM w4h.datasets
+       WHERE id = $1`,
+      [id]
+    )
+    : await query(
+      `SELECT d.id, d.study_id, d.name, d.description
+       FROM w4h.datasets d
+       JOIN w4h.user_studies us
+         ON us.study_id = d.study_id
+       WHERE d.id = $1 AND us.user_id = $2`,
+      [id, req.user.id]
+    );
 
   if (result.rows.length === 0) {
     return res.status(404).json({ error: 'Dataset not found' });
@@ -292,7 +347,7 @@ async function getDataset(req, res) {
   `, [dataset.id]);
 
   // 2. Load the hardcoded map (Backward Compatibility Base)
-  const QUERY_MAP = await getQueryMap(cityId);
+  const QUERY_MAP = await getQueryMap(dataset.study_id);
 
   const processedDataset = await processDataset(dataset, req.user, QUERY_MAP, tableConfigs.rows);
 
