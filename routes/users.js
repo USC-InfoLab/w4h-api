@@ -99,23 +99,34 @@ async function addUser(req, res) {
   }
   try {
     const { user } = req.body;
-    
-    // Validate password if provided
-    if (user.password) {
-      const passwordValidation = validatePassword(user.password);
-      if (!passwordValidation.valid) {
-        return res.status(400).json({ error: passwordValidation.message });
-      }
+
+    const username = (user.username || user.email || '').trim();
+    const email = (user.email || '').trim();
+    const name = (user.name || username || '').trim();
+    const role = user.role;
+    const password = user.password;
+
+    if (!username || !email || !role || !password) {
+      return res.status(400).json({ error: 'username, email, role, and password are required' });
     }
-    
-    const hashedPassword = bcrypt.hashSync(user.password, 8);
+
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ error: passwordValidation.message });
+    }
+
+    const hashedPassword = bcrypt.hashSync(password, 8);
 
     await query(
       `INSERT INTO ${SCHEMA}.${TABLE} (username, name, email, password, role) VALUES ($1, $2, $3, $4, $5)`,
-      [user.username, user.name, user.email, hashedPassword, user.role]
+      [username, name, email, hashedPassword, role]
     );
-    res.json({ success: true, message: 'User created' });
+    res.status(201).json({ success: true, message: 'User created' });
   } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Username or email already exists' });
+    }
+
     console.error('Add user error:', error);
     res.status(500).json({ error: error.message });
   }
@@ -147,7 +158,20 @@ async function list(req, res) {
   }
   try {
     const result = await query(
-      `SELECT id, username, name, email, role, created_at FROM ${SCHEMA}.${TABLE} ORDER BY username ASC`
+      `SELECT
+         u.id,
+         u.username,
+         u.name,
+         u.email,
+         u.role,
+         u.created_at,
+         COALESCE(ARRAY_AGG(DISTINCT us.study_id) FILTER (WHERE us.study_id IS NOT NULL), '{}') AS study_ids,
+         COALESCE(STRING_AGG(DISTINCT s.name, ', ') FILTER (WHERE s.name IS NOT NULL), '') AS studies
+       FROM ${SCHEMA}.${TABLE} u
+       LEFT JOIN ${SCHEMA}.user_studies us ON us.user_id = u.id
+       LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+       GROUP BY u.id, u.username, u.name, u.email, u.role, u.created_at
+       ORDER BY u.username ASC`
     );
     res.json(result.rows);
   } catch (error) {
