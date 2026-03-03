@@ -129,11 +129,11 @@ erDiagram
 <p>The W4H Toolkit is a platform that provides:</p>
 <ul>
   <li>
-    <a href="http://localhost:5173/docs/stories">Stories</a>
+    <a href="{{APP_URL}}/docs/stories">Stories</a>
     study data.
   </li>
   <li>
-    <a href="http://localhost:5173/docs">Docs</a> 
+    <a href="{{APP_URL}}/docs">Docs</a> 
     documentation.
   </li>
 </ul>
@@ -162,7 +162,7 @@ erDiagram
   <a href="http://localhost:5173/docs/faq">FAQ</a>
   for answers to common questions.
 </p>
-<p><a href="http://localhost:5173/docs/faq">FAQ</a></p>
+<p><a href="{{APP_URL}}/docs/faq">FAQ</a></p>
 ', '[]'::jsonb, CURRENT_TIMESTAMP),
   ('quick-start', '⚡️Quick Start', 'Quick Start', 'Get started with W4H in 5 minutes', 'Open', 'guide', 1, false, true, true, 1, '# Quick Start
 
