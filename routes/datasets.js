@@ -6,6 +6,10 @@ import { USER_ROLES } from '../lib/utils/user.js';
 import { query } from '../lib/utils/db.js';
 
 router.get('/studies', authenticate, listStudies);
+router.get('/studies-admin', authenticate, listStudiesAdmin);
+router.get('/studies-admin/:id', authenticate, getStudyAdmin);
+router.post('/studies-admin', authenticate, addStudyAdmin);
+router.put('/studies-admin/:id', authenticate, setStudyAdmin);
 router.get('/tableinfo', authenticate, tableInfo);
 router.get('/', authenticate, listDatasets);
 router.get('/:id', authenticate, getDataset);
@@ -15,6 +19,126 @@ const DATASET_ALLOWED_ROLES = new Set(['admin', 'researcher', 'clinician']);
 
 function canAccessDatasets(user) {
   return !!user && DATASET_ALLOWED_ROLES.has(user.role);
+}
+
+function isAdmin(user) {
+  return !!user && user.role === USER_ROLES.ADMIN;
+}
+
+async function listStudiesAdmin(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const result = await query(
+      `SELECT
+         s.id,
+         s.name,
+         s.description,
+         COUNT(DISTINCT d.id)::int AS dataset_count,
+         COUNT(DISTINCT us.user_id)::int AS user_count
+       FROM w4h.studies s
+       LEFT JOIN w4h.datasets d ON d.study_id = s.id
+       LEFT JOIN w4h.user_studies us ON us.study_id = s.id
+       GROUP BY s.id, s.name, s.description
+       ORDER BY s.name ASC`
+    );
+
+    return res.json(result.rows);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+async function getStudyAdmin(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const result = await query(
+      `SELECT id, name, description FROM w4h.studies WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Study not found' });
+    }
+
+    return res.json(result.rows[0]);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+async function addStudyAdmin(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const id = String(req.body?.id || '').trim();
+    const name = String(req.body?.name || '').trim();
+    const description = req.body?.description == null ? null : String(req.body.description).trim();
+
+    if (!id || !name) {
+      return res.status(400).json({ error: 'id and name are required' });
+    }
+
+    await query(
+      `INSERT INTO w4h.studies (id, name, description)
+       VALUES ($1, $2, $3)`,
+      [id, name, description || null]
+    );
+
+    // Keep admin users automatically linked to all studies.
+    await query(
+      `INSERT INTO w4h.user_studies (user_id, study_id)
+       SELECT u.id, $1
+       FROM w4h.users u
+       WHERE u.role = 'admin'
+       ON CONFLICT (user_id, study_id) DO NOTHING`,
+      [id]
+    );
+
+    return res.status(201).json({ success: true, message: 'Study created' });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Study id already exists' });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+async function setStudyAdmin(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const name = String(req.body?.name || '').trim();
+    const description = req.body?.description == null ? null : String(req.body.description).trim();
+
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    const result = await query(
+      `UPDATE w4h.studies
+       SET name = $1, description = $2
+       WHERE id = $3`,
+      [name, description || null, req.params.id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Study not found' });
+    }
+
+    return res.json({ success: true, message: 'Study updated' });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
 }
 
 async function listStudies(req, res) {

@@ -9,10 +9,57 @@ import { validatePassword } from '../lib/utils/password-validator.js';
 const SCHEMA = 'w4h';
 const TABLE = 'users';
 
+function normalizeStudyIds(input) {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return [...new Set(
+    input
+      .map(id => (id == null ? '' : String(id).trim()))
+      .filter(Boolean)
+  )];
+}
+
+async function getAllStudyIds() {
+  const result = await query(`SELECT id FROM ${SCHEMA}.studies ORDER BY name ASC`);
+  return result.rows.map(row => row.id);
+}
+
+async function syncUserStudies(userId, role, requestedStudyIds = []) {
+  const studyIds = role === 'admin'
+    ? await getAllStudyIds()
+    : normalizeStudyIds(requestedStudyIds);
+
+  await query(`DELETE FROM ${SCHEMA}.user_studies WHERE user_id = $1`, [userId]);
+
+  if (studyIds.length > 0) {
+    await query(
+      `INSERT INTO ${SCHEMA}.user_studies (user_id, study_id)
+       SELECT $1, UNNEST($2::text[])
+       ON CONFLICT (user_id, study_id) DO NOTHING`,
+      [userId, studyIds]
+    );
+  }
+
+  return studyIds;
+}
+
+async function ensureAdminAssignedToAllStudies(userId) {
+  await query(
+    `INSERT INTO ${SCHEMA}.user_studies (user_id, study_id)
+     SELECT $1, s.id
+     FROM ${SCHEMA}.studies s
+     ON CONFLICT (user_id, study_id) DO NOTHING`,
+    [userId]
+  );
+}
+
 router.post('/login', login);
 router.post('/token-valid', tokenValid);
 router.get('/', auth.authenticate, list);
 router.get('/user/:email', auth.authenticate, getByEmail);
+router.post('/profile', auth.authenticate, updateProfile);
 router.post('/add', auth.authenticate, addUser);
 router.post('/set', auth.authenticate, setUser);
 router.delete('/:email', auth.authenticate, del);
@@ -45,6 +92,19 @@ async function del(req, res) {
     return res.json(null);
   }
   try {
+    const targetResult = await query(
+      `SELECT id, role, email FROM ${SCHEMA}.${TABLE} WHERE email = $1`,
+      [req.params.email]
+    );
+
+    if (targetResult.rowCount === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (targetResult.rows[0].role === 'admin') {
+      return res.status(400).json({ error: 'Admin users cannot be deleted' });
+    }
+
     await query(`DELETE FROM ${SCHEMA}.${TABLE} WHERE email = $1`, [req.params.email]);
     res.json({ success: true, message: 'User deleted' });
   } catch (error) {
@@ -59,6 +119,30 @@ async function setUser(req, res) {
   }
   try {
     const { user } = req.body;
+    const targetId = user.id || null;
+    const targetEmail = (user.original_email || user.email || '').trim();
+
+    if (!targetId && !targetEmail) {
+      return res.status(400).json({ error: 'User id or email is required' });
+    }
+
+    const identifyValue = targetId || targetEmail;
+    const identifyClause = targetId ? 'id = $1' : 'email = $1';
+    const existingResult = await query(
+      `SELECT id, role FROM ${SCHEMA}.${TABLE} WHERE ${identifyClause}`,
+      [identifyValue]
+    );
+
+    if (existingResult.rowCount === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const existingUser = existingResult.rows[0];
+    if (existingUser.role === 'admin' && user.role !== 'admin') {
+      return res.status(400).json({ error: 'Admin role cannot be changed' });
+    }
+
+    const effectiveRole = existingUser.role === 'admin' ? 'admin' : user.role;
     
     // Validate password if provided
     if (user.password) {
@@ -68,21 +152,28 @@ async function setUser(req, res) {
       }
     }
     
-    let updateQuery = `UPDATE ${SCHEMA}.${TABLE} SET name = $1, email = $2, role = $3`;
-    const params = [user.name, user.email, user.role, user.email];
+    const fields = [`name = $1`, `email = $2`, `role = $3`];
+    const params = [user.name, user.email, effectiveRole];
 
     if (user.password) {
       const hashedPassword = bcrypt.hashSync(user.password, 8);
-      updateQuery += `, password = $4`;
-      updateQuery += ` WHERE email = $5`;
       params.push(hashedPassword);
-      params[3] = user.email;
-    } else {
-      updateQuery += ` WHERE email = $4`;
+      fields.push(`password = $${params.length}`);
     }
 
-    const result = await query(updateQuery, params);
+    params.push(targetId || targetEmail);
+    const whereClause = targetId ? `id = $${params.length}` : `email = $${params.length}`;
+
+    const result = await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET ${fields.join(', ')}
+       WHERE ${whereClause}
+       RETURNING id, role`,
+      params
+    );
+
     if (result.rowCount > 0) {
+      await syncUserStudies(result.rows[0].id, result.rows[0].role, user.study_ids || []);
       res.json({ success: true, message: 'User updated' });
     } else {
       res.json({ error: 'User not found' });
@@ -116,10 +207,14 @@ async function addUser(req, res) {
 
     const hashedPassword = bcrypt.hashSync(password, 8);
 
-    await query(
-      `INSERT INTO ${SCHEMA}.${TABLE} (name, email, password, role) VALUES ($1, $2, $3, $4)`,
+    const insertResult = await query(
+      `INSERT INTO ${SCHEMA}.${TABLE} (name, email, password, role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, role`,
       [name, email, hashedPassword, role]
     );
+
+    await syncUserStudies(insertResult.rows[0].id, insertResult.rows[0].role, user.study_ids || []);
     res.status(201).json({ success: true, message: 'User created' });
   } catch (error) {
     if (error.code === '23505') {
@@ -131,13 +226,98 @@ async function addUser(req, res) {
   }
 }
 
+async function updateProfile(req, res) {
+  try {
+    const { user } = req.body;
+    const updates = [];
+    const params = [];
+
+    if (user?.name !== undefined) {
+      params.push(user.name);
+      updates.push(`name = $${params.length}`);
+    }
+
+    if (user?.password) {
+      const passwordValidation = validatePassword(user.password);
+      if (!passwordValidation.valid) {
+        return res.status(400).json({ error: passwordValidation.message });
+      }
+
+      const hashedPassword = bcrypt.hashSync(user.password, 8);
+      params.push(hashedPassword);
+      updates.push(`password = $${params.length}`);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No profile changes provided' });
+    }
+
+    params.push(req.user.id);
+    const result = await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET ${updates.join(', ')}
+       WHERE id = $${params.length}
+       RETURNING id, name, email, role`,
+      params
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const updatedUser = result.rows[0];
+    const token = auth.sign(updatedUser);
+    return res.json({ success: true, user: { ...updatedUser, token } });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+}
+
 async function getByEmail(req, res) {
   if (req.user.role !== 'admin') {
     return res.json(null);
   }
   try {
     const result = await query(
-      `SELECT id, name, email, role, created_at FROM ${SCHEMA}.${TABLE} WHERE email = $1`,
+      `SELECT
+         u.id,
+         u.name,
+         u.email,
+         u.role,
+         u.created_at,
+         CASE
+           WHEN u.role = 'admin' THEN COALESCE(
+             (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.studies s),
+             '{}'
+           )
+           ELSE COALESCE(
+             (
+               SELECT ARRAY_AGG(us.study_id ORDER BY s.name)
+               FROM ${SCHEMA}.user_studies us
+               LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+               WHERE us.user_id = u.id
+             ),
+             '{}'
+           )
+         END AS study_ids,
+         CASE
+           WHEN u.role = 'admin' THEN COALESCE(
+             (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.studies s),
+             ''
+           )
+           ELSE COALESCE(
+             (
+               SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
+               FROM ${SCHEMA}.user_studies us
+               LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+               WHERE us.user_id = u.id
+             ),
+             ''
+           )
+         END AS studies
+       FROM ${SCHEMA}.${TABLE} u
+       WHERE u.email = $1`,
       [req.params.email]
     );
     if (result.rows.length > 0) {
@@ -163,12 +343,37 @@ async function list(req, res) {
          u.email,
          u.role,
          u.created_at,
-         COALESCE(ARRAY_AGG(DISTINCT us.study_id) FILTER (WHERE us.study_id IS NOT NULL), '{}') AS study_ids,
-         COALESCE(STRING_AGG(DISTINCT s.name, ', ') FILTER (WHERE s.name IS NOT NULL), '') AS studies
+         CASE
+           WHEN u.role = 'admin' THEN COALESCE(
+             (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.studies s),
+             '{}'
+           )
+           ELSE COALESCE(
+             (
+               SELECT ARRAY_AGG(us.study_id ORDER BY s.name)
+               FROM ${SCHEMA}.user_studies us
+               LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+               WHERE us.user_id = u.id
+             ),
+             '{}'
+           )
+         END AS study_ids,
+         CASE
+           WHEN u.role = 'admin' THEN COALESCE(
+             (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.studies s),
+             ''
+           )
+           ELSE COALESCE(
+             (
+               SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
+               FROM ${SCHEMA}.user_studies us
+               LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+               WHERE us.user_id = u.id
+             ),
+             ''
+           )
+         END AS studies
        FROM ${SCHEMA}.${TABLE} u
-       LEFT JOIN ${SCHEMA}.user_studies us ON us.user_id = u.id
-       LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
-       GROUP BY u.id, u.name, u.email, u.role, u.created_at
        ORDER BY u.email ASC`
     );
     res.json(result.rows);
@@ -200,6 +405,10 @@ async function login(req, res) {
     
     if (!bcrypt.compareSync(password, user.password)) {
       return res.json({ error: { message: 'Invalid Email or Password!' } });
+    }
+
+    if (user.role === 'admin') {
+      await ensureAdminAssignedToAllStudies(user.id);
     }
 
     const userInfo = {
