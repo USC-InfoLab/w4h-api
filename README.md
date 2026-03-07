@@ -1,12 +1,11 @@
-# W4H dashboard api
+# W4H API
 
 ## Setup
 
 ```bash
-cp .env.example .env  #edit and configure
+cp .env.example .env  #do not edit for initial set up
 npm install
-node app.js  #run dev
-npm start  #same as node app.js
+npm start  #or node app.js
 ```
 
 ## CLI

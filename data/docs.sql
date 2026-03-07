@@ -80,7 +80,7 @@ erDiagram
 
 <ul>
   <li>
-    <a href="{{APP_URL}}/docs/stories">Stories</a>
+    <a href="{{APP_URL}}/docs/studies">Studies</a>
     study data.
   </li>
   <li>
@@ -129,7 +129,7 @@ erDiagram
 <p>The W4H Toolkit is a platform that provides:</p>
 <ul>
   <li>
-    <a href="{{APP_URL}}/docs/stories">Stories</a>
+    <a href="{{APP_URL}}/docs/studies">Studies</a>
     study data.
   </li>
   <li>
