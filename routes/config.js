@@ -63,6 +63,20 @@ router.get('/status', (req, res) => {
 });
 
 /**
+ * GET /config/database-settings
+ * Get current database settings (even if not fully configured)
+ * Public endpoint - no auth required
+ */
+router.get('/database-settings', (req, res) => {
+  res.json({
+    host: process.env.DB_HOST || '',
+    port: process.env.DB_PORT || '5432',
+    database: process.env.DB_DATABASE || '',
+    user: process.env.DB_USER || ''
+  });
+});
+
+/**
  * POST /config/database
  * Configure database credentials
  * Body: { host, port, database, user, password }
@@ -293,12 +307,12 @@ router.post('/database', requireAdminIfConfigured, async (req, res) => {
  * Public endpoint only when no users exist yet
  */
 router.post('/admin-setup', async (req, res) => {
-  const { username, email, password, name } = req.body;
+  const { email, password, name } = req.body;
 
-  if (!username || !email || !password) {
+  if (!email || !password) {
     return res.status(400).json({
       success: false,
-      error: 'username, email, and password are required'
+      error: 'email and password are required'
     });
   }
 
@@ -321,7 +335,6 @@ router.post('/admin-setup', async (req, res) => {
     }
 
     const adminResult = await createInitialAdmin({
-      username: username.trim(),
       email: email.trim(),
       password,
       name: name ? name.trim() : undefined
@@ -335,7 +348,7 @@ router.post('/admin-setup', async (req, res) => {
     }
 
     const token = auth.sign({
-      username: adminResult.user.username,
+      email: adminResult.user.email,
       role: 'admin',
       firstTimeLogin: true
     });
@@ -345,7 +358,6 @@ router.post('/admin-setup', async (req, res) => {
       message: 'Initial admin account created successfully',
       token,
       user: {
-        username: adminResult.user.username,
         email: adminResult.user.email,
         name: adminResult.user.name,
         role: 'admin',
