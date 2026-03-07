@@ -5,6 +5,7 @@ import { query } from '../lib/utils/db.js';
 import * as auth from '../auth.js';
 import jwt from 'jsonwebtoken';
 import { validatePassword } from '../lib/utils/password-validator.js';
+import { isMailerConfigured, sendMail } from '../lib/mailer.js';
 
 const SCHEMA = 'w4h';
 const TABLE = 'users';
@@ -215,7 +216,26 @@ async function addUser(req, res) {
     );
 
     await syncUserStudies(insertResult.rows[0].id, insertResult.rows[0].role, user.study_ids || []);
-    res.status(201).json({ success: true, message: 'User created' });
+
+    let mailWarning = null;
+    if (isMailerConfigured()) {
+      try {
+        await sendMail({
+          to: email,
+          subject: 'Your W4H account is ready',
+          text: `Hello ${name},\n\nAn account has been created for you in W4H with role: ${role}.\nYou can now sign in to the W4H portal.\n`,
+          html: `<p>Hello ${name},</p><p>An account has been created for you in <strong>W4H</strong> with role: <strong>${role}</strong>.</p><p>You can now sign in to the W4H portal.</p>`
+        });
+      } catch (mailError) {
+        mailWarning = mailError.message;
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'User created',
+      ...(mailWarning ? { mailWarning: `User created but email failed: ${mailWarning}` } : {})
+    });
   } catch (error) {
     if (error.code === '23505') {
       return res.status(409).json({ error: 'Email already exists' });
