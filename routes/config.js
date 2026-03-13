@@ -40,12 +40,10 @@ async function writeEnvValues(keyValues) {
 
   Object.keys(keyValues).forEach((key) => {
     const value = keyValues[key] ?? '';
-    const regex = new RegExp(`^${key}=.*$`, 'm');
-    if (regex.test(envContent)) {
-      envContent = envContent.replace(regex, `${key}=${value}`);
-    } else {
-      envContent += `\n${key}=${value}`;
-    }
+    const regex = new RegExp(`^${key}=.*$`, 'gm');
+    // Remove all existing occurrences, then append once
+    envContent = envContent.replace(regex, '').replace(/\n{2,}/g, '\n');
+    envContent = envContent.trimEnd() + `\n${key}=${value}`;
     process.env[key] = String(value);
   });
 
@@ -339,12 +337,10 @@ router.post('/database', requireAdminIfConfigured, async (req, res) => {
     };
 
     Object.keys(dbConfig).forEach(key => {
-      const regex = new RegExp(`^${key}=.*$`, 'm');
-      if (regex.test(envContent)) {
-        envContent = envContent.replace(regex, `${key}=${dbConfig[key]}`);
-      } else {
-        envContent += `\n${key}=${dbConfig[key]}`;
-      }
+      const regex = new RegExp(`^${key}=.*$`, 'gm');
+      // Remove all existing occurrences, then append once
+      envContent = envContent.replace(regex, '').replace(/\n{2,}/g, '\n');
+      envContent = envContent.trimEnd() + `\n${key}=${dbConfig[key]}`;
     });
 
     await fs.writeFile(envPath, envContent.trim() + '\n');
@@ -650,6 +646,14 @@ router.get('/docs-backup', requireAdminIfConfigured, async (req, res) => {
 
     const ts = dayjs().format('YYYY-MM-DD_HH-mm-ss');
     const filename = `docs-backup-${ts}.sql`;
+
+    // In dev mode, save to data/docs.sql and return without sql payload
+    const isDev = process.env.NODE_ENV !== 'production';
+    if (isDev) {
+      const docsPath = path.join(__dirname, '..', 'data', 'docs.sql');
+      await fs.writeFile(docsPath, sql, 'utf8');
+      return res.json({ success: true, saved: 'data/docs.sql' });
+    }
 
     res.json({
       success: true,
