@@ -5,13 +5,6 @@
 	"version": "0.2.0",
 	"configurations": [
 		{
-			"name": "🚀 Launch App",
-			"request": "launch",
-			"type": "editor-browser",
-			"url": "http://localhost:5173",
-			"webRoot": "${workspaceFolder}"
-		},
-		{
 			//for this one set PORT in .env
 			"type": "node",
 			"request": "launch",
