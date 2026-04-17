@@ -20,6 +20,8 @@ import mailer from './routes/mailer.js';
 import datasets from './routes/datasets.js';
 import docs from './routes/docs.js';
 import config from './routes/config.js';
+import platform from './routes/platform.js';
+import projects from './routes/projects.js';
 
 const app = express();
 app.use(cors());
@@ -49,6 +51,8 @@ app.use('/mailer', mailer);
 app.use('/datasets', datasets);
 app.use('/docs', docs);
 app.use('/config', config);
+app.use('/platform', platform);
+app.use('/projects', projects);
 
 app.get('/', async function (req, res) {
   const { stdout } = await execa`git rev-parse --short HEAD`;
