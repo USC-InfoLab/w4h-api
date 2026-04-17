@@ -37,7 +37,7 @@ VALUES
 
 - [X] Set up issue tracking (Linear or GitHub) @Luciano
 - [ ] Set up the team @Luciano
-- [ ] CI/CD with GitHub and possibly GitHub or a customized system
+- [ ] CI/CD with GitHub and possibly GitHub or a customized system (@bhargav)
 - [ ] Update README with initial setup (add a high-level component diagram) @Tracy)
 - [ ] Finish User Management (@Luciano)
 - [ ] Finish Project Management (including db)
