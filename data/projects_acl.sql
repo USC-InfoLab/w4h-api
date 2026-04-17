@@ -105,4 +105,15 @@ CREATE TABLE IF NOT EXISTS w4h.project_db_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_project_db_tokens_lookup ON w4h.project_db_tokens(project_id, user_id, expires_at);
 
+COMMENT ON TABLE w4h.projects IS 'Research project shell: metadata, IRB references, visibility.';
+COMMENT ON COLUMN w4h.projects.slug IS 'URL-safe unique key for routing and APIs.';
+COMMENT ON COLUMN w4h.projects.visibility IS 'org-private | project-private | internal — complements row-level ACL.';
+
+COMMENT ON TABLE w4h.project_members IS 'Collaborators and coarse roles for the project hub.';
+COMMENT ON TABLE w4h.project_datasets IS 'Which catalog datasets are linked to this project and read/write intent.';
+COMMENT ON TABLE w4h.project_notebooks IS 'Notebook/repo pointers only; execution happens in external runtimes.';
+COMMENT ON TABLE w4h.project_docs IS 'Links project hub to internal docs (w4h.docs) by slug.';
+COMMENT ON TABLE w4h.project_acl_rules IS 'Fine-grained allow/deny rules; evaluate with project role and membership.';
+COMMENT ON TABLE w4h.project_db_tokens IS 'Short-lived project-scoped secrets; store SHA-256 hash only, never raw token.';
+
 COMMIT;

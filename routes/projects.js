@@ -2,14 +2,21 @@ import express from 'express';
 import crypto from 'crypto';
 
 import { authenticate } from '../auth.js';
+import { authenticateJwtOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
 import { query } from '../lib/utils/db.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 
 const router = express.Router();
 
 router.get('/', authenticate, listProjects);
-router.get('/:id', authenticate, getProjectOverview);
 router.post('/', authenticate, createProject);
+
+router.get('/:id/db-tokens', authenticate, listProjectDbTokens);
+router.delete('/:id/db-tokens/:tokenId', authenticate, revokeProjectDbToken);
+router.get('/:id/acl', authenticate, getProjectAclRules);
+
+router.get('/:id', authenticateJwtOrProjectDbToken, getProjectOverview);
+
 router.patch('/:id', authenticate, updateProject);
 router.put('/:id/members', authenticate, replaceProjectMembers);
 router.put('/:id/datasets', authenticate, replaceProjectDatasets);
@@ -157,13 +164,21 @@ async function getProjectOverview(req, res) {
       )
     ]);
 
+    const canManage = !req.authViaProjectDbToken && (await canManageProject(projectId, req.user));
+    const canIssueDbToken = !req.authViaProjectDbToken && (await canReadProject(projectId, req.user));
+
     res.json({
       project: projectRes.rows[0],
       members: membersRes.rows,
       datasets: datasetsRes.rows,
       notebooks: notebooksRes.rows,
       docs: docsRes.rows,
-      organizations: orgsRes.rows
+      organizations: orgsRes.rows,
+      capabilities: {
+        can_manage: canManage,
+        can_issue_db_token: canIssueDbToken,
+        auth_via_project_token: Boolean(req.authViaProjectDbToken)
+      }
     });
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to load project overview' });
@@ -253,6 +268,15 @@ async function updateProject(req, res) {
   }
 }
 
+async function resolveMemberUserId(row) {
+  let userId = Number(row?.user_id);
+  if (Number.isInteger(userId)) return userId;
+  const email = row?.email == null ? '' : String(row.email).trim();
+  if (!email) return null;
+  const found = await query(`SELECT id FROM w4h.users WHERE lower(trim(email)) = lower(trim($1))`, [email]);
+  return found.rowCount ? found.rows[0].id : null;
+}
+
 async function replaceProjectMembers(req, res) {
   const projectId = req.params.id;
   if (!(await canManageProject(projectId, req.user))) {
@@ -262,13 +286,29 @@ async function replaceProjectMembers(req, res) {
   try {
     const members = Array.isArray(req.body?.members) ? req.body.members : [];
     const allowedRoles = new Set(['owner', 'editor', 'viewer', 'admin']);
+    const resolved = [];
+
+    for (const row of members) {
+      const role = String(row?.role || 'viewer');
+      if (!allowedRoles.has(role)) continue;
+      const userId = await resolveMemberUserId(row);
+      if (!Number.isInteger(userId)) continue;
+      resolved.push({ userId, role });
+    }
+
+    const byUser = new Map();
+    for (const { userId, role } of resolved) {
+      byUser.set(userId, role);
+    }
+    const finalList = [...byUser.entries()].map(([userId, role]) => ({ userId, role }));
+
+    if (!finalList.some((m) => m.role === 'owner')) {
+      return res.status(400).json({ error: 'At least one member must have the owner role' });
+    }
 
     await query(`DELETE FROM w4h.project_members WHERE project_id = $1::uuid`, [projectId]);
 
-    for (const row of members) {
-      const userId = Number(row?.user_id);
-      const role = String(row?.role || 'viewer');
-      if (!Number.isInteger(userId) || !allowedRoles.has(role)) continue;
+    for (const { userId, role } of finalList) {
       await query(
         `INSERT INTO w4h.project_members (project_id, user_id, role, invited_by)
          VALUES ($1::uuid, $2, $3, $4)
@@ -278,7 +318,7 @@ async function replaceProjectMembers(req, res) {
     }
 
     const fresh = await query(
-      `SELECT pm.user_id, pm.role, pm.joined_at, u.name, u.email
+      `SELECT pm.user_id, pm.role, pm.joined_at, u.name, u.email, u.role AS user_role
        FROM w4h.project_members pm
        JOIN w4h.users u ON u.id = pm.user_id
        WHERE pm.project_id = $1::uuid
@@ -418,8 +458,77 @@ async function replaceProjectDocs(req, res) {
   }
 }
 
+async function listProjectDbTokens(req, res) {
+  const projectId = req.params.id;
+  if (!(await canManageProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const rows = await query(
+      `SELECT t.id, t.user_id, t.issued_at, t.expires_at, t.revoked_at,
+              u.email, u.name
+       FROM w4h.project_db_tokens t
+       JOIN w4h.users u ON u.id = t.user_id
+       WHERE t.project_id = $1::uuid
+       ORDER BY t.issued_at DESC`,
+      [projectId]
+    );
+    res.json(rows.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to list tokens' });
+  }
+}
+
+async function revokeProjectDbToken(req, res) {
+  const projectId = req.params.id;
+  const tokenId = req.params.tokenId;
+  if (!(await canManageProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const updated = await query(
+      `UPDATE w4h.project_db_tokens
+       SET revoked_at = NOW()
+       WHERE id = $1::uuid AND project_id = $2::uuid AND revoked_at IS NULL
+       RETURNING id`,
+      [tokenId, projectId]
+    );
+    if (!updated.rowCount) {
+      return res.status(404).json({ error: 'Token not found or already revoked' });
+    }
+    res.json({ success: true, id: updated.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to revoke token' });
+  }
+}
+
+async function getProjectAclRules(req, res) {
+  const projectId = req.params.id;
+  if (!(await canManageProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const rows = await query(
+      `SELECT id, subject_type, subject_key, resource_type, resource_key, permission, effect, created_at
+       FROM w4h.project_acl_rules
+       WHERE project_id = $1::uuid
+       ORDER BY created_at ASC`,
+      [projectId]
+    );
+    res.json(rows.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load ACL rules' });
+  }
+}
+
 async function issueProjectDbToken(req, res) {
   const projectId = req.params.id;
+  if (req.authViaProjectDbToken) {
+    return res.status(403).json({ error: 'Issue tokens using app login, not a project token' });
+  }
   if (!(await canReadProject(projectId, req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
