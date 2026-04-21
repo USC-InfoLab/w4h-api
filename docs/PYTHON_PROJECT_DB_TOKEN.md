@@ -54,6 +54,7 @@ r2 = requests.get(
 )
 r2.raise_for_status()
 overview = r2.json()
+# overview includes: project, members, datasets, notebooks, docs, organizations, acl_rules, capabilities
 ```
 
 ### 3) Operational hygiene

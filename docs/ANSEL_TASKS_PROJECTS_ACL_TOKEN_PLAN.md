@@ -28,6 +28,7 @@ This file ties together the three assigned tasks with **where to look in the rep
 | File | Contents |
 |------|----------|
 | [data/projects_acl.sql](../data/projects_acl.sql) | `w4h.projects`, `project_members`, `project_datasets`, `project_notebooks`, `project_docs`, `project_acl_rules`, `project_db_tokens` + `COMMENT ON` for metadata |
+| [data/projects_launchers_migration.sql](../data/projects_launchers_migration.sql) | Adds `w4h.projects.launchers` JSONB for Jupyter/RStudio/VSCode base URLs |
 
 Apply after core schema (`data/schema.sql`). Safe to re-run (`IF NOT EXISTS`).
 
@@ -47,6 +48,7 @@ Apply after core schema (`data/schema.sql`). Safe to re-run (`IF NOT EXISTS`).
 | PUT | `/projects/:id/datasets` | Replace links |
 | PUT | `/projects/:id/notebooks` | Replace notebook metadata |
 | PUT | `/projects/:id/docs` | Replace doc slugs (must exist in `w4h.docs`) |
+| PUT | `/projects/:id/acl` | Replace fine-grained ACL rules (`rules: [...]`) |
 | POST | `/projects/:id/db-token` | Mint token (JWT only) |
 | GET | `/projects/:id/db-tokens` | List rows (managers) |
 | DELETE | `/projects/:id/db-tokens/:tokenId` | Revoke (managers) |
@@ -65,8 +67,10 @@ Apply after core schema (`data/schema.sql`). Safe to re-run (`IF NOT EXISTS`).
 | `capabilities.can_manage` | Show edit members, dataset linking, revoke tokens |
 | `capabilities.can_issue_db_token` | Show “Issue project token” |
 | `capabilities.auth_via_project_token` | Hide mutating actions (read-only session) |
+| `acl_rules[]` | Fine-grained rules (also editable via **Save ACL rules** in UI) |
+| `project.launchers` | `jupyterBaseUrl`, `rstudioBaseUrl`, `vscodeTemplate` — persisted via `PATCH /projects/:id` |
 
-Launcher URLs (Jupyter/RStudio/VSCode) remain **client-side preferences** in local storage until a project-level column is added.
+Launcher URLs are stored in **`w4h.projects.launchers`** after running `projects_launchers_migration.sql`.
 
 ---
 
