@@ -23,6 +23,7 @@ router.post('/:id/members', authenticate, addProjectMember);
 router.patch('/:id/members/:userId', authenticate, updateProjectMemberRole);
 router.delete('/:id/members/:userId', authenticate, removeProjectMember);
 router.put('/:id/members', authenticate, replaceProjectMembers);
+router.put('/:id/organizations', authenticate, replaceProjectOrganizations);
 router.put('/:id/datasets', authenticate, replaceProjectDatasets);
 router.put('/:id/notebooks', authenticate, replaceProjectNotebooks);
 router.put('/:id/docs', authenticate, replaceProjectDocs);
@@ -62,6 +63,15 @@ function slugify(input) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)/g, '');
+}
+
+/** Accept website_url (preferred) or legacy keys from JSON bodies. */
+function normalizeOrgWebsiteUrl(row) {
+  if (!row || typeof row !== 'object') return null;
+  const raw = row.website_url ?? row.websiteUrl ?? row.url ?? row.link;
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  return s || null;
 }
 
 async function resolveProjectId(projectRef) {
@@ -136,7 +146,7 @@ async function getProjectOverview(req, res) {
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    const [membersRes, datasetsRes, notebooksRes, docsRes, orgsRes, aclRes] = await Promise.all([
+    const [membersRes, datasetsRes, notebooksRes, docsRes, orgsRes, derivedOrgsRes, aclRes] = await Promise.all([
       query(
         `SELECT pm.user_id, pm.role, pm.joined_at,
                 u.name, u.email, u.role AS user_role
@@ -172,6 +182,13 @@ async function getProjectOverview(req, res) {
         [projectId]
       ),
       query(
+        `SELECT id, short, name, website_url, sort_order
+         FROM w4h.project_organizations
+         WHERE project_id = $1::uuid
+         ORDER BY sort_order ASC, name ASC`,
+        [projectId]
+      ),
+      query(
         `SELECT DISTINCT s.id AS study_id, s.name AS study_name
          FROM w4h.project_datasets pd
          JOIN w4h.datasets d ON d.id = pd.dataset_id
@@ -191,6 +208,17 @@ async function getProjectOverview(req, res) {
 
     const canManage = !req.authViaProjectDbToken && (await canManageProject(projectId, req.user));
     const canIssueDbToken = !req.authViaProjectDbToken && (await canReadProject(projectId, req.user));
+    const manualOrgRows = Array.isArray(orgsRes.rows) ? orgsRes.rows : [];
+    const organizations =
+      manualOrgRows.length > 0
+        ? manualOrgRows
+        : derivedOrgsRes.rows.map((o, idx) => ({
+            id: `derived-${idx}`,
+            short: String(o.study_id || '').slice(0, 4).toUpperCase() || 'ORG',
+            name: o.study_name || o.study_id || 'Study',
+            website_url: null,
+            sort_order: idx
+          }));
 
     res.json({
       project: projectRes.rows[0],
@@ -198,7 +226,7 @@ async function getProjectOverview(req, res) {
       datasets: datasetsRes.rows,
       notebooks: notebooksRes.rows,
       docs: docsRes.rows,
-      organizations: orgsRes.rows,
+      organizations,
       acl_rules: aclRes.rows,
       capabilities: {
         can_manage: canManage,
@@ -260,6 +288,25 @@ function normalizeLaunchersPayload(raw) {
   };
 }
 
+/** Replace collaborating org rows for a project (requires migration: w4h.project_organizations). */
+async function replaceProjectOrganizationsData(projectId, organizations) {
+  const rows = Array.isArray(organizations) ? organizations : [];
+  await query(`DELETE FROM w4h.project_organizations WHERE project_id = $1::uuid`, [projectId]);
+  let sortOrder = 0;
+  for (const row of rows) {
+    const name = String(row?.name || '').trim();
+    if (!name) continue;
+    const short = row?.short == null ? null : String(row.short).trim();
+    const websiteUrl = normalizeOrgWebsiteUrl(row);
+    await query(
+      `INSERT INTO w4h.project_organizations (project_id, short, name, website_url, sort_order)
+       VALUES ($1::uuid, $2, $3, $4, $5)`,
+      [projectId, short || null, name, websiteUrl, sortOrder]
+    );
+    sortOrder += 1;
+  }
+}
+
 async function updateProject(req, res) {
   const projectId = await resolveProjectId(req.params.id);
   if (!projectId) return res.status(404).json({ error: 'Project not found' });
@@ -292,19 +339,50 @@ async function updateProject(req, res) {
       fields.push(`launchers = $${params.length}::jsonb`);
     }
 
-    if (!fields.length) return res.status(400).json({ error: 'No updatable fields provided' });
-    params.push(projectId);
+    const orgPayload = req.body?.organizations;
+    const shouldSyncOrgs = Array.isArray(orgPayload);
+    if (!fields.length && !shouldSyncOrgs) {
+      return res.status(400).json({ error: 'No updatable fields provided' });
+    }
 
-    const updated = await query(
-      `UPDATE w4h.projects
-       SET ${fields.join(', ')}, updated_at = NOW()
-       WHERE id = $${params.length}::uuid
-       RETURNING *`,
-      params
-    );
+    let projectRow = null;
+    if (fields.length) {
+      params.push(projectId);
+      const updated = await query(
+        `UPDATE w4h.projects
+         SET ${fields.join(', ')}, updated_at = NOW()
+         WHERE id = $${params.length}::uuid
+         RETURNING *`,
+        params
+      );
+      if (!updated.rowCount) return res.status(404).json({ error: 'Project not found' });
+      projectRow = updated.rows[0];
+    }
 
-    if (!updated.rowCount) return res.status(404).json({ error: 'Project not found' });
-    res.json(updated.rows[0]);
+    let organizationsOut = null;
+    if (shouldSyncOrgs) {
+      await replaceProjectOrganizationsData(projectId, orgPayload);
+      const orgsFresh = await query(
+        `SELECT id, short, name, website_url, sort_order
+         FROM w4h.project_organizations
+         WHERE project_id = $1::uuid
+         ORDER BY sort_order ASC, name ASC`,
+        [projectId]
+      );
+      organizationsOut = orgsFresh.rows;
+    }
+
+    if (!projectRow) {
+      const cur = await query(`SELECT * FROM w4h.projects WHERE id = $1::uuid`, [projectId]);
+      if (!cur.rowCount) return res.status(404).json({ error: 'Project not found' });
+      projectRow = cur.rows[0];
+    }
+
+    if (organizationsOut) {
+      res.json({ ...projectRow, organizations: organizationsOut });
+    } else {
+      res.json(projectRow);
+    }
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to update project' });
   }
@@ -548,6 +626,28 @@ async function replaceProjectDatasets(req, res) {
     res.json(fresh.rows);
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to update project datasets' });
+  }
+}
+
+async function replaceProjectOrganizations(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canManageProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    await replaceProjectOrganizationsData(projectId, req.body?.organizations);
+    const fresh = await query(
+      `SELECT id, short, name, website_url, sort_order
+       FROM w4h.project_organizations
+       WHERE project_id = $1::uuid
+       ORDER BY sort_order ASC, name ASC`,
+      [projectId]
+    );
+    res.json(fresh.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to update organizations' });
   }
 }
 
