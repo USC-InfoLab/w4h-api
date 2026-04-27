@@ -1,0 +1,46 @@
+docs:
+  home:
+    doc_type: ""
+    card_title: Welcome to W4H
+    action_label: Open
+    sort_order: 0
+    hidden: false
+    is_feature_card: false
+    show_in_docs: false
+    card_order: 0
+  quick-start:
+    doc_type: guide
+    card_title: Quick Start
+    action_label: Open
+    sort_order: 1
+    hidden: false
+    is_feature_card: true
+    show_in_docs: true
+    card_order: 1
+  faq:
+    doc_type: faq
+    card_title: FAQ
+    action_label: Open
+    sort_order: 10
+    hidden: false
+    is_feature_card: false
+    show_in_docs: true
+    card_order: 0
+  ansel-todo:
+    doc_type: internal
+    card_title: ""
+    action_label: Open
+    sort_order: 0
+    hidden: false
+    is_feature_card: false
+    show_in_docs: true
+    card_order: 0
+  w4h-app-setup-for-developers:
+    doc_type: internal
+    card_title: ""
+    action_label: Open
+    sort_order: 0
+    hidden: false
+    is_feature_card: false
+    show_in_docs: true
+    card_order: 0

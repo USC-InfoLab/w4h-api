@@ -1,7 +1,9 @@
 import express from 'express';
+
 const router = express.Router();
 
 import { authenticate } from '../auth.js';
+import { handleMarkdownZipExport } from './docs-export.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { query } from '../lib/utils/db.js';
 
@@ -10,6 +12,7 @@ import crypto from 'crypto';
 router.get('/', authenticate, list);
 router.get('/search', authenticate, search);
 router.get('/cards/feature', authenticate, featureCards);
+router.get('/export/markdown.zip', authenticate, handleMarkdownZipExport);
 router.get('/:slug', authenticate, get);
 router.put('/:slug', authenticate, put);
 router.delete('/:slug', authenticate, del);
