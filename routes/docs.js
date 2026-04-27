@@ -1,7 +1,11 @@
 import express from 'express';
+import archiver from 'archiver';
+import { stringify as stringifyYaml } from 'yaml';
+
 const router = express.Router();
 
 import { authenticate } from '../auth.js';
+import { splitFrontmatter } from '../lib/docs-repo-import.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { query } from '../lib/utils/db.js';
 
@@ -10,11 +14,105 @@ import crypto from 'crypto';
 router.get('/', authenticate, list);
 router.get('/search', authenticate, search);
 router.get('/cards/feature', authenticate, featureCards);
+router.get('/export/markdown.zip', authenticate, exportMarkdownZip);
 router.get('/:slug', authenticate, get);
 router.put('/:slug', authenticate, put);
 router.delete('/:slug', authenticate, del);
 
 const DOCS_TABLE = 'w4h.docs';
+
+/** Zip path for exported markdown: content/<doc_type>/<slug>.md or content/<slug>.md when doc_type is empty. */
+function markdownPathFromDocType(slug, docType) {
+  const safe =
+    String(slug ?? 'doc')
+      .replace(/[/\\?%*:|"<>]/g, '-')
+      .replace(/^\.+/, '') || 'doc';
+  const typeDir =
+    String(docType ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/[/\\?%*:|"<>]/g, '-')
+      .replace(/^\.+/, '')
+      .replace(/\s+/g, '-') || '';
+  if (!typeDir) {
+    return `content/${safe}.md`;
+  }
+  return `content/${typeDir}/${safe}.md`;
+}
+
+/** Markdown file body matching w4h-documentation/content (YAML frontmatter + body). */
+function markdownFileForExport(row) {
+  const raw = row.md == null ? '' : String(row.md);
+  const { body } = splitFrontmatter(raw);
+  const titleFromSlug = String(row.slug ?? '')
+    .split(/[-_]/g)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+  const title =
+    (row.title != null && String(row.title).trim()) || titleFromSlug;
+  const description = row.description != null ? String(row.description).trim() : '';
+  const fmYaml = stringifyYaml({ title, description }).trimEnd();
+  return `---\n${fmYaml}\n---\n${body}`;
+}
+
+/** Admin only: stream docs bundle zip (markdown + root documentation-configuration.yml). */
+async function exportMarkdownZip(req, res) {
+  if (req.user.role !== USER_ROLES.ADMIN) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const result = await query(
+      `SELECT
+        slug, title, description, md, doc_type, card_title, action_label, sort_order,
+        hidden, is_feature_card, show_in_docs, card_order
+       FROM ${DOCS_TABLE}
+       ORDER BY sort_order ASC NULLS LAST, slug ASC`
+    );
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="w4h-docs-bundle.zip"');
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.on('error', (err) => {
+      console.error('Zip archive error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to build export archive', details: err.message });
+      } else {
+        res.end();
+      }
+    });
+
+    archive.pipe(res);
+
+    const config = { docs: {} };
+    for (const row of result.rows) {
+      config.docs[row.slug] = {
+        doc_type: row.doc_type != null ? String(row.doc_type) : '',
+        card_title: row.card_title != null ? String(row.card_title) : '',
+        action_label: row.action_label != null ? String(row.action_label) : 'Open',
+        sort_order: Number.isFinite(Number(row.sort_order)) ? Number(row.sort_order) : 0,
+        hidden: Boolean(row.hidden),
+        is_feature_card: Boolean(row.is_feature_card),
+        show_in_docs: row.show_in_docs !== false,
+        card_order: Number.isFinite(Number(row.card_order)) ? Number(row.card_order) : 0
+      };
+
+      const outputPath = markdownPathFromDocType(row.slug, row.doc_type);
+      archive.append(markdownFileForExport(row), { name: outputPath });
+    }
+
+    archive.append(stringifyYaml(config), { name: 'documentation-configuration.yml' });
+
+    await archive.finalize();
+  } catch (err) {
+    console.error('Export markdown zip error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to export documentation markdown', details: err.message });
+    }
+  }
+}
 
 async function featureCards(req, res) {
   if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
