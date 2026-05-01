@@ -288,7 +288,7 @@ function normalizeLaunchersPayload(raw) {
   };
 }
 
-/** Replace collaborating org rows for a project (requires migration: w4h.project_organizations). */
+/** Replace collaborating org rows for a project (requires w4h.project_organizations from data/projects_acl.sql). */
 async function replaceProjectOrganizationsData(projectId, organizations) {
   const rows = Array.isArray(organizations) ? organizations : [];
   await query(`DELETE FROM w4h.project_organizations WHERE project_id = $1::uuid`, [projectId]);

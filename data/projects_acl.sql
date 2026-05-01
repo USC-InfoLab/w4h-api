@@ -1,5 +1,5 @@
--- Project collaboration + ACL schema for W4H
--- Run after data/schema.sql. Safe to re-run.
+-- Projects hub: collaboration tables, ACL, DB tokens, collaborating orgs, launcher config.
+-- Run after data/schema.sql (and data/datasets.sql if datasets are required). Safe to re-run.
 
 BEGIN;
 
@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS w4h.projects (
   created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE w4h.projects
+  ADD COLUMN IF NOT EXISTS launchers jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+COMMENT ON COLUMN w4h.projects.launchers IS
+  'JSON: jupyterBaseUrl, rstudioBaseUrl, vscodeTemplate — used by project hub launch buttons.';
 
 CREATE INDEX IF NOT EXISTS idx_projects_slug ON w4h.projects(slug);
 CREATE INDEX IF NOT EXISTS idx_projects_created_by ON w4h.projects(created_by);
@@ -91,8 +97,6 @@ CREATE TABLE IF NOT EXISTS w4h.project_acl_rules (
 CREATE INDEX IF NOT EXISTS idx_project_acl_project_id ON w4h.project_acl_rules(project_id);
 CREATE INDEX IF NOT EXISTS idx_project_acl_subject ON w4h.project_acl_rules(subject_type, subject_key);
 
--- Optional short-lived db access tokens used by backend-mediated notebook access.
--- Stores only a hash of the token value.
 CREATE TABLE IF NOT EXISTS w4h.project_db_tokens (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
@@ -105,6 +109,38 @@ CREATE TABLE IF NOT EXISTS w4h.project_db_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_project_db_tokens_lookup ON w4h.project_db_tokens(project_id, user_id, expires_at);
 
+CREATE TABLE IF NOT EXISTS w4h.project_organizations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  short text,
+  name text NOT NULL,
+  website_url text,
+  sort_order integer NOT NULL DEFAULT 0,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_organizations_project_id
+  ON w4h.project_organizations(project_id, sort_order, name);
+
+-- Upgrade rows created by older split migration files (role / legacy url column).
+ALTER TABLE w4h.project_organizations DROP COLUMN IF EXISTS role;
+
+ALTER TABLE w4h.project_organizations ADD COLUMN IF NOT EXISTS website_url text;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'w4h'
+      AND table_name = 'project_organizations'
+      AND column_name = 'url'
+  ) THEN
+    UPDATE w4h.project_organizations
+    SET website_url = COALESCE(NULLIF(TRIM(website_url), ''), url);
+    ALTER TABLE w4h.project_organizations DROP COLUMN url;
+  END IF;
+END $$;
+
 COMMENT ON TABLE w4h.projects IS 'Research project shell: metadata, IRB references, visibility.';
 COMMENT ON COLUMN w4h.projects.slug IS 'URL-safe unique key for routing and APIs.';
 COMMENT ON COLUMN w4h.projects.visibility IS 'org-private | project-private | internal — complements row-level ACL.';
@@ -115,5 +151,10 @@ COMMENT ON TABLE w4h.project_notebooks IS 'Notebook/repo pointers only; executio
 COMMENT ON TABLE w4h.project_docs IS 'Links project hub to internal docs (w4h.docs) by slug.';
 COMMENT ON TABLE w4h.project_acl_rules IS 'Fine-grained allow/deny rules; evaluate with project role and membership.';
 COMMENT ON TABLE w4h.project_db_tokens IS 'Short-lived project-scoped secrets; store SHA-256 hash only, never raw token.';
+
+COMMENT ON TABLE w4h.project_organizations IS
+  'Admin-managed collaborating organizations displayed on the project hub.';
+COMMENT ON COLUMN w4h.project_organizations.website_url IS
+  'Optional organization homepage; shown as a link on the project hub.';
 
 COMMIT;

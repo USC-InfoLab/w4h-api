@@ -1,2 +1,0 @@
--- Deprecated: run project_organizations_website_url_migration.sql instead.
--- The org link column is named website_url (not url) so request/JSON handling stays reliable.
