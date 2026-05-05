@@ -102,27 +102,6 @@ Authorization: <JWT token from login>
 
 ---
 
-### 4. Reset Connection Pool
-
-**POST** `/config/reset` 🔒 **ADMIN ONLY**
-
-Manually reset the database connection pool (useful after manual `.env` changes).
-
-**Headers:**
-```
-Authorization: <JWT token from login>
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Database pool reset successfully"
-}
-```
-
----
-
 ## Frontend Example
 
 ```javascript

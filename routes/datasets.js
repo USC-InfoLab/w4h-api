@@ -3,7 +3,7 @@ const router = express.Router();
 
 import { authenticate } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
-import { query } from '../lib/utils/db.js';
+import { query } from '../db.js';
 
 router.get('/studies', authenticate, listStudies);
 router.get('/studies-admin', authenticate, listStudiesAdmin);

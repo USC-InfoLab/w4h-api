@@ -1,7 +1,7 @@
 import express from 'express';
 const router = express.Router();
 import bcrypt from 'bcrypt';
-import { query } from '../lib/utils/db.js';
+import { query } from '../db.js';
 import * as auth from '../auth.js';
 import jwt from 'jsonwebtoken';
 import { validatePassword } from '../lib/utils/password-validator.js';
