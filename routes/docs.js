@@ -1,20 +1,31 @@
 import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
 const router = express.Router();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 import { authenticate } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { query } from '../lib/utils/db.js';
+import { renderDoc } from '../lib/utils/docRender.js';
+import { pipeMarkdownZipToResponse } from '../lib/utils/markdownZip.js';
+import { loadDocumentationConfig } from '../lib/utils/docMarkdownImport.js';
 
 import crypto from 'crypto';
 
 router.get('/', authenticate, list);
 router.get('/search', authenticate, search);
 router.get('/cards/feature', authenticate, featureCards);
+router.get('/export/markdown-zip', authenticate, exportMarkdownZip);
 router.get('/:slug', authenticate, get);
 router.put('/:slug', authenticate, put);
 router.delete('/:slug', authenticate, del);
 
 const DOCS_TABLE = 'w4h.docs';
+
+// Review buckets: export + CRUD :slug here; markdown seeding + YAML live under lib/db-init.js and lib/utils/docMarkdownImport.js.
 
 async function featureCards(req, res) {
   if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
@@ -117,10 +128,9 @@ async function put(req, res) {
     is_feature_card = true,
     show_in_docs = true,
     md = '',
-    html = '',
-    toc = []
   } = req.body;
 
+  const { html, toc } = renderDoc(md);
   const tocJson = JSON.stringify(toc);
 
   try {
@@ -214,6 +224,39 @@ async function del(req, res) {
     res.status(500).json({ error: 'Failed to delete document' });
   }
 }
+/** Admin-only: zipped Markdown export (paths follow documentation-configuration layout). */
+async function exportMarkdownZip(req, res) {
+  if (req.user.role !== USER_ROLES.ADMIN) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const apiRoot = path.join(__dirname, '..');
+    const cfg = (await loadDocumentationConfig(apiRoot)) || {};
+    const layout = cfg.layout === 'flat' ? 'flat' : 'nested';
+
+    const includeHidden =
+      req.query.includeHidden === 'true' ||
+      req.query.includeHidden === '1' ||
+      req.query.include_hidden === 'true';
+
+    let sql = `SELECT slug, title, description, doc_type, md FROM ${DOCS_TABLE}`;
+    if (!includeHidden) {
+      sql += ' WHERE COALESCE(hidden, false) = false';
+    }
+    sql += ' ORDER BY slug';
+
+    const result = await query(sql);
+
+    await pipeMarkdownZipToResponse(res, result.rows, { layout });
+  } catch (err) {
+    console.error('exportMarkdownZip', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to export documentation' });
+    }
+  }
+}
+
 async function search(req, res) {
   if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
