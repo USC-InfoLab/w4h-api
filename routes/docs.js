@@ -1,31 +1,70 @@
 import express from 'express';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import archiver from 'archiver';
+
 const router = express.Router();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
+import { DOCS_TABLE, query } from '../db.js';
 import { authenticate } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
-import { query } from '../lib/utils/db.js';
-import { renderDoc } from '../lib/utils/docRender.js';
-import { pipeMarkdownZipToResponse } from '../lib/utils/markdownZip.js';
-import { loadDocumentationConfig } from '../lib/utils/docMarkdownImport.js';
+import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter } from '../lib/utils/docs.js';
 
 import crypto from 'crypto';
 
 router.get('/', authenticate, list);
 router.get('/search', authenticate, search);
 router.get('/cards/feature', authenticate, featureCards);
-router.get('/export/markdown-zip', authenticate, exportMarkdownZip);
+router.get('/export', authenticate, exportDocs);
 router.get('/:slug', authenticate, get);
 router.put('/:slug', authenticate, put);
 router.delete('/:slug', authenticate, del);
 
-const DOCS_TABLE = 'w4h.docs';
+async function exportDocs(req, res) {
+  if (req.user.role !== USER_ROLES.ADMIN) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
 
-// Review buckets: export + CRUD :slug here; markdown seeding + YAML live under lib/db-init.js and lib/utils/docMarkdownImport.js.
+  try {
+    const result = await query(
+      `SELECT
+        slug, title, description, md, doc_type, card_title, action_label, sort_order,
+        hidden, is_feature_card, show_in_docs, card_order
+       FROM ${DOCS_TABLE}
+       ORDER BY sort_order ASC NULLS LAST, slug ASC`
+    );
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="w4h-docs-bundle.zip"');
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.on('error', (err) => {
+      console.error('Zip archive error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to build export archive', details: err.message });
+      } else {
+        res.end();
+      }
+    });
+
+    archive.pipe(res);
+
+    for (const row of result.rows) {
+      const content = markdownFileForExport(row);
+      // Use the name field from the exported YAML frontmatter as the zip entry path,
+      // falling back to slug + doc_type if not present.
+      const { meta } = splitFrontmatter(content);
+      const name = typeof meta.name === 'string' && meta.name.trim() ? meta.name.trim() : row.slug;
+      const outputPath = markdownPathFromDocType(name, row.doc_type);
+      archive.append(content, { name: outputPath });
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error('Export markdown zip error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to export documentation markdown', details: err.message });
+    }
+  }
+}
 
 async function featureCards(req, res) {
   if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
