@@ -23,7 +23,7 @@ function normalizeStudyIds(input) {
 }
 
 async function getAllStudyIds() {
-  const result = await query(`SELECT id FROM ${SCHEMA}.studies ORDER BY name ASC`);
+  const result = await query(`SELECT id FROM ${SCHEMA}.projects ORDER BY name ASC`);
   return result.rows.map(row => row.id);
 }
 
@@ -32,11 +32,11 @@ async function syncUserStudies(userId, role, requestedStudyIds = []) {
     ? await getAllStudyIds()
     : normalizeStudyIds(requestedStudyIds);
 
-  await query(`DELETE FROM ${SCHEMA}.user_studies WHERE user_id = $1`, [userId]);
+  await query(`DELETE FROM ${SCHEMA}.user_projects WHERE user_id = $1`, [userId]);
 
   if (studyIds.length > 0) {
     await query(
-      `INSERT INTO ${SCHEMA}.user_studies (user_id, study_id)
+      `INSERT INTO ${SCHEMA}.user_projects (user_id, study_id)
        SELECT $1, UNNEST($2::text[])
        ON CONFLICT (user_id, study_id) DO NOTHING`,
       [userId, studyIds]
@@ -50,7 +50,7 @@ async function ensureAdminAssignedToAllStudies(userId) {
   await query(
     `INSERT INTO ${SCHEMA}.user_studies (user_id, study_id)
      SELECT $1, s.id
-     FROM ${SCHEMA}.studies s
+     FROM ${SCHEMA}.projects s
      ON CONFLICT (user_id, study_id) DO NOTHING`,
     [userId]
   );
@@ -308,14 +308,14 @@ async function getByEmail(req, res) {
          u.created_at,
          CASE
            WHEN u.role = 'admin' THEN COALESCE(
-             (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.studies s),
+             (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.projects s),
              '{}'
            )
            ELSE COALESCE(
              (
                SELECT ARRAY_AGG(us.study_id ORDER BY s.name)
                FROM ${SCHEMA}.user_studies us
-               LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.study_id
                WHERE us.user_id = u.id
              ),
              '{}'
@@ -323,14 +323,14 @@ async function getByEmail(req, res) {
          END AS study_ids,
          CASE
            WHEN u.role = 'admin' THEN COALESCE(
-             (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.studies s),
+             (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.projects s),
              ''
            )
            ELSE COALESCE(
              (
                SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
                FROM ${SCHEMA}.user_studies us
-               LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.study_id
                WHERE us.user_id = u.id
              ),
              ''
@@ -365,14 +365,14 @@ async function list(req, res) {
          u.created_at,
          CASE
            WHEN u.role = 'admin' THEN COALESCE(
-             (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.studies s),
+             (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.projects s),
              '{}'
            )
            ELSE COALESCE(
              (
                SELECT ARRAY_AGG(us.study_id ORDER BY s.name)
                FROM ${SCHEMA}.user_studies us
-               LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.study_id
                WHERE us.user_id = u.id
              ),
              '{}'
@@ -380,14 +380,14 @@ async function list(req, res) {
          END AS study_ids,
          CASE
            WHEN u.role = 'admin' THEN COALESCE(
-             (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.studies s),
+             (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.projects s),
              ''
            )
            ELSE COALESCE(
              (
                SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
                FROM ${SCHEMA}.user_studies us
-               LEFT JOIN ${SCHEMA}.studies s ON s.id = us.study_id
+               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.study_id
                WHERE us.user_id = u.id
              ),
              ''

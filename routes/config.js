@@ -61,7 +61,7 @@ export default router;
 // Handlers
 // ---------------------------------------------------------------------------
 
-/** GET /config/status — Check if database is configured. Admin only. */
+/** GET /config/status — Check if database is configured. */
 function getStatus(req, res) {
   const isConfigured = !!(
     process.env.DB_HOST &&
@@ -87,7 +87,7 @@ function getStatus(req, res) {
   });
 }
 
-/** GET /config/database-settings — Get current database settings (even if not fully configured). Admin only. */
+/** GET /config/database-settings — Get current database settings (even if not fully configured). */
 function getDatabaseSettings(req, res) {
   if (!isAdmin(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -101,7 +101,7 @@ function getDatabaseSettings(req, res) {
   });
 }
 
-/** GET /config/mailer-settings — Get current SMTP settings (without password). Admin only. */
+/** GET /config/mailer-settings — Get current SMTP settings (without password). */
 function getMailerSettings(req, res) {
   if (!isAdmin(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -199,7 +199,11 @@ async function postMailerTest(req, res) {
   }
 }
 
-/** POST /config/database — Configure database credentials. Admin only (after initial setup). */
+/**
+ * POST /config/database
+ * Configure database credentials
+ * Body: { host, port, database, user, password }
+ */
 async function postInitDatabase(req, res) {
   const { host, port, database, user, password } = req.body;
   const effectivePassword = password || process.env.DB_PASSWORD;
@@ -429,15 +433,6 @@ async function postAdminSetup(req, res) {
   }
 
   try {
-    const initResult = await initializeDatabase();
-    if (!initResult.success) {
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to initialize database schema',
-        details: initResult.error
-      });
-    }
-
     const usersExist = await hasAnyUsers();
     if (usersExist) {
       return res.status(400).json({

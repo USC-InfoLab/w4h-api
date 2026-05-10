@@ -1,13 +1,12 @@
 import express from 'express';
+import archiver from 'archiver';
 
 const router = express.Router();
 
-import { DOCS_TABLE} from '../db.js';
+import { DOCS_TABLE, query } from '../db.js';
 import { authenticate } from '../auth.js';
-import { exportDocs } from '../lib/docs-export.js';
 import { USER_ROLES } from '../lib/utils/user.js';
-import { USER_ROLES } from '../lib/utils/markdown.js';
-import { query } from '../db.js';
+import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter } from '../lib/utils/docs.js';
 
 import crypto from 'crypto';
 
@@ -48,24 +47,15 @@ async function exportDocs(req, res) {
 
     archive.pipe(res);
 
-    const config = { docs: {} };
     for (const row of result.rows) {
-      config.docs[row.slug] = {
-        doc_type: row.doc_type != null ? String(row.doc_type) : '',
-        card_title: row.card_title != null ? String(row.card_title) : '',
-        action_label: row.action_label != null ? String(row.action_label) : 'Open',
-        sort_order: Number.isFinite(Number(row.sort_order)) ? Number(row.sort_order) : 0,
-        hidden: Boolean(row.hidden),
-        is_feature_card: Boolean(row.is_feature_card),
-        show_in_docs: row.show_in_docs !== false,
-        card_order: Number.isFinite(Number(row.card_order)) ? Number(row.card_order) : 0
-      };
-
-      const outputPath = markdownPathFromDocType(row.slug, row.doc_type);
-      archive.append(markdownFileForExport(row), { name: outputPath });
+      const content = markdownFileForExport(row);
+      // Use the name field from the exported YAML frontmatter as the zip entry path,
+      // falling back to slug + doc_type if not present.
+      const { meta } = splitFrontmatter(content);
+      const name = typeof meta.name === 'string' && meta.name.trim() ? meta.name.trim() : row.slug;
+      const outputPath = markdownPathFromDocType(name, row.doc_type);
+      archive.append(content, { name: outputPath });
     }
-
-    archive.append(stringifyYaml(config), { name: 'documentation-configuration.yml' });
 
     await archive.finalize();
   } catch (err) {
