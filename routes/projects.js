@@ -3,7 +3,7 @@ import crypto from 'crypto';
 
 import { authenticate } from '../auth.js';
 import { authenticateJwtOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
-import { query } from '../lib/utils/db.js';
+import { query } from '../db.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 
 const router = express.Router();

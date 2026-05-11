@@ -40,8 +40,8 @@ async function listStudiesAdmin(req, res) {
          COUNT(DISTINCT d.id)::int AS dataset_count,
          COUNT(DISTINCT us.user_id)::int AS user_count
        FROM w4h.projects s
-       LEFT JOIN w4h.datasets d ON d.study_id = s.id
-       LEFT JOIN w4h.user_projects us ON us.study_id = s.id
+       LEFT JOIN w4h.datasets d ON d.project_id = s.id
+       LEFT JOIN w4h.user_projects us ON us.project_id = s.id
        GROUP BY s.id, s.name, s.description
        ORDER BY s.name ASC`
     );
@@ -157,8 +157,8 @@ async function listStudies(req, res) {
     sql += `
       WHERE EXISTS (
         SELECT 1
-        FROM w4h.user_studies us
-        WHERE us.study_id = w4h.projects.id
+        FROM w4h.user_projects us
+        WHERE us.project_id = w4h.projects.id
           AND us.user_id = $1
       )
     `;
@@ -183,11 +183,11 @@ async function tableInfo(req, res) {
   try {
     const datasetAccessResult = req.user.role === USER_ROLES.ADMIN
       ? await query(
-        `SELECT id, study_id FROM w4h.datasets WHERE id = $1`,
+        `SELECT id, project_id AS study_id FROM w4h.datasets WHERE id = $1`,
         [req.query.dataset_id]
       )
       : await query(
-        `SELECT d.id, d.study_id
+        `SELECT d.id, d.project_id AS study_id
          FROM w4h.datasets d
          JOIN w4h.user_projects us
            ON us.project_id = d.project_id
@@ -386,15 +386,15 @@ async function listDatasets(req, res) {
   }
 
   let sql = `
-    SELECT d.id, d.study_id, d.name, d.description
+    SELECT d.id, d.project_id AS study_id, d.name, d.description
     FROM w4h.datasets d
   `;
   const params = [];
 
   if (req.user.role !== USER_ROLES.ADMIN) {
     sql += `
-      JOIN w4h.user_studies us
-        ON us.study_id = d.study_id
+      JOIN w4h.user_projects us
+        ON us.project_id = d.project_id
     `;
     params.push(req.user.id);
     sql += ` WHERE us.user_id = $${params.length}`;
@@ -403,8 +403,8 @@ async function listDatasets(req, res) {
   if (req.query.study_id) {
     params.push(req.query.study_id);
     sql += params.length === 1 && req.user.role === USER_ROLES.ADMIN
-      ? ` WHERE d.study_id = $${params.length}`
-      : ` AND d.study_id = $${params.length}`;
+      ? ` WHERE d.project_id = $${params.length}`
+      : ` AND d.project_id = $${params.length}`;
   }
 
   sql += ` ORDER BY name ASC`;
@@ -445,16 +445,16 @@ async function getDataset(req, res) {
   const { id } = req.params;
   const result = req.user.role === USER_ROLES.ADMIN
     ? await query(
-      `SELECT id, study_id, name, description
+      `SELECT id, project_id AS study_id, name, description
        FROM w4h.datasets
        WHERE id = $1`,
       [id]
     )
     : await query(
-      `SELECT d.id, d.study_id, d.name, d.description
+      `SELECT d.id, d.project_id AS study_id, d.name, d.description
        FROM w4h.datasets d
-       JOIN w4h.user_studies us
-         ON us.study_id = d.study_id
+       JOIN w4h.user_projects us
+         ON us.project_id = d.project_id
        WHERE d.id = $1 AND us.user_id = $2`,
       [id, req.user.id]
     );
