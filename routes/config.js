@@ -3,8 +3,8 @@ const router = express.Router();
 import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { USER_ROLES } from '../lib/utils/user.js';
 import crypto from 'crypto';
-import dayjs from 'dayjs';
 import pkg from 'pg';
 const { Pool } = pkg;
 import db from '../db.js';
@@ -15,20 +15,11 @@ import { getMailerConfig, isMailerConfigured, sendMail } from '../lib/mailer.js'
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-function sqlString(value) {
-  if (value === null || value === undefined) return 'NULL';
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-function sqlBool(value) {
-  if (value === null || value === undefined) return 'NULL';
-  return value ? 'true' : 'false';
-}
-
-function sqlNumber(value) {
-  if (value === null || value === undefined || Number.isNaN(value)) return 'NULL';
-  return String(value);
-}
+const isAdmin = user => !!user && user.role === USER_ROLES.ADMIN;
 
 async function writeEnvValues(keyValues) {
   const envPath = path.join(__dirname, '..', '.env');
@@ -50,20 +41,28 @@ async function writeEnvValues(keyValues) {
   await fs.writeFile(envPath, envContent.trim() + '\n');
 }
 
-function requireAdminIfConfigured(req, res, next) {
-  if (!db.isConfigured()) {
-    return next();
-  }
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
 
-  return auth.authenticate(req, res, () => auth.requireAdmin(req, res, next));
-}
+router.get('/status', getStatus);
+router.get('/database-settings', auth.authenticate, getDatabaseSettings);
+router.get('/mailer-settings', auth.authenticate, getMailerSettings);
+router.post('/mailer-settings', auth.authenticate, postMailerSettings);
+router.post('/mailer-test', auth.authenticate, postMailerTest);
+router.post('/init-database', postInitDatabase);
+router.post('/admin-setup', postAdminSetup);
+router.get('/test', auth.authenticate, getTest);
+router.post('/reset', auth.authenticate, postReset);
 
-/**
- * GET /config/status
- * Check if database is configured
- * Public endpoint - no auth required
- */
-router.get('/status', (req, res) => {
+export default router;
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/** GET /config/status — Check if database is configured. */
+function getStatus(req, res) {
   const isConfigured = !!(
     process.env.DB_HOST &&
     process.env.DB_PORT &&
@@ -79,30 +78,35 @@ router.get('/status', (req, res) => {
       port: process.env.DB_PORT,
       database: process.env.DB_DATABASE,
       user: process.env.DB_USER
-    } : null
+    } : {
+      host: process.env.DB_HOST || '',
+      port: process.env.DB_PORT || '5432',
+      database: process.env.DB_DATABASE || '',
+      user: process.env.DB_USER || ''
+    }
   });
-});
+}
 
-/**
- * GET /config/database-settings
- * Get current database settings (even if not fully configured)
- * Public endpoint - no auth required
- */
-router.get('/database-settings', (req, res) => {
+/** GET /config/database-settings — Get current database settings (even if not fully configured). */
+function getDatabaseSettings(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
   res.json({
     host: process.env.DB_HOST || '',
     port: process.env.DB_PORT || '5432',
     database: process.env.DB_DATABASE || '',
     user: process.env.DB_USER || ''
   });
-});
+}
 
-/**
- * GET /config/mailer-settings
- * Get current SMTP settings (without returning password)
- * ADMIN ONLY
- */
-router.get('/mailer-settings', requireAdminIfConfigured, (req, res) => {
+/** GET /config/mailer-settings — Get current SMTP settings (without password). */
+function getMailerSettings(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
   const cfg = getMailerConfig();
   res.json({
     host: cfg.host,
@@ -114,14 +118,14 @@ router.get('/mailer-settings', requireAdminIfConfigured, (req, res) => {
     configured: isMailerConfigured(),
     hasPassword: !!cfg.pass
   });
-});
+}
 
-/**
- * POST /config/mailer-settings
- * Save SMTP settings to .env
- * ADMIN ONLY
- */
-router.post('/mailer-settings', requireAdminIfConfigured, async (req, res) => {
+/** POST /config/mailer-settings — Save SMTP settings to .env. Admin only. */
+async function postMailerSettings(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
   const host = String(req.body?.host || '').trim();
   const port = String(req.body?.port || '').trim();
   const secure = !!req.body?.secure;
@@ -164,14 +168,14 @@ router.post('/mailer-settings', requireAdminIfConfigured, async (req, res) => {
       details: error.message
     });
   }
-});
+}
 
-/**
- * POST /config/mailer-test
- * Send test email to verify SMTP settings
- * ADMIN ONLY
- */
-router.post('/mailer-test', requireAdminIfConfigured, async (req, res) => {
+/** POST /config/mailer-test — Send a test email. Admin only. */
+async function postMailerTest(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
   const to = String(req.body?.to || '').trim();
   if (!to) {
     return res.status(400).json({ success: false, error: 'Test recipient email is required' });
@@ -193,15 +197,14 @@ router.post('/mailer-test', requireAdminIfConfigured, async (req, res) => {
       details: error.message
     });
   }
-});
+}
 
 /**
  * POST /config/database
  * Configure database credentials
  * Body: { host, port, database, user, password }
- * ADMIN ONLY (after initial setup)
  */
-router.post('/database', requireAdminIfConfigured, async (req, res) => {
+async function postInitDatabase(req, res) {
   const { host, port, database, user, password } = req.body;
   const effectivePassword = password || process.env.DB_PASSWORD;
 
@@ -236,11 +239,11 @@ router.post('/database', requireAdminIfConfigured, async (req, res) => {
     try {
       await testPool.query('SELECT 1');
     } catch (connError) {
-      console.log(`Connection error code: ${connError.code}, message: ${connError.message}`);
+      if (process.env.W4H_DEBUG) console.log(`[config] Connection error code: ${connError.code}, message: ${connError.message}`);
       
       // If database doesn't exist, try to create it
       if (connError.code === '3D000' || connError.message?.includes('does not exist')) { 
-        console.log(`Database '${database}' does not exist. Attempting to create it...`);
+        if (process.env.W4H_DEBUG) console.info(`[config] Database '${database}' does not exist. Attempting to create it...`);
         await testPool.end();
         testPoolEnded = true;
         
@@ -278,7 +281,7 @@ router.post('/database', requireAdminIfConfigured, async (req, res) => {
           }
 
           await adminPool.query(`CREATE DATABASE "${database}" TEMPLATE template1 ENCODING 'UTF8'`);
-          console.log(`Database '${database}' created successfully`);
+          if (process.env.W4H_DEBUG) console.info(`[config] Database '${database}' created successfully`);
           databaseCreated = true;
         } catch (createError) {
           await adminPool.end();
@@ -416,14 +419,10 @@ router.post('/database', requireAdminIfConfigured, async (req, res) => {
       code: error.code
     });
   }
-});
+}
 
-/**
- * POST /config/admin-setup
- * Create initial admin account after database setup
- * Public endpoint only when no users exist yet
- */
-router.post('/admin-setup', async (req, res) => {
+/** POST /config/admin-setup — Create initial admin account. Public only when no users exist yet. */
+async function postAdminSetup(req, res) {
   const { email, password, name } = req.body;
 
   if (!email || !password) {
@@ -434,15 +433,6 @@ router.post('/admin-setup', async (req, res) => {
   }
 
   try {
-    const initResult = await initializeDatabase();
-    if (!initResult.success) {
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to initialize database schema',
-        details: initResult.error
-      });
-    }
-
     const usersExist = await hasAnyUsers();
     if (usersExist) {
       return res.status(400).json({
@@ -504,14 +494,14 @@ router.post('/admin-setup', async (req, res) => {
       details: error.message
     });
   }
-});
+}
 
-/**
- * GET /config/test
- * Test database connection with current config
- * ADMIN ONLY (after initial setup)
- */
-router.get('/test', requireAdminIfConfigured, async (req, res) => {
+/** GET /config/test — Test database connection. Admin only. */
+async function getTest(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
   if (!process.env.DB_HOST || !process.env.DB_PORT || !process.env.DB_DATABASE || 
       !process.env.DB_USER || !process.env.DB_PASSWORD) {
     return res.status(400).json({
@@ -548,14 +538,14 @@ router.get('/test', requireAdminIfConfigured, async (req, res) => {
       details: error.message
     });
   }
-});
+}
 
-/**
- * POST /config/reset
- * Reset database connection pool (useful after manual .env changes)
- * ADMIN ONLY (after initial setup)
- */
-router.post('/reset', requireAdminIfConfigured, async (req, res) => {
+/** POST /config/reset — Reset database connection pool. Admin only. */
+async function postReset(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  
   try {
     const success = await db.resetPool();
     
@@ -578,96 +568,4 @@ router.post('/reset', requireAdminIfConfigured, async (req, res) => {
       details: error.message
     });
   }
-});
-
-/**
- * GET /config/docs-backup
- * Generate docs SQL backup and return filename + SQL payload
- * ADMIN ONLY (after initial setup)
- */
-router.get('/docs-backup', requireAdminIfConfigured, async (req, res) => {
-  try {
-    const result = await db.query(
-      `SELECT
-        slug,
-        title,
-        card_title,
-        description,
-        action_label,
-        doc_type,
-        sort_order,
-        hidden,
-        is_feature_card,
-        show_in_docs,
-        card_order,
-        md,
-        html,
-        toc,
-        updated_at
-       FROM w4h.docs
-       ORDER BY sort_order ASC NULLS LAST, slug ASC`
-    );
-
-    const header = [
-      '-- Docs backup generated from current database content',
-      '-- Generated by GET /config/docs-backup',
-      '-- This script is restore-ready: creates schema/table and replaces docs data',
-      ''
-    ].join('\n');
-
-    const valuesSql = result.rows
-      .map((doc) => {
-        const tocJson = JSON.stringify(doc.toc ?? []);
-        return `  (${[
-          sqlString(doc.slug),
-          sqlString(doc.title),
-          sqlString(doc.card_title),
-          sqlString(doc.description),
-          sqlString(doc.action_label),
-          sqlString(doc.doc_type),
-          sqlNumber(doc.sort_order),
-          sqlBool(doc.hidden),
-          sqlBool(doc.is_feature_card),
-          sqlBool(doc.show_in_docs),
-          sqlNumber(doc.card_order),
-          sqlString(doc.md),
-          sqlString(doc.html),
-          `${sqlString(tocJson)}::jsonb`,
-          'CURRENT_TIMESTAMP'
-        ].join(', ')})`;
-      })
-      .join(',\n');
-
-    const insertSql = valuesSql
-      ? `INSERT INTO w4h.docs (slug, title, card_title, description, action_label, doc_type, sort_order, hidden, is_feature_card, show_in_docs, card_order, md, html, toc, updated_at)\nVALUES\n${valuesSql};\n`
-      : '-- No docs rows found to insert.\n';
-
-    const sql = `${header}BEGIN;\n\nCREATE SCHEMA IF NOT EXISTS w4h;\nCREATE EXTENSION IF NOT EXISTS pgcrypto;\n\nCREATE TABLE IF NOT EXISTS w4h.docs (\n  id uuid NOT NULL DEFAULT gen_random_uuid(),\n  slug text COLLATE pg_catalog."default" NOT NULL,\n  title text COLLATE pg_catalog."default",\n  card_title text COLLATE pg_catalog."default",\n  description text COLLATE pg_catalog."default",\n  action_label text COLLATE pg_catalog."default",\n  doc_type text COLLATE pg_catalog."default",\n  sort_order integer,\n  hidden boolean,\n  updated_at timestamp without time zone,\n  is_feature_card boolean,\n  show_in_docs boolean,\n  md text COLLATE pg_catalog."default",\n  html text COLLATE pg_catalog."default",\n  toc jsonb,\n  card_order integer,\n  CONSTRAINT docs_pkey PRIMARY KEY (id),\n  CONSTRAINT docs_slug_key UNIQUE (slug)\n);\n\nCREATE INDEX IF NOT EXISTS idx_docs_slug ON w4h.docs(slug);\n\nTRUNCATE TABLE w4h.docs;\n\n${insertSql}\nCOMMIT;\n`;
-
-    const ts = dayjs().format('YYYY-MM-DD_HH-mm-ss');
-    const filename = `docs-backup-${ts}.sql`;
-
-    // In dev mode, save to data/docs.sql and return without sql payload
-    const isDev = process.env.NODE_ENV !== 'production';
-    if (isDev) {
-      const docsPath = path.join(__dirname, '..', 'data', 'docs.sql');
-      await fs.writeFile(docsPath, sql, 'utf8');
-      return res.json({ success: true, saved: 'data/docs.sql' });
-    }
-
-    res.json({
-      success: true,
-      filename,
-      sql
-    });
-  } catch (error) {
-    console.error('Docs backup generation error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to generate docs backup',
-      details: error.message
-    });
-  }
-});
-
-export default router;
+}

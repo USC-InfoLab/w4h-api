@@ -3,7 +3,7 @@ const router = express.Router();
 
 import { authenticate } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
-import { query } from '../lib/utils/db.js';
+import { query } from '../db.js';
 
 router.get('/studies', authenticate, listStudies);
 router.get('/studies-admin', authenticate, listStudiesAdmin);
@@ -31,6 +31,7 @@ async function listStudiesAdmin(req, res) {
   }
 
   try {
+    ///XXX: should use W$H_SCHEMA_NAME...
     const result = await query(
       `SELECT
          s.id,
@@ -38,9 +39,9 @@ async function listStudiesAdmin(req, res) {
          s.description,
          COUNT(DISTINCT d.id)::int AS dataset_count,
          COUNT(DISTINCT us.user_id)::int AS user_count
-       FROM w4h.studies s
+       FROM w4h.projects s
        LEFT JOIN w4h.datasets d ON d.study_id = s.id
-       LEFT JOIN w4h.user_studies us ON us.study_id = s.id
+       LEFT JOIN w4h.user_projects us ON us.study_id = s.id
        GROUP BY s.id, s.name, s.description
        ORDER BY s.name ASC`
     );
@@ -58,7 +59,7 @@ async function getStudyAdmin(req, res) {
 
   try {
     const result = await query(
-      `SELECT id, name, description FROM w4h.studies WHERE id = $1`,
+      `SELECT id, name, description FROM w4h.projects WHERE id = $1`,
       [req.params.id]
     );
 
@@ -87,18 +88,18 @@ async function addStudyAdmin(req, res) {
     }
 
     await query(
-      `INSERT INTO w4h.studies (id, name, description)
+      `INSERT INTO w4h.projects (id, name, description)
        VALUES ($1, $2, $3)`,
       [id, name, description || null]
     );
 
     // Keep admin users automatically linked to all studies.
     await query(
-      `INSERT INTO w4h.user_studies (user_id, study_id)
+      `INSERT INTO w4h.user_projects (user_id, project_id)
        SELECT u.id, $1
        FROM w4h.users u
        WHERE u.role = 'admin'
-       ON CONFLICT (user_id, study_id) DO NOTHING`,
+       ON CONFLICT (user_id, project_id) DO NOTHING`,
       [id]
     );
 
@@ -125,7 +126,7 @@ async function setStudyAdmin(req, res) {
     }
 
     const result = await query(
-      `UPDATE w4h.studies
+      `UPDATE w4h.projects
        SET name = $1, description = $2
        WHERE id = $3`,
       [name, description || null, req.params.id]
@@ -148,7 +149,7 @@ async function listStudies(req, res) {
 
   let sql = `
     SELECT id, name
-    FROM w4h.studies
+    FROM w4h.projects
   `;
   const params = [];
 
@@ -157,7 +158,7 @@ async function listStudies(req, res) {
       WHERE EXISTS (
         SELECT 1
         FROM w4h.user_studies us
-        WHERE us.study_id = w4h.studies.id
+        WHERE us.study_id = w4h.projects.id
           AND us.user_id = $1
       )
     `;
@@ -188,8 +189,8 @@ async function tableInfo(req, res) {
       : await query(
         `SELECT d.id, d.study_id
          FROM w4h.datasets d
-         JOIN w4h.user_studies us
-           ON us.study_id = d.study_id
+         JOIN w4h.user_projects us
+           ON us.project_id = d.project_id
          WHERE d.id = $1 AND us.user_id = $2`,
         [req.query.dataset_id, req.user.id]
       );
