@@ -36,9 +36,9 @@ async function syncUserStudies(userId, role, requestedStudyIds = []) {
 
   if (studyIds.length > 0) {
     await query(
-      `INSERT INTO ${SCHEMA}.user_projects (user_id, study_id)
+      `INSERT INTO ${SCHEMA}.user_projects (user_id, project_id)
        SELECT $1, UNNEST($2::text[])
-       ON CONFLICT (user_id, study_id) DO NOTHING`,
+       ON CONFLICT (user_id, project_id) DO NOTHING`,
       [userId, studyIds]
     );
   }
@@ -48,10 +48,10 @@ async function syncUserStudies(userId, role, requestedStudyIds = []) {
 
 async function ensureAdminAssignedToAllStudies(userId) {
   await query(
-    `INSERT INTO ${SCHEMA}.user_studies (user_id, study_id)
+    `INSERT INTO ${SCHEMA}.user_projects (user_id, project_id)
      SELECT $1, s.id
      FROM ${SCHEMA}.projects s
-     ON CONFLICT (user_id, study_id) DO NOTHING`,
+     ON CONFLICT (user_id, project_id) DO NOTHING`,
     [userId]
   );
 }
@@ -313,9 +313,9 @@ async function getByEmail(req, res) {
            )
            ELSE COALESCE(
              (
-               SELECT ARRAY_AGG(us.study_id ORDER BY s.name)
-               FROM ${SCHEMA}.user_studies us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.study_id
+               SELECT ARRAY_AGG(us.project_id ORDER BY s.name)
+               FROM ${SCHEMA}.user_projects us
+               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                WHERE us.user_id = u.id
              ),
              '{}'
@@ -329,8 +329,8 @@ async function getByEmail(req, res) {
            ELSE COALESCE(
              (
                SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
-               FROM ${SCHEMA}.user_studies us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.study_id
+               FROM ${SCHEMA}.user_projects us
+               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                WHERE us.user_id = u.id
              ),
              ''
@@ -370,9 +370,9 @@ async function list(req, res) {
            )
            ELSE COALESCE(
              (
-               SELECT ARRAY_AGG(us.study_id ORDER BY s.name)
-               FROM ${SCHEMA}.user_studies us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.study_id
+               SELECT ARRAY_AGG(us.project_id ORDER BY s.name)
+               FROM ${SCHEMA}.user_projects us
+               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                WHERE us.user_id = u.id
              ),
              '{}'
@@ -386,8 +386,8 @@ async function list(req, res) {
            ELSE COALESCE(
              (
                SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
-               FROM ${SCHEMA}.user_studies us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.study_id
+               FROM ${SCHEMA}.user_projects us
+               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                WHERE us.user_id = u.id
              ),
              ''
