@@ -17,6 +17,25 @@ router.get('/:id', authenticate, getDataset);
 const STATUS_TABLE_NAME = 'w4h.status_log';
 const DATASET_ALLOWED_ROLES = new Set(['admin', 'researcher', 'clinician']);
 
+/** Legacy DBs still use study_id; newer schema uses project_id. */
+let datasetsProjectColumnCache = null;
+
+async function datasetsProjectFkColumn() {
+  if (datasetsProjectColumnCache) return datasetsProjectColumnCache;
+  const r = await query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'w4h' AND table_name = 'datasets'
+       AND column_name IN ('project_id', 'study_id')`
+  );
+  const names = new Set(r.rows.map((row) => row.column_name));
+  if (names.has('project_id')) datasetsProjectColumnCache = 'project_id';
+  else if (names.has('study_id')) datasetsProjectColumnCache = 'study_id';
+  else {
+    throw new Error('w4h.datasets has neither project_id nor study_id');
+  }
+  return datasetsProjectColumnCache;
+}
+
 function canAccessDatasets(user) {
   return !!user && DATASET_ALLOWED_ROLES.has(user.role);
 }
@@ -32,6 +51,7 @@ async function listStudiesAdmin(req, res) {
 
   try {
     ///XXX: should use W$H_SCHEMA_NAME...
+    const pc = await datasetsProjectFkColumn();
     const result = await query(
       `SELECT
          s.id,
@@ -40,7 +60,7 @@ async function listStudiesAdmin(req, res) {
          COUNT(DISTINCT d.id)::int AS dataset_count,
          COUNT(DISTINCT us.user_id)::int AS user_count
        FROM w4h.projects s
-       LEFT JOIN w4h.datasets d ON d.project_id = s.id
+       LEFT JOIN w4h.datasets d ON d.${pc} = s.id
        LEFT JOIN w4h.user_projects us ON us.project_id = s.id
        GROUP BY s.id, s.name, s.description
        ORDER BY s.name ASC`
@@ -181,16 +201,17 @@ async function tableInfo(req, res) {
   let partitions = [];
 
   try {
+    const pc = await datasetsProjectFkColumn();
     const datasetAccessResult = req.user.role === USER_ROLES.ADMIN
       ? await query(
-        `SELECT id, project_id AS study_id FROM w4h.datasets WHERE id = $1`,
+        `SELECT id, ${pc} AS study_id FROM w4h.datasets WHERE id = $1`,
         [req.query.dataset_id]
       )
       : await query(
-        `SELECT d.id, d.project_id AS study_id
+        `SELECT d.id, d.${pc} AS study_id
          FROM w4h.datasets d
          JOIN w4h.user_projects us
-           ON us.project_id = d.project_id
+           ON us.project_id = d.${pc}
          WHERE d.id = $1 AND us.user_id = $2`,
         [req.query.dataset_id, req.user.id]
       );
@@ -385,8 +406,9 @@ async function listDatasets(req, res) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
+  const pc = await datasetsProjectFkColumn();
   let sql = `
-    SELECT d.id, d.project_id AS study_id, d.name, d.description
+    SELECT d.id, d.${pc} AS study_id, d.name, d.description
     FROM w4h.datasets d
   `;
   const params = [];
@@ -394,7 +416,7 @@ async function listDatasets(req, res) {
   if (req.user.role !== USER_ROLES.ADMIN) {
     sql += `
       JOIN w4h.user_projects us
-        ON us.project_id = d.project_id
+        ON us.project_id = d.${pc}
     `;
     params.push(req.user.id);
     sql += ` WHERE us.user_id = $${params.length}`;
@@ -403,8 +425,8 @@ async function listDatasets(req, res) {
   if (req.query.study_id) {
     params.push(req.query.study_id);
     sql += params.length === 1 && req.user.role === USER_ROLES.ADMIN
-      ? ` WHERE d.project_id = $${params.length}`
-      : ` AND d.project_id = $${params.length}`;
+      ? ` WHERE d.${pc} = $${params.length}`
+      : ` AND d.${pc} = $${params.length}`;
   }
 
   sql += ` ORDER BY name ASC`;
@@ -443,18 +465,19 @@ async function getDataset(req, res) {
   }
 
   const { id } = req.params;
+  const pc = await datasetsProjectFkColumn();
   const result = req.user.role === USER_ROLES.ADMIN
     ? await query(
-      `SELECT id, project_id AS study_id, name, description
+      `SELECT id, ${pc} AS study_id, name, description
        FROM w4h.datasets
        WHERE id = $1`,
       [id]
     )
     : await query(
-      `SELECT d.id, d.project_id AS study_id, d.name, d.description
+      `SELECT d.id, d.${pc} AS study_id, d.name, d.description
        FROM w4h.datasets d
        JOIN w4h.user_projects us
-         ON us.project_id = d.project_id
+         ON us.project_id = d.${pc}
        WHERE d.id = $1 AND us.user_id = $2`,
       [id, req.user.id]
     );
