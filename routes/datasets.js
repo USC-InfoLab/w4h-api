@@ -11,12 +11,6 @@ router.get('/projects-admin', authenticate, listStudiesAdmin);
 router.get('/projects-admin/:id', authenticate, getStudyAdmin);
 router.post('/projects-admin', authenticate, addStudyAdmin);
 router.put('/projects-admin/:id', authenticate, setStudyAdmin);
-// Legacy paths (same handlers)
-router.get('/studies', authenticate, listStudies);
-router.get('/studies-admin', authenticate, listStudiesAdmin);
-router.get('/studies-admin/:id', authenticate, getStudyAdmin);
-router.post('/studies-admin', authenticate, addStudyAdmin);
-router.put('/studies-admin/:id', authenticate, setStudyAdmin);
 router.get('/tableinfo', authenticate, tableInfo);
 router.get('/', authenticate, listDatasets);
 router.get('/:id', authenticate, getDataset);
@@ -209,7 +203,7 @@ async function tableInfo(req, res) {
     }
 
     const catalogProjectId =
-      req.query.project_id || req.query.study_id || datasetAccessResult.rows[0].dataset_project_id;
+      req.query.project_id || datasetAccessResult.rows[0].dataset_project_id;
     const queryMap = await getQueryMap(catalogProjectId);
     const dataset = queryMap.get(req.query.dataset_id);
 
@@ -411,7 +405,7 @@ async function listDatasets(req, res) {
     sql += ` WHERE us.user_id = $${params.length}`;
   }
 
-  const filterProjectId = req.query.project_id || req.query.study_id;
+  const filterProjectId = req.query.project_id;
   if (filterProjectId) {
     params.push(filterProjectId);
     sql += params.length === 1 && req.user.role === USER_ROLES.ADMIN

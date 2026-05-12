@@ -10,11 +10,10 @@ import { isMailerConfigured, sendMail } from '../lib/mailer.js';
 const SCHEMA = 'w4h';
 const TABLE = 'users';
 
-/** Request body may still send study_ids; prefer project_ids. */
+/** Project ids assigned to the user (catalog / ACL projects). */
 function pickProjectIds(user) {
   if (!user || typeof user !== 'object') return [];
-  const raw = user.project_ids ?? user.study_ids;
-  return normalizeProjectIds(raw);
+  return normalizeProjectIds(user.project_ids);
 }
 
 function normalizeProjectIds(input) {
