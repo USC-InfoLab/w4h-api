@@ -70,3 +70,23 @@ CREATE TABLE IF NOT EXISTS w4h.docs (
   CONSTRAINT docs_slug_key UNIQUE (slug)
 );
 CREATE INDEX IF NOT EXISTS idx_docs_slug ON w4h.docs(slug);
+
+CREATE TABLE IF NOT EXISTS w4h.user_api_keys (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id integer NOT NULL,
+  token_hash text NOT NULL,
+  prefix text NOT NULL,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  revoked_at timestamp without time zone,
+  CONSTRAINT user_api_keys_pkey PRIMARY KEY (id),
+  CONSTRAINT user_api_keys_user_fk FOREIGN KEY (user_id)
+    REFERENCES w4h.users (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_api_keys_token_active
+  ON w4h.user_api_keys (token_hash)
+  WHERE revoked_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_api_keys_one_active_per_user
+  ON w4h.user_api_keys (user_id)
+  WHERE revoked_at IS NULL;
