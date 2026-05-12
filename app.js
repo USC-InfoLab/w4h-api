@@ -13,7 +13,6 @@ if (process.env.W4H_DEBUG) {
 import { execa } from 'execa';
 import express from 'express';
 import cors from 'cors';
-import bodyParser from 'body-parser';
 
 import users from './routes/users.js';
 import mailer from './routes/mailer.js';
@@ -26,13 +25,9 @@ import projects from './routes/projects.js';
 const app = express();
 app.use(cors());
 
-// Increase JSON body limit to e.g. 10mb
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// app.use(express.urlencoded({extended: true})); 
-// app.use(bodyParser.json()); // support json encoded bodies
-// app.use(bodyParser.urlencoded({ extended: true })); // support encoded bodies
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.on('uncaughtException', err => {
@@ -43,8 +38,6 @@ app.on('uncaughtException', err => {
 app.listen(process.env.PORT, () => {
   console.log('App running at: http://localhost:' + process.env.PORT);
 });
-
-///////////////////////////////////////////////////////////////////////
 
 app.use('/users', users);
 app.use('/mailer', mailer);

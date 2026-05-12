@@ -32,7 +32,6 @@ async function listStudiesAdmin(req, res) {
   }
 
   try {
-    ///XXX: should use W$H_SCHEMA_NAME...
     const pc = await resolveDatasetProjectLinkColumn();
     const result = await query(
       `SELECT
@@ -95,7 +94,6 @@ async function addStudyAdmin(req, res) {
       [id, name, description || null]
     );
 
-    // Keep admin users automatically linked to all studies.
     await query(
       `INSERT INTO w4h.user_projects (user_id, project_id)
        SELECT u.id, $1
@@ -216,12 +214,10 @@ async function tableInfo(req, res) {
       return res.status(400).json({ error: 'Missing table for dataset' });
     }
 
-    // Parse schema + table name
     const [schemaName, tableName] = table.includes('.')
       ? table.split('.')
       : ['public', table];
 
-    // 1️⃣ Get column metadata (names + types)
     const colSql = `
       SELECT column_name AS name, data_type AS type
       FROM information_schema.columns
@@ -236,8 +232,6 @@ async function tableInfo(req, res) {
       .map(r => r.name);
 
     if (columnIds.includes(XT_PARTITION_ID)) {
-      // query partitions
-      // Assume 'schemaName' holds the city's schema (e.g., 'city')
       const partitionTable = dataset.datasetInfo.partitionTableInfo.table;
       const partitionSql = `
   SELECT id, name
@@ -248,7 +242,6 @@ async function tableInfo(req, res) {
       partitions = partitionResult.rows;
     }
 
-    // 2️⃣ Pull one small sample of data
     const sampleSql = `
       SELECT *
       FROM ${table}
@@ -258,7 +251,6 @@ async function tableInfo(req, res) {
     const sampleResult = await query(sampleSql);
     const sampleRows = sampleResult.rows || [];
 
-    // 3️⃣ Compute distinct values from the sample
     for (const col of textColumns) {
       const sampleValues = sampleRows
         .map(r => r[col])
@@ -268,12 +260,12 @@ async function tableInfo(req, res) {
 
       const unique = [...new Set(sampleValues)];
 
-      if (unique.length >= 190) { // 95%
+      if (unique.length >= 190) {
         if (process.env.W4H_DEBUG) console.log(`⚙️ Skipping noisy column: ${col}`);
         continue;
       }
 
-      values[col] = unique; //.slice(0, 200);      // keep up to 200 unique values
+      values[col] = unique;
     }
 
     const columns = colResult.rows;
@@ -294,10 +286,8 @@ async function tableInfo(req, res) {
   }
 }
 
-// Helper function to process a single dataset
 async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
   const datasetId = dataset.id;
-  // Add mixins to dataset
   const mixins = [];
   for (const [key, entry] of QUERY_MAP.entries()) {
     if (entry.datasetInfo && entry.datasetInfo.id === datasetId) {
@@ -308,9 +298,9 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
   mixins.sort((a, b) => {
     const aHasColon = a.id.includes(':');
     const bHasColon = b.id.includes(':');
-    if (aHasColon !== bHasColon) {
-      return aHasColon ? 1 : -1; // mixins WITHOUT ':' come first
-    }
+      if (aHasColon !== bHasColon) {
+        return aHasColon ? 1 : -1;
+      }
     return (a.description || '').localeCompare(b.description || '');
   });
 
@@ -323,11 +313,10 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
     mixins,
   };
 
-  // Query status logs for tables in this dataset
   const allUniqueTableNames = new Set();
   processedDataset.tables?.forEach(table => {
     allUniqueTableNames.add(table);
-    allUniqueTableNames.add(table + '_staging');   // add staging variant
+    allUniqueTableNames.add(table + '_staging');
   });
 
   const datasetTables = tableConfigs
@@ -335,7 +324,7 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
 
   datasetTables.forEach(d => {
     allUniqueTableNames.add(d.name);
-    allUniqueTableNames.add(d.name + '_staging'); // add staging variant
+    allUniqueTableNames.add(d.name + '_staging');
   });
 
   const tableNamesArray = Array.from(allUniqueTableNames);
@@ -353,7 +342,6 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
   }
 
   if (processedDataset.tables) {
-    // Assign status and metabase_url to each table
     processedDataset.tables = processedDataset.tables?.map((table, index) => ({
       name: table,
       status: statusMap.get(table)
@@ -363,13 +351,11 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
       source_name: datasetInfo.sources?.[index]?.name || null,
       source_url: datasetInfo.sources?.[index]?.url || null
     })) || [];
-    // Remove redundant top-level metabase_urls
     delete processedDataset.metabase_urls;
     delete processedDataset.sources;
   } else {
     processedDataset.tables = datasetTables;
 
-    // Assign status to each table
     processedDataset.tables = processedDataset.tables.map(tableInfo => ({
       name: tableInfo.name,
       metabase_url: tableInfo.metabase_url || null,
@@ -428,7 +414,6 @@ async function listDatasets(req, res) {
     WHERE dataset_id = ANY($1)
   `, [datasetIds]);
 
-  // Process datasets
   const datasets = [];
   const queryMapByCatalogProject = new Map();
 
@@ -479,7 +464,6 @@ async function getDataset(req, res) {
     WHERE dataset_id = $1
   `, [dataset.id]);
 
-  // 2. Load the hardcoded map (Backward Compatibility Base)
   const QUERY_MAP = await getQueryMap(dataset.dataset_project_id);
 
   const processedDataset = await processDataset(dataset, req.user, QUERY_MAP, tableConfigs.rows);

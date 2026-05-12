@@ -66,7 +66,6 @@ function slugify(input) {
     .replace(/(^-|-$)/g, '');
 }
 
-/** Accept website_url (preferred) or legacy keys from JSON bodies. */
 function normalizeOrgWebsiteUrl(row) {
   if (!row || typeof row !== 'object') return null;
   const raw = row.website_url ?? row.websiteUrl ?? row.url ?? row.link;
@@ -291,7 +290,6 @@ function normalizeLaunchersPayload(raw) {
   };
 }
 
-/** Replace collaborating org rows for a project (requires w4h.project_organizations from data/projects_acl.sql). */
 async function replaceProjectOrganizationsData(projectId, organizations) {
   const rows = Array.isArray(organizations) ? organizations : [];
   await query(`DELETE FROM w4h.project_organizations WHERE project_id = $1::uuid`, [projectId]);

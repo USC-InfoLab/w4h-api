@@ -1,10 +1,3 @@
-/**
- * One-time (idempotent) migration: create w4h.user_projects and backfill from
- * w4h.user_studies when present. Needed after studies→projects rename when the
- * DB was created from an older schema.
- *
- * project_id type matches w4h.projects.id (text from schema.sql vs uuid from projects_acl.sql).
- */
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';

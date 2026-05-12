@@ -3,11 +3,6 @@ import { authenticate } from '../auth.js';
 
 const router = express.Router();
 
-/**
- * GET /platform/hub-principles
- * Non-secret alignment notes for clients (metadata, ACL, credentials).
- * Datasets (catalog projects) remain the source of truth; this is descriptive only.
- */
 router.get('/hub-principles', authenticate, (req, res) => {
   res.json({
     metadataLayer: 'postgres_including_column_comments',

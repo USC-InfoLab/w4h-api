@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Example: mint a project DB token with a W4H JWT, then fetch project overview
-using X-W4H-Project-DB-Token (no password in notebook).
-
-Usage:
-  export W4H_API_BASE=http://localhost:2026
-  export W4H_JWT='<paste token from browser localStorage w4h.user.token>'
-  export W4H_PROJECT_ID='<uuid>'
-  python project_db_token_client.py
-
-After this works, reuse the same X-W4H-Project-DB-Token on read-only project routes; notebook rows appear in GET /projects/<id> under "notebooks".
-
-Requires: pip install requests
-"""
 
 from __future__ import annotations
 

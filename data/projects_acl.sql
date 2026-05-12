@@ -1,6 +1,3 @@
--- Projects hub: collaboration tables, ACL, DB tokens, collaborating orgs, launcher config.
--- Run after data/schema.sql (and data/datasets.sql if datasets are required). Safe to re-run.
-
 BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -21,9 +18,6 @@ CREATE TABLE IF NOT EXISTS w4h.projects (
 
 ALTER TABLE w4h.projects
   ADD COLUMN IF NOT EXISTS launchers jsonb NOT NULL DEFAULT '{}'::jsonb;
-
-COMMENT ON COLUMN w4h.projects.launchers IS
-  'JSON: jupyterBaseUrl, rstudioBaseUrl, vscodeTemplate — used by project hub launch buttons.';
 
 CREATE INDEX IF NOT EXISTS idx_projects_slug ON w4h.projects(slug);
 CREATE INDEX IF NOT EXISTS idx_projects_created_by ON w4h.projects(created_by);
@@ -122,7 +116,6 @@ CREATE TABLE IF NOT EXISTS w4h.project_organizations (
 CREATE INDEX IF NOT EXISTS idx_project_organizations_project_id
   ON w4h.project_organizations(project_id, sort_order, name);
 
--- Upgrade rows created by older split migration files (role / legacy url column).
 ALTER TABLE w4h.project_organizations DROP COLUMN IF EXISTS role;
 
 ALTER TABLE w4h.project_organizations ADD COLUMN IF NOT EXISTS website_url text;
@@ -140,21 +133,5 @@ BEGIN
     ALTER TABLE w4h.project_organizations DROP COLUMN url;
   END IF;
 END $$;
-
-COMMENT ON TABLE w4h.projects IS 'Research project shell: metadata, IRB references, visibility.';
-COMMENT ON COLUMN w4h.projects.slug IS 'URL-safe unique key for routing and APIs.';
-COMMENT ON COLUMN w4h.projects.visibility IS 'org-private | project-private | internal — complements row-level ACL.';
-
-COMMENT ON TABLE w4h.project_members IS 'Collaborators and coarse roles for the project hub.';
-COMMENT ON TABLE w4h.project_datasets IS 'Which catalog datasets are linked to this project and read/write intent.';
-COMMENT ON TABLE w4h.project_notebooks IS 'Notebook/repo pointers only; execution happens in external runtimes.';
-COMMENT ON TABLE w4h.project_docs IS 'Links project hub to internal docs (w4h.docs) by slug.';
-COMMENT ON TABLE w4h.project_acl_rules IS 'Fine-grained allow/deny rules; evaluate with project role and membership.';
-COMMENT ON TABLE w4h.project_db_tokens IS 'Short-lived project-scoped secrets; store SHA-256 hash only, never raw token.';
-
-COMMENT ON TABLE w4h.project_organizations IS
-  'Admin-managed collaborating organizations displayed on the project hub.';
-COMMENT ON COLUMN w4h.project_organizations.website_url IS
-  'Optional organization homepage; shown as a link on the project hub.';
 
 COMMIT;

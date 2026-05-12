@@ -1,12 +1,7 @@
 import pkg from 'pg';
 const { Pool, types } = pkg;
 
-// Parse PostgreSQL 'numeric' type as float instead of string
 types.setTypeParser(1700, d => parseFloat(d));
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 export const SCHEMA_NAME = 'w4h';
 export const USERS_TABLE_NAME = 'users';
@@ -17,7 +12,6 @@ export const DOCS_TABLE = `${SCHEMA_NAME}.${DOCS_TABLE_NAME}`;
 export const USER_TABLE = `${SCHEMA_NAME}.${USERS_TABLE_NAME}`;
 export const USER_PROJECTS_TABLE = `${SCHEMA_NAME}.${USERS_USER_PROJECTS}`;
 
-// We only track types for ingested data.
 export const SQL_TYPES = {
   INTEGER: 'integer',
   DOUBLE_PRECISION: 'double precision',
@@ -31,10 +25,6 @@ export const SQL_TYPES = {
   TIMESTAMP_WITH_TIME_ZONE: 'timestamp with time zone',
   SERIAL: 'serial',
 };
-
-// ---------------------------------------------------------------------------
-// Pool management
-// ---------------------------------------------------------------------------
 
 let pool = null;
 
@@ -104,10 +94,6 @@ export async function resetPool() {
   return pool !== null;
 }
 
-// ---------------------------------------------------------------------------
-// Query
-// ---------------------------------------------------------------------------
-
 export async function query(sql, params) {
   const currentPool = getPool();
 
@@ -136,11 +122,6 @@ export async function query(sql, params) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Schema utilities
-// ---------------------------------------------------------------------------
-
-/** Parse 'schema.table' or bare 'table' (defaults to SCHEMA_NAME). */
 function parseTable(table) {
   const dot = table.indexOf('.');
   return dot >= 0
@@ -186,9 +167,5 @@ export async function getUserTablesInSchema(schema) {
   );
   return result.rows.map(row => row.table_name);
 }
-
-// ---------------------------------------------------------------------------
-// Default export (for `import db from './db.js'` consumers)
-// ---------------------------------------------------------------------------
 
 export default { query, resetPool, isConfigured, getPool };

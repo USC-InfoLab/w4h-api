@@ -10,7 +10,6 @@ import { isMailerConfigured, sendMail } from '../lib/mailer.js';
 const SCHEMA = 'w4h';
 const TABLE = 'users';
 
-/** Project ids assigned to the user (catalog / ACL projects). */
 function pickProjectIds(user) {
   if (!user || typeof user !== 'object') return [];
   return normalizeProjectIds(user.project_ids);
@@ -86,7 +85,6 @@ function tokenValid(req, res) {
       return res.json({ tokenExpired: true });
     }
     
-    // Verify the token (will throw if expired or invalid)
     jwt.verify(token, process.env.TOKEN_SECRET);
     res.json({ tokenExpired: false });
   } catch (error) {
@@ -151,7 +149,6 @@ async function setUser(req, res) {
 
     const effectiveRole = existingUser.role === 'admin' ? 'admin' : user.role;
     
-    // Validate password if provided
     if (user.password) {
       const passwordValidation = validatePassword(user.password);
       if (!passwordValidation.valid) {
