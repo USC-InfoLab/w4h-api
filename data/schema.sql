@@ -12,6 +12,11 @@ CREATE TABLE IF NOT EXISTS w4h.users (
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON w4h.users(email);
 
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_hash text;
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_prefix text;
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_created_at timestamp with time zone;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key_hash ON w4h.users(api_key_hash) WHERE api_key_hash IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS w4h.projects (
   id text COLLATE pg_catalog."default" NOT NULL,
   name text COLLATE pg_catalog."default" NOT NULL,

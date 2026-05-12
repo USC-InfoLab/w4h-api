@@ -1,16 +1,23 @@
 import express from 'express';
-import { authenticate } from '../auth.js';
 
 const router = express.Router();
 
-router.get('/hub-principles', authenticate, (req, res) => {
+router.get('/hub-principles', (req, res) => {
   res.json({
     metadataLayer: 'postgres_including_column_comments',
     datasetRepresentation: 'metadata_layer',
     accessControl: 'roles_as_groups_app_maps_to_postgres_acl',
     credentialFlow: 'api_key_to_backend_to_short_lived_pg_credentials',
     computeTargets: ['local', 'spark', 'databricks'],
-    apiKeyScopeOptions: ['user', 'project']
+    apiKeyScopeOptions: ['user', 'project'],
+    userApiKeyPrefix: 'w4h_sk_',
+    userApiKeyHeaders: ['Authorization: Bearer <key>', 'Authorization: <jwt>', 'X-W4H-API-Key: <key>'],
+    userApiKeyRotatePath: 'POST /users/me/api-key',
+    userApiKeyRevokeSelfPath: 'DELETE /users/me/api-key',
+    userApiKeyRevokeAdminPath: 'DELETE /users/user/:email/api-key',
+    projectDbTokenHeader: 'X-W4H-Project-DB-Token',
+    projectDbTokenMintPath: 'POST /projects/:id/db-token',
+    notebookDataPaths: ['GET /datasets', 'GET /datasets/:id', 'GET /projects/:id']
   });
 });
 

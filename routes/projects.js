@@ -1,34 +1,34 @@
 import express from 'express';
 import crypto from 'crypto';
 
-import { authenticate } from '../auth.js';
-import { authenticateJwtOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
+import { authenticateJwtOrApiKey } from '../auth.js';
+import { authenticateJwtApiKeyOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
 import { query } from '../db.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 
 const router = express.Router();
 
-router.get('/', authenticate, listProjects);
-router.post('/', authenticate, createProject);
+router.get('/', authenticateJwtOrApiKey, listProjects);
+router.post('/', authenticateJwtOrApiKey, createProject);
 
-router.get('/:id/db-tokens', authenticate, listProjectDbTokens);
-router.delete('/:id/db-tokens/:tokenId', authenticate, revokeProjectDbToken);
-router.get('/:id/acl', authenticate, getProjectAclRules);
-router.put('/:id/acl', authenticate, replaceProjectAclRules);
+router.get('/:id/db-tokens', authenticateJwtOrApiKey, listProjectDbTokens);
+router.delete('/:id/db-tokens/:tokenId', authenticateJwtOrApiKey, revokeProjectDbToken);
+router.get('/:id/acl', authenticateJwtOrApiKey, getProjectAclRules);
+router.put('/:id/acl', authenticateJwtOrApiKey, replaceProjectAclRules);
 
-router.get('/:id', authenticateJwtOrProjectDbToken, getProjectOverview);
+router.get('/:id', authenticateJwtApiKeyOrProjectDbToken, getProjectOverview);
 
-router.patch('/:id', authenticate, updateProject);
-router.post('/:id/members', authenticate, addProjectMember);
-router.patch('/:id/members/:userId', authenticate, updateProjectMemberRole);
-router.delete('/:id/members/:userId', authenticate, removeProjectMember);
-router.put('/:id/members', authenticate, replaceProjectMembers);
-router.put('/:id/organizations', authenticate, replaceProjectOrganizations);
-router.put('/:id/datasets', authenticate, replaceProjectDatasets);
-router.put('/:id/notebooks', authenticate, replaceProjectNotebooks);
-router.put('/:id/docs', authenticate, replaceProjectDocs);
-router.post('/:id/db-token', authenticate, issueProjectDbToken);
+router.patch('/:id', authenticateJwtOrApiKey, updateProject);
+router.post('/:id/members', authenticateJwtOrApiKey, addProjectMember);
+router.patch('/:id/members/:userId', authenticateJwtOrApiKey, updateProjectMemberRole);
+router.delete('/:id/members/:userId', authenticateJwtOrApiKey, removeProjectMember);
+router.put('/:id/members', authenticateJwtOrApiKey, replaceProjectMembers);
+router.put('/:id/organizations', authenticateJwtOrApiKey, replaceProjectOrganizations);
+router.put('/:id/datasets', authenticateJwtOrApiKey, replaceProjectDatasets);
+router.put('/:id/notebooks', authenticateJwtOrApiKey, replaceProjectNotebooks);
+router.put('/:id/docs', authenticateJwtOrApiKey, replaceProjectDocs);
+router.post('/:id/db-token', authenticateJwtOrApiKey, issueProjectDbToken);
 
 function canCreateProject(user) {
   return !!user && user.role === USER_ROLES.ADMIN;

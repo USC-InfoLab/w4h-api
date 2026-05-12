@@ -1,19 +1,19 @@
 import express from 'express';
 const router = express.Router();
 
-import { authenticate } from '../auth.js';
+import { authenticateJwtOrApiKey } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 
-router.get('/projects', authenticate, listStudies);
-router.get('/projects-admin', authenticate, listStudiesAdmin);
-router.get('/projects-admin/:id', authenticate, getStudyAdmin);
-router.post('/projects-admin', authenticate, addStudyAdmin);
-router.put('/projects-admin/:id', authenticate, setStudyAdmin);
-router.get('/tableinfo', authenticate, tableInfo);
-router.get('/', authenticate, listDatasets);
-router.get('/:id', authenticate, getDataset);
+router.get('/projects', authenticateJwtOrApiKey, listStudies);
+router.get('/projects-admin', authenticateJwtOrApiKey, listStudiesAdmin);
+router.get('/projects-admin/:id', authenticateJwtOrApiKey, getStudyAdmin);
+router.post('/projects-admin', authenticateJwtOrApiKey, addStudyAdmin);
+router.put('/projects-admin/:id', authenticateJwtOrApiKey, setStudyAdmin);
+router.get('/tableinfo', authenticateJwtOrApiKey, tableInfo);
+router.get('/', authenticateJwtOrApiKey, listDatasets);
+router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
 const DATASET_ALLOWED_ROLES = new Set(['admin', 'researcher', 'clinician']);

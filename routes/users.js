@@ -1,6 +1,7 @@
 import express from 'express';
 const router = express.Router();
 import bcrypt from 'bcrypt';
+import crypto from 'crypto';
 import { query } from '../db.js';
 import * as auth from '../auth.js';
 import jwt from 'jsonwebtoken';
@@ -63,6 +64,10 @@ async function ensureAdminAssignedToAllProjects(userId) {
 
 router.post('/login', login);
 router.post('/token-valid', tokenValid);
+router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
+router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
+router.delete('/me/api-key', auth.authenticate, revokeMyApiKey);
+router.delete('/user/:email/api-key', auth.authenticate, revokeUserApiKeyByEmail);
 router.get('/', auth.authenticate, list);
 router.get('/user/:email', auth.authenticate, getByEmail);
 router.post('/profile', auth.authenticate, updateProfile);
@@ -114,6 +119,96 @@ async function del(req, res) {
     res.json({ success: true, message: 'User deleted' });
   } catch (error) {
     console.error('Delete user error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function getMyApiKeyMeta(req, res) {
+  try {
+    const result = await query(
+      `SELECT api_key_prefix, api_key_created_at, (api_key_hash IS NOT NULL) AS api_key_active
+       FROM ${SCHEMA}.${TABLE} WHERE id = $1`,
+      [req.user.id]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const row = result.rows[0];
+    res.json({
+      active: row.api_key_active,
+      api_key_prefix: row.api_key_prefix,
+      api_key_created_at: row.api_key_created_at
+    });
+  } catch (error) {
+    console.error('getMyApiKeyMeta:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function rotateMyApiKey(req, res) {
+  try {
+    const raw = `${auth.USER_API_KEY_PREFIX}${crypto.randomBytes(32).toString('base64url')}`;
+    const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
+    const prefix = raw.slice(0, 24);
+    const result = await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET api_key_hash = $1, api_key_prefix = $2, api_key_created_at = NOW()
+       WHERE id = $3
+       RETURNING api_key_created_at`,
+      [tokenHash, prefix, req.user.id]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.status(201).json({
+      api_key: raw,
+      api_key_prefix: prefix,
+      api_key_created_at: result.rows[0].api_key_created_at
+    });
+  } catch (error) {
+    console.error('rotateMyApiKey:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function revokeMyApiKey(req, res) {
+  try {
+    await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET api_key_hash = NULL, api_key_prefix = NULL, api_key_created_at = NULL
+       WHERE id = $1`,
+      [req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('revokeMyApiKey:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function revokeUserApiKeyByEmail(req, res) {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin privileges required' });
+  }
+  try {
+    const rawEmail = Array.isArray(req.params.email) ? req.params.email[0] : req.params.email;
+    const email = decodeURIComponent(String(rawEmail || '').trim());
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    const result = await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET api_key_hash = NULL, api_key_prefix = NULL, api_key_created_at = NULL
+       WHERE email = $1
+       RETURNING id`,
+      [email]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('revokeUserApiKeyByEmail:', error);
     res.status(500).json({ error: error.message });
   }
 }
@@ -309,6 +404,9 @@ async function getByEmail(req, res) {
          u.email,
          u.role,
          u.created_at,
+         u.api_key_prefix,
+         u.api_key_created_at,
+         (u.api_key_hash IS NOT NULL) AS api_key_active,
          CASE
            WHEN u.role = 'admin' THEN COALESCE(
              (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.projects s),
@@ -341,7 +439,7 @@ async function getByEmail(req, res) {
          END AS projects
        FROM ${SCHEMA}.${TABLE} u
        WHERE u.email = $1`,
-      [req.params.email]
+      [decodeURIComponent(String(req.params.email || ''))]
     );
     if (result.rows.length > 0) {
       res.json(result.rows[0]);
@@ -366,6 +464,9 @@ async function list(req, res) {
          u.email,
          u.role,
          u.created_at,
+         u.api_key_prefix,
+         u.api_key_created_at,
+         (u.api_key_hash IS NOT NULL) AS api_key_active,
          CASE
            WHEN u.role = 'admin' THEN COALESCE(
              (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.projects s),

@@ -134,4 +134,9 @@ BEGIN
   END IF;
 END $$;
 
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_hash text;
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_prefix text;
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_created_at timestamp with time zone;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key_hash ON w4h.users(api_key_hash) WHERE api_key_hash IS NOT NULL;
+
 COMMIT;
