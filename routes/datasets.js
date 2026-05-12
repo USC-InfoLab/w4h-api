@@ -4,7 +4,14 @@ const router = express.Router();
 import { authenticate } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { query } from '../db.js';
+import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 
+router.get('/projects', authenticate, listStudies);
+router.get('/projects-admin', authenticate, listStudiesAdmin);
+router.get('/projects-admin/:id', authenticate, getStudyAdmin);
+router.post('/projects-admin', authenticate, addStudyAdmin);
+router.put('/projects-admin/:id', authenticate, setStudyAdmin);
+// Legacy paths (same handlers)
 router.get('/studies', authenticate, listStudies);
 router.get('/studies-admin', authenticate, listStudiesAdmin);
 router.get('/studies-admin/:id', authenticate, getStudyAdmin);
@@ -16,25 +23,6 @@ router.get('/:id', authenticate, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
 const DATASET_ALLOWED_ROLES = new Set(['admin', 'researcher', 'clinician']);
-
-/** Legacy DBs still use study_id; newer schema uses project_id. */
-let datasetsProjectColumnCache = null;
-
-async function datasetsProjectFkColumn() {
-  if (datasetsProjectColumnCache) return datasetsProjectColumnCache;
-  const r = await query(
-    `SELECT column_name FROM information_schema.columns
-     WHERE table_schema = 'w4h' AND table_name = 'datasets'
-       AND column_name IN ('project_id', 'study_id')`
-  );
-  const names = new Set(r.rows.map((row) => row.column_name));
-  if (names.has('project_id')) datasetsProjectColumnCache = 'project_id';
-  else if (names.has('study_id')) datasetsProjectColumnCache = 'study_id';
-  else {
-    throw new Error('w4h.datasets has neither project_id nor study_id');
-  }
-  return datasetsProjectColumnCache;
-}
 
 function canAccessDatasets(user) {
   return !!user && DATASET_ALLOWED_ROLES.has(user.role);
@@ -51,7 +39,7 @@ async function listStudiesAdmin(req, res) {
 
   try {
     ///XXX: should use W$H_SCHEMA_NAME...
-    const pc = await datasetsProjectFkColumn();
+    const pc = await resolveDatasetProjectLinkColumn();
     const result = await query(
       `SELECT
          s.id,
@@ -201,14 +189,14 @@ async function tableInfo(req, res) {
   let partitions = [];
 
   try {
-    const pc = await datasetsProjectFkColumn();
+    const pc = await resolveDatasetProjectLinkColumn();
     const datasetAccessResult = req.user.role === USER_ROLES.ADMIN
       ? await query(
-        `SELECT id, ${pc} AS study_id FROM w4h.datasets WHERE id = $1`,
+        `SELECT id, ${pc} AS dataset_project_id FROM w4h.datasets WHERE id = $1`,
         [req.query.dataset_id]
       )
       : await query(
-        `SELECT d.id, d.${pc} AS study_id
+        `SELECT d.id, d.${pc} AS dataset_project_id
          FROM w4h.datasets d
          JOIN w4h.user_projects us
            ON us.project_id = d.${pc}
@@ -220,8 +208,9 @@ async function tableInfo(req, res) {
       return res.status(403).json({ error: 'Unauthorized for requested dataset' });
     }
 
-    const studyId = req.query.study_id || datasetAccessResult.rows[0].study_id;
-    const queryMap = await getQueryMap(studyId);
+    const catalogProjectId =
+      req.query.project_id || req.query.study_id || datasetAccessResult.rows[0].dataset_project_id;
+    const queryMap = await getQueryMap(catalogProjectId);
     const dataset = queryMap.get(req.query.dataset_id);
 
     if (!dataset) {
@@ -406,9 +395,9 @@ async function listDatasets(req, res) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  const pc = await datasetsProjectFkColumn();
+  const pc = await resolveDatasetProjectLinkColumn();
   let sql = `
-    SELECT d.id, d.${pc} AS study_id, d.name, d.description
+    SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
     FROM w4h.datasets d
   `;
   const params = [];
@@ -422,8 +411,9 @@ async function listDatasets(req, res) {
     sql += ` WHERE us.user_id = $${params.length}`;
   }
 
-  if (req.query.study_id) {
-    params.push(req.query.study_id);
+  const filterProjectId = req.query.project_id || req.query.study_id;
+  if (filterProjectId) {
+    params.push(filterProjectId);
     sql += params.length === 1 && req.user.role === USER_ROLES.ADMIN
       ? ` WHERE d.${pc} = $${params.length}`
       : ` AND d.${pc} = $${params.length}`;
@@ -446,14 +436,15 @@ async function listDatasets(req, res) {
 
   // Process datasets
   const datasets = [];
-  const queryMapByStudy = new Map();
+  const queryMapByCatalogProject = new Map();
 
   for (const d of result.rows) {
-    if (!queryMapByStudy.has(d.study_id)) {
-      queryMapByStudy.set(d.study_id, await getQueryMap(d.study_id));
+    const cp = d.dataset_project_id;
+    if (!queryMapByCatalogProject.has(cp)) {
+      queryMapByCatalogProject.set(cp, await getQueryMap(cp));
     }
 
-    datasets.push(await processDataset(d, req.user, queryMapByStudy.get(d.study_id), tableConfigs.rows));
+    datasets.push(await processDataset(d, req.user, queryMapByCatalogProject.get(cp), tableConfigs.rows));
   }
 
   res.json(datasets);
@@ -465,16 +456,16 @@ async function getDataset(req, res) {
   }
 
   const { id } = req.params;
-  const pc = await datasetsProjectFkColumn();
+  const pc = await resolveDatasetProjectLinkColumn();
   const result = req.user.role === USER_ROLES.ADMIN
     ? await query(
-      `SELECT id, ${pc} AS study_id, name, description
+      `SELECT id, ${pc} AS dataset_project_id, name, description
        FROM w4h.datasets
        WHERE id = $1`,
       [id]
     )
     : await query(
-      `SELECT d.id, d.${pc} AS study_id, d.name, d.description
+      `SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
        FROM w4h.datasets d
        JOIN w4h.user_projects us
          ON us.project_id = d.${pc}
@@ -495,7 +486,7 @@ async function getDataset(req, res) {
   `, [dataset.id]);
 
   // 2. Load the hardcoded map (Backward Compatibility Base)
-  const QUERY_MAP = await getQueryMap(dataset.study_id);
+  const QUERY_MAP = await getQueryMap(dataset.dataset_project_id);
 
   const processedDataset = await processDataset(dataset, req.user, QUERY_MAP, tableConfigs.rows);
 

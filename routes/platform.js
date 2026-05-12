@@ -6,7 +6,7 @@ const router = express.Router();
 /**
  * GET /platform/hub-principles
  * Non-secret alignment notes for clients (metadata, ACL, credentials).
- * Datasets/studies remain the source of truth; this is descriptive only.
+ * Datasets (catalog projects) remain the source of truth; this is descriptive only.
  */
 router.get('/hub-principles', authenticate, (req, res) => {
   res.json({

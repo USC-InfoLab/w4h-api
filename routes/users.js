@@ -10,7 +10,14 @@ import { isMailerConfigured, sendMail } from '../lib/mailer.js';
 const SCHEMA = 'w4h';
 const TABLE = 'users';
 
-function normalizeStudyIds(input) {
+/** Request body may still send study_ids; prefer project_ids. */
+function pickProjectIds(user) {
+  if (!user || typeof user !== 'object') return [];
+  const raw = user.project_ids ?? user.study_ids;
+  return normalizeProjectIds(raw);
+}
+
+function normalizeProjectIds(input) {
   if (!Array.isArray(input)) {
     return [];
   }
@@ -22,31 +29,31 @@ function normalizeStudyIds(input) {
   )];
 }
 
-async function getAllStudyIds() {
+async function getAllProjectIds() {
   const result = await query(`SELECT id FROM ${SCHEMA}.projects ORDER BY name ASC`);
   return result.rows.map(row => row.id);
 }
 
-async function syncUserStudies(userId, role, requestedStudyIds = []) {
-  const studyIds = role === 'admin'
-    ? await getAllStudyIds()
-    : normalizeStudyIds(requestedStudyIds);
+async function syncUserProjects(userId, role, requestedProjectIds = []) {
+  const projectIds = role === 'admin'
+    ? await getAllProjectIds()
+    : normalizeProjectIds(requestedProjectIds);
 
   await query(`DELETE FROM ${SCHEMA}.user_projects WHERE user_id = $1`, [userId]);
 
-  if (studyIds.length > 0) {
+  if (projectIds.length > 0) {
     await query(
       `INSERT INTO ${SCHEMA}.user_projects (user_id, project_id)
        SELECT $1, UNNEST($2::text[])
        ON CONFLICT (user_id, project_id) DO NOTHING`,
-      [userId, studyIds]
+      [userId, projectIds]
     );
   }
 
-  return studyIds;
+  return projectIds;
 }
 
-async function ensureAdminAssignedToAllStudies(userId) {
+async function ensureAdminAssignedToAllProjects(userId) {
   await query(
     `INSERT INTO ${SCHEMA}.user_projects (user_id, project_id)
      SELECT $1, s.id
@@ -174,7 +181,7 @@ async function setUser(req, res) {
     );
 
     if (result.rowCount > 0) {
-      await syncUserStudies(result.rows[0].id, result.rows[0].role, user.study_ids || []);
+      await syncUserProjects(result.rows[0].id, result.rows[0].role, pickProjectIds(user));
       res.json({ success: true, message: 'User updated' });
     } else {
       res.json({ error: 'User not found' });
@@ -215,7 +222,7 @@ async function addUser(req, res) {
       [name, email, hashedPassword, role]
     );
 
-    await syncUserStudies(insertResult.rows[0].id, insertResult.rows[0].role, user.study_ids || []);
+    await syncUserProjects(insertResult.rows[0].id, insertResult.rows[0].role, pickProjectIds(user));
 
     let mailWarning = null;
     if (isMailerConfigured()) {
@@ -320,7 +327,7 @@ async function getByEmail(req, res) {
              ),
              '{}'
            )
-         END AS study_ids,
+         END AS project_ids,
          CASE
            WHEN u.role = 'admin' THEN COALESCE(
              (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.projects s),
@@ -335,7 +342,7 @@ async function getByEmail(req, res) {
              ),
              ''
            )
-         END AS studies
+         END AS projects
        FROM ${SCHEMA}.${TABLE} u
        WHERE u.email = $1`,
       [req.params.email]
@@ -377,7 +384,7 @@ async function list(req, res) {
              ),
              '{}'
            )
-         END AS study_ids,
+         END AS project_ids,
          CASE
            WHEN u.role = 'admin' THEN COALESCE(
              (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.projects s),
@@ -392,7 +399,7 @@ async function list(req, res) {
              ),
              ''
            )
-         END AS studies
+         END AS projects
        FROM ${SCHEMA}.${TABLE} u
        ORDER BY u.email ASC`
     );
@@ -428,7 +435,7 @@ async function login(req, res) {
     }
 
     if (user.role === 'admin') {
-      await ensureAdminAssignedToAllStudies(user.id);
+      await ensureAdminAssignedToAllProjects(user.id);
     }
 
     const userInfo = {

@@ -9,6 +9,8 @@ Usage:
   export W4H_PROJECT_ID='<uuid>'
   python project_db_token_client.py
 
+After this works, reuse the same X-W4H-Project-DB-Token on read-only project routes; notebook rows appear in GET /projects/<id> under "notebooks".
+
 Requires: pip install requests
 """
 

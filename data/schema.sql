@@ -1,5 +1,7 @@
 -- Core schema objects for W4H
 -- Idempotent: safe to run multiple times
+--
+-- Includes w4h.docs DDL here (single source of truth). Do not maintain a separate docs-only SQL file.
 
 CREATE SCHEMA IF NOT EXISTS w4h;
 

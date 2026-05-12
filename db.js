@@ -11,11 +11,13 @@ types.setTypeParser(1700, d => parseFloat(d));
 export const SCHEMA_NAME = 'w4h';
 export const USERS_TABLE_NAME = 'users';
 export const DOCS_TABLE_NAME = 'docs';
-export const USERS_USER_STUDIES = 'user_studies';
+export const USERS_USER_PROJECTS = 'user_projects';
+export const USERS_USER_STUDIES = USERS_USER_PROJECTS; // legacy export name
 
 export const DOCS_TABLE = `${SCHEMA_NAME}.${DOCS_TABLE_NAME}`;
 export const USER_TABLE = `${SCHEMA_NAME}.${USERS_TABLE_NAME}`;
-export const USER_STUDIES_TABLE = `${SCHEMA_NAME}.${USERS_USER_STUDIES}`;
+export const USER_PROJECTS_TABLE = `${SCHEMA_NAME}.${USERS_USER_PROJECTS}`;
+export const USER_STUDIES_TABLE = USER_PROJECTS_TABLE; // legacy export name
 
 // We only track types for ingested data.
 export const SQL_TYPES = {

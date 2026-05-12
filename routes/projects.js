@@ -5,6 +5,7 @@ import { authenticate } from '../auth.js';
 import { authenticateJwtOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
 import { query } from '../db.js';
 import { USER_ROLES } from '../lib/utils/user.js';
+import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 
 const router = express.Router();
 
@@ -146,6 +147,8 @@ async function getProjectOverview(req, res) {
       return res.status(404).json({ error: 'Project not found' });
     }
 
+    const pc = await resolveDatasetProjectLinkColumn();
+
     const [membersRes, datasetsRes, notebooksRes, docsRes, orgsRes, derivedOrgsRes, aclRes] = await Promise.all([
       query(
         `SELECT pm.user_id, pm.role, pm.joined_at,
@@ -158,7 +161,7 @@ async function getProjectOverview(req, res) {
       ),
       query(
         `SELECT pd.dataset_id, pd.access_type, pd.approved_at,
-                d.name, d.description, d.study_id
+                d.name, d.description, d.${pc} AS dataset_project_id
          FROM w4h.project_datasets pd
          JOIN w4h.datasets d ON d.id = pd.dataset_id
          WHERE pd.project_id = $1::uuid
@@ -189,10 +192,10 @@ async function getProjectOverview(req, res) {
         [projectId]
       ),
       query(
-        `SELECT DISTINCT s.id AS study_id, s.name AS study_name
+        `SELECT DISTINCT s.id AS dataset_project_id, s.name AS dataset_project_name
          FROM w4h.project_datasets pd
          JOIN w4h.datasets d ON d.id = pd.dataset_id
-         LEFT JOIN w4h.studies s ON s.id = d.study_id
+         LEFT JOIN w4h.projects s ON s.id::text = d.${pc}::text
          WHERE pd.project_id = $1::uuid
          ORDER BY s.name ASC NULLS LAST`,
         [projectId]
@@ -214,8 +217,8 @@ async function getProjectOverview(req, res) {
         ? manualOrgRows
         : derivedOrgsRes.rows.map((o, idx) => ({
             id: `derived-${idx}`,
-            short: String(o.study_id || '').slice(0, 4).toUpperCase() || 'ORG',
-            name: o.study_name || o.study_id || 'Study',
+            short: String(o.dataset_project_id || '').slice(0, 4).toUpperCase() || 'ORG',
+            name: o.dataset_project_name || o.dataset_project_id || 'Project',
             website_url: null,
             sort_order: idx
           }));
@@ -615,8 +618,9 @@ async function replaceProjectDatasets(req, res) {
       );
     }
 
+    const pc = await resolveDatasetProjectLinkColumn();
     const fresh = await query(
-      `SELECT pd.dataset_id, pd.access_type, pd.approved_at, d.name, d.description, d.study_id
+      `SELECT pd.dataset_id, pd.access_type, pd.approved_at, d.name, d.description, d.${pc} AS dataset_project_id
        FROM w4h.project_datasets pd
        JOIN w4h.datasets d ON d.id = pd.dataset_id
        WHERE pd.project_id = $1::uuid
