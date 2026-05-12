@@ -2,19 +2,18 @@ import express from 'express';
 const router = express.Router();
 
 import { authenticate } from '../auth.js';
-import { authenticateJwtOrUserApiKey } from '../lib/middleware/jwtOrUserApiKey.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 
-router.get('/projects', authenticateJwtOrUserApiKey, listStudies);
+router.get('/projects', authenticate, listStudies);
 router.get('/projects-admin', authenticate, listStudiesAdmin);
 router.get('/projects-admin/:id', authenticate, getStudyAdmin);
 router.post('/projects-admin', authenticate, addStudyAdmin);
 router.put('/projects-admin/:id', authenticate, setStudyAdmin);
-router.get('/tableinfo', authenticateJwtOrUserApiKey, tableInfo);
-router.get('/', authenticateJwtOrUserApiKey, listDatasets);
-router.get('/:id', authenticateJwtOrUserApiKey, getDataset);
+router.get('/tableinfo', authenticate, tableInfo);
+router.get('/', authenticate, listDatasets);
+router.get('/:id', authenticate, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
 const DATASET_ALLOWED_ROLES = new Set(['admin', 'researcher', 'clinician']);

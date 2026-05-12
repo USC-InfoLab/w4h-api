@@ -2,7 +2,6 @@ import express from 'express';
 import crypto from 'crypto';
 
 import { authenticate } from '../auth.js';
-import { authenticateJwtOrUserApiKey } from '../lib/middleware/jwtOrUserApiKey.js';
 import { authenticateJwtOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
 import { query } from '../db.js';
 import { USER_ROLES } from '../lib/utils/user.js';
@@ -10,7 +9,7 @@ import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLink
 
 const router = express.Router();
 
-router.get('/', authenticateJwtOrUserApiKey, listProjects);
+router.get('/', authenticate, listProjects);
 router.post('/', authenticate, createProject);
 
 router.get('/:id/db-tokens', authenticate, listProjectDbTokens);
