@@ -1,13 +1,11 @@
 import express from 'express';
 const router = express.Router();
 import bcrypt from 'bcrypt';
-import crypto from 'crypto';
 import { query } from '../db.js';
 import * as auth from '../auth.js';
 import jwt from 'jsonwebtoken';
 import { validatePassword } from '../lib/utils/password-validator.js';
 import { isMailerConfigured, sendMail } from '../lib/mailer.js';
-import { hashApiKey } from '../lib/middleware/userApiKeyAuth.js';
 
 const SCHEMA = 'w4h';
 const TABLE = 'users';
@@ -72,10 +70,6 @@ router.post('/add', auth.authenticate, addUser);
 router.post('/set', auth.authenticate, setUser);
 router.delete('/:email', auth.authenticate, del);
 router.get('/roles', auth.authenticate, roles);
-router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
-router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
-router.delete('/me/api-key', auth.authenticate, revokeMyApiKeys);
-router.delete('/user/:email/api-keys', auth.authenticate, adminRevokeUserApiKeys);
 
 function roles(req, res) {
   if (req.user.role !== 'admin') {
@@ -95,98 +89,6 @@ function tokenValid(req, res) {
     res.json({ tokenExpired: false });
   } catch (error) {
     res.json({ tokenExpired: true });
-  }
-}
-
-function generateUserApiKey() {
-  return `w4h_${crypto.randomBytes(32).toString('base64url')}`;
-}
-
-async function getMyApiKeyMeta(req, res) {
-  try {
-    const r = await query(
-      `SELECT prefix, created_at
-       FROM ${SCHEMA}.user_api_keys
-       WHERE user_id = $1 AND revoked_at IS NULL
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [req.user.id]
-    );
-    if (!r.rowCount) {
-      return res.json({ configured: false, prefix: null, created_at: null });
-    }
-    return res.json({
-      configured: true,
-      prefix: r.rows[0].prefix,
-      created_at: r.rows[0].created_at
-    });
-  } catch (error) {
-    console.error('getMyApiKeyMeta error:', error);
-    return res.status(500).json({ error: error.message });
-  }
-}
-
-async function rotateMyApiKey(req, res) {
-  try {
-    await query(
-      `UPDATE ${SCHEMA}.user_api_keys
-       SET revoked_at = CURRENT_TIMESTAMP
-       WHERE user_id = $1 AND revoked_at IS NULL`,
-      [req.user.id]
-    );
-    const raw = generateUserApiKey();
-    const prefix = raw.length > 20 ? raw.slice(0, 20) : raw;
-    const ins = await query(
-      `INSERT INTO ${SCHEMA}.user_api_keys (user_id, token_hash, prefix)
-       VALUES ($1, $2, $3)
-       RETURNING created_at`,
-      [req.user.id, hashApiKey(raw), prefix]
-    );
-    return res.json({ apiKey: raw, created_at: ins.rows[0].created_at });
-  } catch (error) {
-    console.error('rotateMyApiKey error:', error);
-    return res.status(500).json({ error: error.message });
-  }
-}
-
-async function revokeMyApiKeys(req, res) {
-  try {
-    await query(
-      `UPDATE ${SCHEMA}.user_api_keys
-       SET revoked_at = CURRENT_TIMESTAMP
-       WHERE user_id = $1 AND revoked_at IS NULL`,
-      [req.user.id]
-    );
-    return res.json({ success: true });
-  } catch (error) {
-    console.error('revokeMyApiKeys error:', error);
-    return res.status(500).json({ error: error.message });
-  }
-}
-
-async function adminRevokeUserApiKeys(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin only' });
-  }
-  try {
-    const email = decodeURIComponent(String(req.params.email || '').trim());
-    const u = await query(
-      `SELECT id, role FROM ${SCHEMA}.${TABLE} WHERE email = $1`,
-      [email]
-    );
-    if (!u.rowCount) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    await query(
-      `UPDATE ${SCHEMA}.user_api_keys
-       SET revoked_at = CURRENT_TIMESTAMP
-       WHERE user_id = $1 AND revoked_at IS NULL`,
-      [u.rows[0].id]
-    );
-    return res.json({ success: true });
-  } catch (error) {
-    console.error('adminRevokeUserApiKeys error:', error);
-    return res.status(500).json({ error: error.message });
   }
 }
 
