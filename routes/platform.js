@@ -17,6 +17,8 @@ router.get('/hub-principles', (req, res) => {
     userApiKeyRevokeAdminPath: 'DELETE /users/user/:email/api-key',
     projectDbTokenHeader: 'X-W4H-Project-DB-Token',
     projectDbTokenMintPath: 'POST /projects/:id/db-token',
+    projectDbTokenPurgeInactivePath: 'DELETE /projects/:id/db-tokens/purge-inactive',
+    projectDbTokenListQuery: 'GET /projects/:id/db-tokens (active only); append ?history=1 for revoked/expired',
     notebookDataPaths: ['GET /datasets', 'GET /datasets/:id', 'GET /projects/:id']
   });
 });

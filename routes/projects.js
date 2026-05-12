@@ -13,6 +13,7 @@ router.get('/', authenticateJwtOrApiKey, listProjects);
 router.post('/', authenticateJwtOrApiKey, createProject);
 
 router.get('/:id/db-tokens', authenticateJwtOrApiKey, listProjectDbTokens);
+router.delete('/:id/db-tokens/purge-inactive', authenticateJwtOrApiKey, purgeInactiveProjectDbTokens);
 router.delete('/:id/db-tokens/:tokenId', authenticateJwtOrApiKey, revokeProjectDbToken);
 router.get('/:id/acl', authenticateJwtOrApiKey, getProjectAclRules);
 router.put('/:id/acl', authenticateJwtOrApiKey, replaceProjectAclRules);
@@ -675,11 +676,16 @@ async function replaceProjectNotebooks(req, res) {
         ? row.runtime_type
         : 'jupyter';
       const launchers = Array.isArray(row?.launchers) ? row.launchers : ['jupyter'];
+      const optionalId =
+        row?.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(row.id))
+          ? String(row.id)
+          : null;
       await query(
         `INSERT INTO w4h.project_notebooks
-           (project_id, title, description, purpose, repo_url, repo_ref, notebook_path, runtime_type, launchers, created_by)
-         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)`,
+           (id, project_id, title, description, purpose, repo_url, repo_ref, notebook_path, runtime_type, launchers, created_by, updated_at)
+         VALUES (COALESCE($1::uuid, gen_random_uuid()), $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, NOW())`,
         [
+          optionalId,
           projectId,
           title,
           row?.description == null ? null : String(row.description),
@@ -753,18 +759,48 @@ async function listProjectDbTokens(req, res) {
   }
 
   try {
-    const rows = await query(
-      `SELECT t.id, t.user_id, t.issued_at, t.expires_at, t.revoked_at,
-              u.email, u.name
+    const historyRaw = req.query?.history;
+    const history =
+      historyRaw === 1 ||
+      historyRaw === true ||
+      String(historyRaw ?? '').trim() === '1' ||
+      String(historyRaw ?? '').trim().toLowerCase() === 'true';
+    let sql = `
+      SELECT t.id, t.user_id, t.issued_at, t.expires_at, t.revoked_at,
+             u.email, u.name
        FROM w4h.project_db_tokens t
        JOIN w4h.users u ON u.id = t.user_id
-       WHERE t.project_id = $1::uuid
-       ORDER BY t.issued_at DESC`,
-      [projectId]
-    );
+       WHERE t.project_id = $1::uuid`;
+    const params = [projectId];
+    if (!history) {
+      sql += ` AND t.revoked_at IS NULL AND t.expires_at > NOW()`;
+    }
+    sql += ` ORDER BY t.issued_at DESC`;
+    const rows = await query(sql, params);
     res.json(rows.rows);
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to list tokens' });
+  }
+}
+
+async function purgeInactiveProjectDbTokens(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canManageProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const result = await query(
+      `DELETE FROM w4h.project_db_tokens
+       WHERE project_id = $1::uuid
+         AND (revoked_at IS NOT NULL OR expires_at < NOW())
+       RETURNING id`,
+      [projectId]
+    );
+    res.json({ deleted: result.rowCount });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to purge tokens' });
   }
 }
 
