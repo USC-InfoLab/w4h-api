@@ -1,6 +1,6 @@
 # Contributing to W4H Tookit
 
-Thank you for considering contributing! We appreciate your help in making [Project Name] better.
+Thank you for considering contributing! We appreciate your help in making the W4H Toolkit better.
 
 ## How to Contribute
 
@@ -13,7 +13,7 @@ We follow the standard GitHub pull request workflow:
 
 ## Reporting Issues
 
-If you find a bug or have a feature request, please open an issue on the [Issues tab](../../issues) of this repository.
+If you find a bug or have a feature request, please open an issue on the [Issues tab](https://github.com/USC-InfoLab/w4h-api/issues) of this repository.
 
 ## Code of Conduct
 
