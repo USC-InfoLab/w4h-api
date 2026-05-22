@@ -1,12 +1,16 @@
 # W4H API
 
+The [Wearables for Health (W4H) Toolkit](https://infolab.usc.edu/projects/W4H/) is a suite of open-source tools for managing, analyzing, and visualizing wearable data used in health applications. This repository provides the [W4H Web API](https://github.com/USC-InfoLab/w4h-api), the web services for the [W4H Web App](https://github.com/USC-InfoLab/w4h-app).
+
 ## Setup
 
 ```bash
 cp .env.example .env  #do not edit for initial set up
 npm install
-npm start  #or node app.js
+npm start
 ```
+
+To reset the installation 
 
 ## CLI
 

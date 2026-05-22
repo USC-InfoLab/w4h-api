@@ -263,38 +263,6 @@ async function del(req, res) {
     res.status(500).json({ error: 'Failed to delete document' });
   }
 }
-/** Admin-only: zipped Markdown export (paths follow documentation-configuration layout). */
-async function exportMarkdownZip(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    const apiRoot = path.join(__dirname, '..');
-    const cfg = (await loadDocumentationConfig(apiRoot)) || {};
-    const layout = cfg.layout === 'flat' ? 'flat' : 'nested';
-
-    const includeHidden =
-      req.query.includeHidden === 'true' ||
-      req.query.includeHidden === '1' ||
-      req.query.include_hidden === 'true';
-
-    let sql = `SELECT slug, title, description, doc_type, md FROM ${DOCS_TABLE}`;
-    if (!includeHidden) {
-      sql += ' WHERE COALESCE(hidden, false) = false';
-    }
-    sql += ' ORDER BY slug';
-
-    const result = await query(sql);
-
-    await pipeMarkdownZipToResponse(res, result.rows, { layout });
-  } catch (err) {
-    console.error('exportMarkdownZip', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to export documentation' });
-    }
-  }
-}
 
 async function search(req, res) {
   if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
