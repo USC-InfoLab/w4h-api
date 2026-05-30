@@ -7,16 +7,38 @@ import { DOCS_TABLE, query } from '../db.js';
 import { authenticate } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter } from '../lib/utils/docs.js';
+import { renderDoc } from '../lib/utils/md-render.js';
 
 import crypto from 'crypto';
 
+
+// Docs routes
 router.get('/', authenticate, list);
 router.get('/search', authenticate, search);
 router.get('/cards/feature', authenticate, featureCards);
 router.get('/export', authenticate, exportDocs);
+router.post('/refresh', authenticate, refreshDocs);
 router.get('/:slug', authenticate, get);
 router.put('/:slug', authenticate, put);
 router.delete('/:slug', authenticate, del);
+
+// Admin-only: refresh docs from source (overwrites existing docs with same slug)
+async function refreshDocs(req, res) {
+  if (req.user.role !== USER_ROLES.ADMIN) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const { importDocs } = await import('../lib/utils/docs.js');
+    const result = await importDocs();
+    if (result.imported) {
+      res.json({ success: true, count: result.count });
+    } else {
+      res.status(400).json({ success: false, reason: result.reason });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
 
 async function exportDocs(req, res) {
   if (req.user.role !== USER_ROLES.ADMIN) {
