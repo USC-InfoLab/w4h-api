@@ -5,18 +5,18 @@ The [Wearables for Health (W4H) Toolkit](https://infolab.usc.edu/projects/W4H/) 
 ## Setup
 
 ```bash
-cp .env.example .env  #do not edit for initial set up
+cp .env.example .env  #no need to edit for initial set up
 npm install
 npm start
 ```
 
-To reset the installation 
+To reset the installation and go through the initial set up, unset `DB_DATABASE` in .env.
 
 ## CLI
 
-Run `bin/w4h` or see launch.json for examples.
+The CLI will be used to access admin and recurring tasks. Run `bin/w4h` or see launch.json for examples.
 
-It is convenient to add `w4h` to the path:
+In development it is convenient to add `w4h` to the path:
 
 ```sh
 mkdir ~/bin
@@ -28,5 +28,7 @@ and add an export in a your `.bashrc` or `.zshrc`:
 ```sh
 export PATH=$HOME/bin:$PATH
 ```
+
+When deploying you can 
 
 ---

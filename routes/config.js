@@ -7,7 +7,7 @@ import { USER_ROLES } from '../lib/utils/user.js';
 import crypto from 'crypto';
 import pkg from 'pg';
 const { Pool } = pkg;
-import db from '../db.js';
+import db, { tableExists, USERS_TABLE_NAME } from '../db.js';
 import * as auth from '../auth.js';
 import { initializeDatabase, createInitialAdmin, hasAnyUsers } from '../lib/db-init.js';
 import { getMailerConfig, isMailerConfigured, sendMail } from '../lib/mailer.js';
@@ -50,6 +50,8 @@ router.get('/database-settings', auth.authenticate, getDatabaseSettings);
 router.get('/mailer-settings', auth.authenticate, getMailerSettings);
 router.post('/mailer-settings', auth.authenticate, postMailerSettings);
 router.post('/mailer-test', auth.authenticate, postMailerTest);
+router.get('/app-settings', auth.authenticate, getAppSettings);
+router.post('/app-settings', auth.authenticate, postAppSettings);
 router.post('/init-database', postInitDatabase);
 router.post('/admin-setup', postAdminSetup);
 router.get('/test', auth.authenticate, getTest);
@@ -62,8 +64,8 @@ export default router;
 // ---------------------------------------------------------------------------
 
 /** GET /config/status — Check if database is configured. */
-function getStatus(req, res) {
-  const isConfigured = !!(
+async function getStatus(req, res) {
+  const envConfigured = !!(
     process.env.DB_HOST &&
     process.env.DB_PORT &&
     process.env.DB_DATABASE &&
@@ -71,20 +73,27 @@ function getStatus(req, res) {
     process.env.DB_PASSWORD
   );
 
-  res.json({
-    configured: isConfigured,
-    details: isConfigured ? {
-      host: process.env.DB_HOST,
-      port: process.env.DB_PORT,
-      database: process.env.DB_DATABASE,
-      user: process.env.DB_USER
-    } : {
-      host: process.env.DB_HOST || '',
-      port: process.env.DB_PORT || '5432',
-      database: process.env.DB_DATABASE || '',
-      user: process.env.DB_USER || ''
+  const details = {
+    host: process.env.DB_HOST || '',
+    port: process.env.DB_PORT || '5432',
+    database: process.env.DB_DATABASE || '',
+    user: process.env.DB_USER || ''
+  };
+
+  if (!envConfigured) {
+    return res.json({ configured: false, details });
+  }
+
+  // Env vars are set — verify the DB is actually reachable and schema is initialized
+  try {
+    const initialized = await tableExists(USERS_TABLE_NAME);
+    if (!initialized) {
+      return res.json({ configured: false, details });
     }
-  });
+    return res.json({ configured: true, details });
+  } catch {
+    return res.json({ configured: false, details });
+  }
 }
 
 /** GET /config/database-settings — Get current database settings (even if not fully configured). */
@@ -196,6 +205,33 @@ async function postMailerTest(req, res) {
       error: 'SMTP test failed',
       details: error.message
     });
+  }
+}
+
+/** GET /config/app-settings — Get general app settings. Admin only. */
+function getAppSettings(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  res.json({
+    helpEmail: process.env.HELP_EMAIL || '',
+    usageTracking: process.env.USAGE_TRACKING === 'true',
+  });
+}
+
+/** POST /config/app-settings — Save general app settings. Admin only. */
+async function postAppSettings(req, res) {
+  if (!isAdmin(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const helpEmail = String(req.body?.helpEmail ?? '').trim();
+  const usageTracking = !!req.body?.usageTracking;
+
+  try {
+    await writeEnvValues({ HELP_EMAIL: helpEmail, USAGE_TRACKING: usageTracking ? 'true' : 'false' });
+    return res.json({ success: true, message: 'App settings saved.' });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: 'Failed to save app settings.', details: error.message });
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "w4h-api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "W4H Toolkit web services",
   "type": "module",
   "repository": {
@@ -25,6 +25,7 @@
     "cli-progress": "^3.11.2",
     "commander": "^9.4.0",
     "cors": "^2.8.5",
+    "crc-32": "^1.2.2",
     "dayjs": "^1.11.19",
     "dotenv": "^16.0.1",
     "execa": "^9.6.1",
@@ -33,8 +34,9 @@
     "fs-extra": "^10.1.0",
     "js-yaml": "^4.1.0",
     "jsonwebtoken": "^9.0.3",
-    "markdown-it": "^14.1.1",
+    "markdown-it": "^14.2.0",
     "markdown-it-anchor": "^9.2.0",
+    "markdown-it-attrs": "^5.0.0",
     "markdown-it-task-lists": "^2.1.1",
     "mermaid": "^11.14.0",
     "nodemailer": "^8.0.1",

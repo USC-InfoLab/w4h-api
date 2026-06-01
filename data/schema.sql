@@ -75,3 +75,56 @@ CREATE TABLE IF NOT EXISTS w4h.docs (
   CONSTRAINT docs_slug_key UNIQUE (slug)
 );
 CREATE INDEX IF NOT EXISTS idx_docs_slug ON w4h.docs(slug);
+
+-- ---------------------------------------------------------------------------
+-- HIPAA Audit Log — append-only record of all access and mutations to PHI.
+-- Required by HIPAA Security Rule §164.312(b). Never delete rows; retain 6 years.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.audit_log (
+  id          BIGSERIAL PRIMARY KEY,
+  timestamp   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+  user_id     INTEGER REFERENCES w4h.users(id) ON DELETE SET NULL,
+  action      VARCHAR(100) NOT NULL,  -- e.g. 'subject.view', 'data.export', 'user.login'
+  resource_type VARCHAR(100),         -- e.g. 'subject', 'dataset', 'user'
+  resource_id   TEXT,                 -- id of the affected record
+  ip_address    INET,
+  user_agent    TEXT,
+  details       JSONB                 -- any additional context
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp   ON w4h.audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_log_user_id     ON w4h.audit_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action      ON w4h.audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_audit_log_resource    ON w4h.audit_log(resource_type, resource_id);
+
+-- ---------------------------------------------------------------------------
+-- Usage Events — feature usage and efficiency metrics.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.usage_events (
+  id          BIGSERIAL PRIMARY KEY,
+  timestamp   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+  user_id     INTEGER REFERENCES w4h.users(id) ON DELETE SET NULL,
+  session_id  TEXT,                   -- client-generated session UUID
+  event_type  VARCHAR(100) NOT NULL,  -- e.g. 'dataset.import', 'query.run', 'page.view'
+  duration_ms INTEGER,                -- time taken for the action, if measurable
+  metadata    JSONB                   -- e.g. { dataset_id, row_count, page, error }
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp  ON w4h.usage_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_usage_events_user_id    ON w4h.usage_events(user_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_event_type ON w4h.usage_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_usage_events_session_id ON w4h.usage_events(session_id);
+
+-- ---------------------------------------------------------------------------
+-- Survey Responses — periodic questionnaire data for efficiency/ROI reporting.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.survey_responses (
+  id            BIGSERIAL PRIMARY KEY,
+  timestamp     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+  user_id       INTEGER REFERENCES w4h.users(id) ON DELETE SET NULL,
+  survey_type   VARCHAR(100) NOT NULL,  -- e.g. 'efficiency', 'satisfaction'
+  responses     JSONB NOT NULL          -- { question_id: answer, ... }
+);
+
+CREATE INDEX IF NOT EXISTS idx_survey_responses_user_id     ON w4h.survey_responses(user_id);
+CREATE INDEX IF NOT EXISTS idx_survey_responses_survey_type ON w4h.survey_responses(survey_type);
