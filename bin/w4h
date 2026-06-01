@@ -6,6 +6,8 @@ import { exit } from 'process';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import readline from 'readline';
+import bcrypt from 'bcrypt';
 import db from '../db.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -16,42 +18,164 @@ const success = chalk.green;
 const warning = chalk.keyword('orange');
 const danger = chalk.bold.red;
 const important = chalk.yellow;
-const CONSOLE_DIR_OPTIONS = { showHidden: true, depth: Infinity, colors: true, maxArrayLength: Infinity };
 
-process.chdir(__dirname + '/..'); //set working directory to service dir
-
+process.chdir(__dirname + '/..');
 dotenv.config();
 
 ////////////////////////////////////////////////////////////////////////////////////
 
 const greeting = warning.bold(`W4H CLI`);
 const boxenOptions = {
-	padding: 1,
-	//margin: 1,
-	borderStyle: 'round',
-	borderColor: '#FFA500',
-	//backgroundColor: ''
+  padding: 1,
+  borderStyle: 'round',
+  borderColor: '#FFA500',
 };
 const msgBox = boxen(greeting, boxenOptions);
 
 const program = new Command();
-
 program.version('0.0.1').description(msgBox);
 
-program
-	.command('configuration')
-	.alias('conf')
-	.description('print configuration')
-	.action(() => {
-		let connection = JSON.parse(process.env.DB_CONNECTION);
-		delete connection.user;
-		delete connection.password;
-		console.log(important('cwd:', process.cwd()));
-		console.log(important('path:', __dirname + '/' + program._name));
-		console.log(info('configuration:'));
-		console.table(connection);
-	});
+////////////////////////////////////////////////////////////////////////////////////
 
-///////////////////////////////////////////////////////////////////////
+program
+  .command('configuration')
+  .alias('conf')
+  .description('print configuration')
+  .action(() => {
+    let connection = JSON.parse(process.env.DB_CONNECTION);
+    delete connection.user;
+    delete connection.password;
+    console.log(important('cwd:', process.cwd()));
+    console.log(important('path:', __dirname + '/' + program._name));
+    console.log(info('configuration:'));
+    console.table(connection);
+  });
+
+////////////////////////////////////////////////////////////////////////////////////
+
+program
+  .command('reset-password')
+  .alias('rp')
+  .description('Break-glass: reset an admin password (HIPAA — must be documented)')
+  .action(async () => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    const ask = (question) => new Promise(resolve => rl.question(question, resolve));
+
+    const askHidden = (question) => new Promise(resolve => {
+      process.stdout.write(question);
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.setEncoding('utf8');
+      let password = '';
+      const onData = (ch) => {
+        ch = ch.toString('utf8');
+        if (ch === '\n' || ch === '\r' || ch === '\u0004') {
+          process.stdout.write('\n');
+          process.stdin.setRawMode(false);
+          process.stdin.pause();
+          process.stdin.removeListener('data', onData);
+          resolve(password);
+        } else if (ch === '\u0003') {
+          process.stdout.write('\n');
+          console.log(warning('Aborted.'));
+          process.exit(0);
+        } else if (ch === '\u007f') {
+          password = password.slice(0, -1);
+        } else {
+          password += ch;
+        }
+      };
+      process.stdin.on('data', onData);
+    });
+
+    console.log(boxen(danger('⚠  BREAK-GLASS PROCEDURE'), { padding: 1, borderStyle: 'round', borderColor: 'red' }));
+    console.log(danger('HIPAA Notice: This action will be audited. Unauthorized use is a HIPAA violation.'));
+    console.log(warning('Do NOT pass passwords as command-line arguments — use the prompts below only.\n'));
+
+    const adminName = await ask(info('Your name (administrator performing reset): '));
+    const reason = await ask(info('Reason for reset: '));
+
+    if (!adminName.trim() || !reason.trim()) {
+      console.log(danger('\n❌ Administrator name and reason are required for the audit trail.'));
+      rl.close();
+      process.exit(1);
+    }
+
+    const email = await ask(info('Email address of account to reset: '));
+
+    const userRes = await db.query(
+      `SELECT id, email, name, role FROM w4h.users WHERE email = $1`,
+      [email.trim()]
+    );
+
+    if (userRes.rowCount === 0) {
+      console.log(danger('\n❌ No user found with that email.'));
+      rl.close();
+      process.exit(1);
+    }
+
+    const user = userRes.rows[0];
+    console.log(success(`\nFound: ${user.name} (${user.email}) — role: ${user.role}`));
+
+    const confirm = await ask(warning('Confirm reset? (yes/no): '));
+    if (confirm.trim().toLowerCase() !== 'yes') {
+      console.log(warning('Aborted.'));
+      rl.close();
+      process.exit(0);
+    }
+
+    const newPassword = await askHidden(info('New password: '));
+    const confirmPassword = await askHidden(info('Confirm new password: '));
+
+    if (newPassword !== confirmPassword) {
+      console.log(danger('\n❌ Passwords do not match.'));
+      rl.close();
+      process.exit(1);
+    }
+
+    if (newPassword.length < 12) {
+      console.log(danger('\n❌ Password must be at least 12 characters.'));
+      rl.close();
+      process.exit(1);
+    }
+
+    const rounds = parseInt(process.env.BCRYPT_ROUNDS) || 12;
+    const hash = await bcrypt.hash(newPassword, rounds);
+
+    await db.query(
+      `UPDATE w4h.users SET password = $1, updated_at = NOW() WHERE email = $2`,
+      [hash, email.trim()]
+    );
+
+    const timestamp = new Date().toISOString();
+
+    // Write audit log — fall back to local file if table unavailable
+    try {
+      await db.query(
+        `INSERT INTO w4h.audit_log (action, performed_by, target_email, reason, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        ['BREAK_GLASS_PASSWORD_RESET', adminName.trim(), email.trim(), reason.trim()]
+      );
+    } catch {
+      const { appendFileSync } = await import('fs');
+      const logEntry = `${timestamp} | BREAK_GLASS_PASSWORD_RESET | by: ${adminName.trim()} | target: ${email.trim()} | reason: ${reason.trim()}\n`;
+      appendFileSync('./break-glass-audit.log', logEntry);
+      console.log(warning('\n⚠️  No audit_log table found — logged to break-glass-audit.log instead.'));
+    }
+
+    console.log(success(`\n✅ Password reset successfully for ${user.email}`));
+    console.log(info(`📋 Audit entry recorded at ${timestamp}`));
+    console.log(important('\nREMINDER: Document this action in your HIPAA incident log:'));
+    console.log(important(`  Administrator : ${adminName.trim()}`));
+    console.log(important(`  Target        : ${email.trim()}`));
+    console.log(important(`  Reason        : ${reason.trim()}`));
+    console.log(important(`  Timestamp     : ${timestamp}\n`));
+
+    rl.close();
+    process.exit(0);
+  });
+
+////////////////////////////////////////////////////////////////////////////////////
 
 program.parse(process.argv);

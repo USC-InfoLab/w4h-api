@@ -157,7 +157,7 @@ async function setUser(req, res) {
     const params = [user.name, user.email, effectiveRole];
 
     if (user.password) {
-      const hashedPassword = bcrypt.hashSync(user.password, 8);
+      const hashedPassword = bcrypt.hashSync(user.password, process.env.BCRYPT_ROUNDS);
       params.push(hashedPassword);
       fields.push(`password = $${params.length}`);
     }
@@ -206,7 +206,7 @@ async function addUser(req, res) {
       return res.status(400).json({ error: passwordValidation.message });
     }
 
-    const hashedPassword = bcrypt.hashSync(password, 8);
+    const hashedPassword = bcrypt.hashSync(password, process.env.BCRYPT_ROUNDS);
 
     const insertResult = await query(
       `INSERT INTO ${SCHEMA}.${TABLE} (name, email, password, role)
@@ -263,7 +263,7 @@ async function updateProfile(req, res) {
         return res.status(400).json({ error: passwordValidation.message });
       }
 
-      const hashedPassword = bcrypt.hashSync(user.password, 8);
+      const hashedPassword = bcrypt.hashSync(user.password, process.env.BCRYPT_ROUNDS);
       params.push(hashedPassword);
       updates.push(`password = $${params.length}`);
     }
