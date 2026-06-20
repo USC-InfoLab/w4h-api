@@ -1,18 +1,19 @@
 import express from 'express';
 const router = express.Router();
 
-import { authenticate } from '../auth.js';
+import { authenticateJwtOrApiKey } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { query } from '../db.js';
+import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 
-router.get('/studies', authenticate, listStudies);
-router.get('/studies-admin', authenticate, listStudiesAdmin);
-router.get('/studies-admin/:id', authenticate, getStudyAdmin);
-router.post('/studies-admin', authenticate, addStudyAdmin);
-router.put('/studies-admin/:id', authenticate, setStudyAdmin);
-router.get('/tableinfo', authenticate, tableInfo);
-router.get('/', authenticate, listDatasets);
-router.get('/:id', authenticate, getDataset);
+router.get('/projects', authenticateJwtOrApiKey, listProjects);
+router.get('/projects-admin', authenticateJwtOrApiKey, listProjectsAdmin);
+router.get('/projects-admin/:id', authenticateJwtOrApiKey, getProjectAdmin);
+router.post('/projects-admin', authenticateJwtOrApiKey, addProjectAdmin);
+router.put('/projects-admin/:id', authenticateJwtOrApiKey, setProjectAdmin);
+router.get('/tableinfo', authenticateJwtOrApiKey, tableInfo);
+router.get('/', authenticateJwtOrApiKey, listDatasets);
+router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
 const DATASET_ALLOWED_ROLES = new Set(['admin', 'researcher', 'clinician']);
@@ -25,13 +26,13 @@ function isAdmin(user) {
   return !!user && user.role === USER_ROLES.ADMIN;
 }
 
-async function listStudiesAdmin(req, res) {
+async function listProjectsAdmin(req, res) {
   if (!isAdmin(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
   try {
-    ///XXX: should use W$H_SCHEMA_NAME...
+    const pc = await resolveDatasetProjectLinkColumn();
     const result = await query(
       `SELECT
          s.id,
@@ -40,8 +41,8 @@ async function listStudiesAdmin(req, res) {
          COUNT(DISTINCT d.id)::int AS dataset_count,
          COUNT(DISTINCT us.user_id)::int AS user_count
        FROM w4h.projects s
-       LEFT JOIN w4h.datasets d ON d.study_id = s.id
-       LEFT JOIN w4h.user_projects us ON us.study_id = s.id
+       LEFT JOIN w4h.datasets d ON d.${pc} = s.id
+       LEFT JOIN w4h.user_projects us ON us.project_id = s.id
        GROUP BY s.id, s.name, s.description
        ORDER BY s.name ASC`
     );
@@ -52,7 +53,7 @@ async function listStudiesAdmin(req, res) {
   }
 }
 
-async function getStudyAdmin(req, res) {
+async function getProjectAdmin(req, res) {
   if (!isAdmin(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
@@ -73,7 +74,7 @@ async function getStudyAdmin(req, res) {
   }
 }
 
-async function addStudyAdmin(req, res) {
+async function addProjectAdmin(req, res) {
   if (!isAdmin(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
@@ -93,7 +94,6 @@ async function addStudyAdmin(req, res) {
       [id, name, description || null]
     );
 
-    // Keep admin users automatically linked to all studies.
     await query(
       `INSERT INTO w4h.user_projects (user_id, project_id)
        SELECT u.id, $1
@@ -103,16 +103,16 @@ async function addStudyAdmin(req, res) {
       [id]
     );
 
-    return res.status(201).json({ success: true, message: 'Study created' });
+    return res.status(201).json({ success: true, message: 'Project created' });
   } catch (error) {
     if (error.code === '23505') {
-      return res.status(409).json({ error: 'Study id already exists' });
+      return res.status(409).json({ error: 'Project id already exists' });
     }
     return res.status(500).json({ error: error.message });
   }
 }
 
-async function setStudyAdmin(req, res) {
+async function setProjectAdmin(req, res) {
   if (!isAdmin(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
@@ -133,16 +133,16 @@ async function setStudyAdmin(req, res) {
     );
 
     if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Study not found' });
+      return res.status(404).json({ error: 'Project not found' });
     }
 
-    return res.json({ success: true, message: 'Study updated' });
+    return res.json({ success: true, message: 'Project updated' });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
 }
 
-async function listStudies(req, res) {
+async function listProjects(req, res) {
   if (!canAccessDatasets(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
@@ -157,8 +157,8 @@ async function listStudies(req, res) {
     sql += `
       WHERE EXISTS (
         SELECT 1
-        FROM w4h.user_studies us
-        WHERE us.study_id = w4h.projects.id
+        FROM w4h.user_projects us
+        WHERE us.project_id = w4h.projects.id
           AND us.user_id = $1
       )
     `;
@@ -181,16 +181,17 @@ async function tableInfo(req, res) {
   let partitions = [];
 
   try {
+    const pc = await resolveDatasetProjectLinkColumn();
     const datasetAccessResult = req.user.role === USER_ROLES.ADMIN
       ? await query(
-        `SELECT id, study_id FROM w4h.datasets WHERE id = $1`,
+        `SELECT id, ${pc} AS dataset_project_id FROM w4h.datasets WHERE id = $1`,
         [req.query.dataset_id]
       )
       : await query(
-        `SELECT d.id, d.study_id
+        `SELECT d.id, d.${pc} AS dataset_project_id
          FROM w4h.datasets d
          JOIN w4h.user_projects us
-           ON us.project_id = d.project_id
+           ON us.project_id = d.${pc}
          WHERE d.id = $1 AND us.user_id = $2`,
         [req.query.dataset_id, req.user.id]
       );
@@ -199,8 +200,9 @@ async function tableInfo(req, res) {
       return res.status(403).json({ error: 'Unauthorized for requested dataset' });
     }
 
-    const studyId = req.query.study_id || datasetAccessResult.rows[0].study_id;
-    const queryMap = await getQueryMap(studyId);
+    const catalogProjectId =
+      req.query.project_id || datasetAccessResult.rows[0].dataset_project_id;
+    const queryMap = await getQueryMap(catalogProjectId);
     const dataset = queryMap.get(req.query.dataset_id);
 
     if (!dataset) {
@@ -212,12 +214,10 @@ async function tableInfo(req, res) {
       return res.status(400).json({ error: 'Missing table for dataset' });
     }
 
-    // Parse schema + table name
     const [schemaName, tableName] = table.includes('.')
       ? table.split('.')
       : ['public', table];
 
-    // 1️⃣ Get column metadata (names + types)
     const colSql = `
       SELECT column_name AS name, data_type AS type
       FROM information_schema.columns
@@ -232,8 +232,6 @@ async function tableInfo(req, res) {
       .map(r => r.name);
 
     if (columnIds.includes(XT_PARTITION_ID)) {
-      // query partitions
-      // Assume 'schemaName' holds the city's schema (e.g., 'city')
       const partitionTable = dataset.datasetInfo.partitionTableInfo.table;
       const partitionSql = `
   SELECT id, name
@@ -244,7 +242,6 @@ async function tableInfo(req, res) {
       partitions = partitionResult.rows;
     }
 
-    // 2️⃣ Pull one small sample of data
     const sampleSql = `
       SELECT *
       FROM ${table}
@@ -254,7 +251,6 @@ async function tableInfo(req, res) {
     const sampleResult = await query(sampleSql);
     const sampleRows = sampleResult.rows || [];
 
-    // 3️⃣ Compute distinct values from the sample
     for (const col of textColumns) {
       const sampleValues = sampleRows
         .map(r => r[col])
@@ -264,12 +260,12 @@ async function tableInfo(req, res) {
 
       const unique = [...new Set(sampleValues)];
 
-      if (unique.length >= 190) { // 95%
+      if (unique.length >= 190) {
         if (process.env.W4H_DEBUG) console.log(`⚙️ Skipping noisy column: ${col}`);
         continue;
       }
 
-      values[col] = unique; //.slice(0, 200);      // keep up to 200 unique values
+      values[col] = unique;
     }
 
     const columns = colResult.rows;
@@ -283,17 +279,15 @@ async function tableInfo(req, res) {
   } catch (err) {
     console.error('tableInfo error:', err);
     return res.status(500).json({
-      error: 'Failed to load table info', 
+      error: 'Failed to load table info',
       message: err.message,
       details: process.env.NODE_ENV === 'development' ? err.stack : undefined
     });
   }
 }
 
-// Helper function to process a single dataset
 async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
   const datasetId = dataset.id;
-  // Add mixins to dataset
   const mixins = [];
   for (const [key, entry] of QUERY_MAP.entries()) {
     if (entry.datasetInfo && entry.datasetInfo.id === datasetId) {
@@ -305,7 +299,7 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
     const aHasColon = a.id.includes(':');
     const bHasColon = b.id.includes(':');
     if (aHasColon !== bHasColon) {
-      return aHasColon ? 1 : -1; // mixins WITHOUT ':' come first
+      return aHasColon ? 1 : -1;
     }
     return (a.description || '').localeCompare(b.description || '');
   });
@@ -319,11 +313,10 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
     mixins,
   };
 
-  // Query status logs for tables in this dataset
   const allUniqueTableNames = new Set();
   processedDataset.tables?.forEach(table => {
     allUniqueTableNames.add(table);
-    allUniqueTableNames.add(table + '_staging');   // add staging variant
+    allUniqueTableNames.add(table + '_staging');
   });
 
   const datasetTables = tableConfigs
@@ -331,7 +324,7 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
 
   datasetTables.forEach(d => {
     allUniqueTableNames.add(d.name);
-    allUniqueTableNames.add(d.name + '_staging'); // add staging variant
+    allUniqueTableNames.add(d.name + '_staging');
   });
 
   const tableNamesArray = Array.from(allUniqueTableNames);
@@ -349,7 +342,6 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
   }
 
   if (processedDataset.tables) {
-    // Assign status and metabase_url to each table
     processedDataset.tables = processedDataset.tables?.map((table, index) => ({
       name: table,
       status: statusMap.get(table)
@@ -359,13 +351,11 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
       source_name: datasetInfo.sources?.[index]?.name || null,
       source_url: datasetInfo.sources?.[index]?.url || null
     })) || [];
-    // Remove redundant top-level metabase_urls
     delete processedDataset.metabase_urls;
     delete processedDataset.sources;
   } else {
     processedDataset.tables = datasetTables;
 
-    // Assign status to each table
     processedDataset.tables = processedDataset.tables.map(tableInfo => ({
       name: tableInfo.name,
       metabase_url: tableInfo.metabase_url || null,
@@ -385,26 +375,28 @@ async function listDatasets(req, res) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
+  const pc = await resolveDatasetProjectLinkColumn();
   let sql = `
-    SELECT d.id, d.study_id, d.name, d.description
+    SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
     FROM w4h.datasets d
   `;
   const params = [];
 
   if (req.user.role !== USER_ROLES.ADMIN) {
     sql += `
-      JOIN w4h.user_studies us
-        ON us.study_id = d.study_id
+      JOIN w4h.user_projects us
+        ON us.project_id = d.${pc}
     `;
     params.push(req.user.id);
     sql += ` WHERE us.user_id = $${params.length}`;
   }
 
-  if (req.query.study_id) {
-    params.push(req.query.study_id);
+  const filterProjectId = req.query.project_id;
+  if (filterProjectId) {
+    params.push(filterProjectId);
     sql += params.length === 1 && req.user.role === USER_ROLES.ADMIN
-      ? ` WHERE d.study_id = $${params.length}`
-      : ` AND d.study_id = $${params.length}`;
+      ? ` WHERE d.${pc} = $${params.length}`
+      : ` AND d.${pc} = $${params.length}`;
   }
 
   sql += ` ORDER BY name ASC`;
@@ -422,16 +414,16 @@ async function listDatasets(req, res) {
     WHERE dataset_id = ANY($1)
   `, [datasetIds]);
 
-  // Process datasets
   const datasets = [];
-  const queryMapByStudy = new Map();
+  const queryMapByCatalogProject = new Map();
 
   for (const d of result.rows) {
-    if (!queryMapByStudy.has(d.study_id)) {
-      queryMapByStudy.set(d.study_id, await getQueryMap(d.study_id));
+    const cp = d.dataset_project_id;
+    if (!queryMapByCatalogProject.has(cp)) {
+      queryMapByCatalogProject.set(cp, await getQueryMap(cp));
     }
 
-    datasets.push(await processDataset(d, req.user, queryMapByStudy.get(d.study_id), tableConfigs.rows));
+    datasets.push(await processDataset(d, req.user, queryMapByCatalogProject.get(cp), tableConfigs.rows));
   }
 
   res.json(datasets);
@@ -443,18 +435,19 @@ async function getDataset(req, res) {
   }
 
   const { id } = req.params;
+  const pc = await resolveDatasetProjectLinkColumn();
   const result = req.user.role === USER_ROLES.ADMIN
     ? await query(
-      `SELECT id, study_id, name, description
+      `SELECT id, ${pc} AS dataset_project_id, name, description
        FROM w4h.datasets
        WHERE id = $1`,
       [id]
     )
     : await query(
-      `SELECT d.id, d.study_id, d.name, d.description
+      `SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
        FROM w4h.datasets d
-       JOIN w4h.user_studies us
-         ON us.study_id = d.study_id
+       JOIN w4h.user_projects us
+         ON us.project_id = d.${pc}
        WHERE d.id = $1 AND us.user_id = $2`,
       [id, req.user.id]
     );
@@ -471,8 +464,7 @@ async function getDataset(req, res) {
     WHERE dataset_id = $1
   `, [dataset.id]);
 
-  // 2. Load the hardcoded map (Backward Compatibility Base)
-  const QUERY_MAP = await getQueryMap(dataset.study_id);
+  const QUERY_MAP = await getQueryMap(dataset.dataset_project_id);
 
   const processedDataset = await processDataset(dataset, req.user, QUERY_MAP, tableConfigs.rows);
 

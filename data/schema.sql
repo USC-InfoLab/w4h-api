@@ -1,8 +1,11 @@
--- Core schema objects for W4H
--- Idempotent: safe to run multiple times
-
 CREATE SCHEMA IF NOT EXISTS w4h;
 
+-- Enable pgcrypto extension for gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- ---------------------------------------------------------------------------
+-- Users — application users (admins, researchers, clinicians)
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.users (
   id SERIAL PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
@@ -15,16 +18,39 @@ CREATE TABLE IF NOT EXISTS w4h.users (
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON w4h.users(email);
 
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_hash text;
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_prefix text;
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_created_at timestamp with time zone;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key_hash ON w4h.users(api_key_hash) WHERE api_key_hash IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Projects — research workspaces/projects containing members, datasets, and notebooks
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.projects (
-  id text COLLATE pg_catalog."default" NOT NULL,
-  name text COLLATE pg_catalog."default" NOT NULL,
-  description text COLLATE pg_catalog."default",
-  CONSTRAINT projects_pkey PRIMARY KEY (id)
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  slug text UNIQUE NOT NULL, -- URL-friendly short name (e.g. 'cardio-study')
+  name text NOT NULL, -- Descriptive human-readable project name
+  description text, -- Summary of the project goals and scope
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')), -- Status flag (active/archived)
+  visibility text NOT NULL DEFAULT 'org-private' CHECK (visibility IN ('org-private', 'project-private', 'internal')), -- Accessibility scope
+  irb_protocol_id text, -- Institutional Review Board protocol tracking number
+  irb_expiry_date date, -- IRB approval expiration date
+  created_by integer NOT NULL REFERENCES w4h.users(id) ON DELETE RESTRICT, -- User who created the project
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+ALTER TABLE w4h.projects ADD COLUMN IF NOT EXISTS launchers jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_projects_slug ON w4h.projects(slug);
+CREATE INDEX IF NOT EXISTS idx_projects_created_by ON w4h.projects(created_by);
+
+-- ---------------------------------------------------------------------------
+-- Datasets — references to structured/unstructured dataset resources
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.datasets (
   id text COLLATE pg_catalog."default" NOT NULL,
-  project_id text COLLATE pg_catalog."default",
+  project_id text COLLATE pg_catalog."default", -- Legacy optional reference to project text ID
   name text COLLATE pg_catalog."default",
   description text COLLATE pg_catalog."default",
   CONSTRAINT datasets_pkey1 PRIMARY KEY (id)
@@ -32,26 +58,26 @@ CREATE TABLE IF NOT EXISTS w4h.datasets (
 
 CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON w4h.datasets(project_id);
 
+ALTER TABLE IF EXISTS w4h.datasets ADD COLUMN IF NOT EXISTS project_id text COLLATE pg_catalog."default";
+ALTER TABLE IF EXISTS w4h.datasets DROP COLUMN IF EXISTS hidden;
+
+-- ---------------------------------------------------------------------------
+-- User Projects (Legacy compatibility mapping)
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.user_projects (
   user_id integer NOT NULL,
-  project_id text COLLATE pg_catalog."default" NOT NULL,
+  project_id uuid NOT NULL, -- References UUID-based projects.id
   CONSTRAINT user_projects_pkey PRIMARY KEY (user_id, project_id),
-  CONSTRAINT user_projects_user_fk FOREIGN KEY (user_id)
-    REFERENCES w4h.users (id)
-    ON DELETE CASCADE,
-  CONSTRAINT user_projects_fk FOREIGN KEY (project_id)
-    REFERENCES w4h.projects (id)
-    ON DELETE CASCADE
+  CONSTRAINT user_projects_user_fk FOREIGN KEY (user_id) REFERENCES w4h.users (id) ON DELETE CASCADE,
+  CONSTRAINT user_projects_fk FOREIGN KEY (project_id) REFERENCES w4h.projects (id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_projects_user_id ON w4h.user_projects(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_projects_project_id ON w4h.user_projects(project_id);
 
-ALTER TABLE IF EXISTS w4h.datasets
-  ADD COLUMN IF NOT EXISTS project_id text COLLATE pg_catalog."default";
-
-ALTER TABLE IF EXISTS w4h.datasets
-  DROP COLUMN IF EXISTS hidden;
+-- ---------------------------------------------------------------------------
+-- Docs — documentation pages and knowledgebase articles
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.docs (
   id uuid NOT NULL DEFAULT gen_random_uuid (),
   slug text COLLATE pg_catalog."default" NOT NULL,
@@ -72,7 +98,118 @@ CREATE TABLE IF NOT EXISTS w4h.docs (
   CONSTRAINT docs_pkey PRIMARY KEY (id),
   CONSTRAINT docs_slug_key UNIQUE (slug)
 );
+
 CREATE INDEX IF NOT EXISTS idx_docs_slug ON w4h.docs(slug);
+
+-- ---------------------------------------------------------------------------
+-- Project Members — user roles and permissions within specific projects
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.project_members (
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  user_id integer NOT NULL REFERENCES w4h.users(id) ON DELETE CASCADE,
+  role text NOT NULL CHECK (role IN ('owner', 'editor', 'viewer', 'admin')), -- Member access role (owner, editor, viewer, admin)
+  invited_by integer REFERENCES w4h.users(id) ON DELETE SET NULL, -- User who invited this member
+  joined_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (project_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_members_user_id ON w4h.project_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_project_members_project_id ON w4h.project_members(project_id);
+
+-- ---------------------------------------------------------------------------
+-- Project Datasets — many-to-many link between projects and associated datasets
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.project_datasets (
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  dataset_id text NOT NULL REFERENCES w4h.datasets(id) ON DELETE RESTRICT,
+  access_type text NOT NULL DEFAULT 'read' CHECK (access_type IN ('read', 'read_write')), -- Access level on the dataset
+  approved_by integer REFERENCES w4h.users(id) ON DELETE SET NULL, -- User who approved linking the dataset
+  approved_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (project_id, dataset_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_datasets_dataset_id ON w4h.project_datasets(dataset_id);
+
+-- ---------------------------------------------------------------------------
+-- Project Notebooks — analytics notebooks (Jupyter, RStudio, VS Code) registered to a project
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.project_notebooks (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  title text NOT NULL, -- Title of the notebook
+  description text, -- Purpose details
+  purpose text NOT NULL DEFAULT 'analysis' CHECK (purpose IN ('exploration', 'preprocessing', 'analysis', 'visualization', 'report')),
+  repo_url text, -- URL to git repo hosting the notebook
+  repo_ref text, -- Branch/commit/tag reference
+  notebook_path text NOT NULL, -- Path to the notebook file inside the repo
+  runtime_type text NOT NULL DEFAULT 'jupyter' CHECK (runtime_type IN ('jupyter', 'rstudio', 'vscode', 'quarto', 'other')), -- Target IDE environment
+  launchers jsonb NOT NULL DEFAULT '["jupyter"]'::jsonb, -- Supported launching options
+  created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_notebooks_project_id ON w4h.project_notebooks(project_id);
+
+-- ---------------------------------------------------------------------------
+-- Project Docs — link documentation pages to specific projects
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.project_docs (
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  doc_slug text NOT NULL REFERENCES w4h.docs(slug) ON DELETE CASCADE, -- References w4h.docs slug
+  linked_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  linked_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (project_id, doc_slug)
+);
+
+-- ---------------------------------------------------------------------------
+-- Project ACL Rules — granular resource access control list configurations
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.project_acl_rules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  subject_type text NOT NULL CHECK (subject_type IN ('role', 'user')), -- Target of rule (role or specific user)
+  subject_key text NOT NULL, -- Role name (e.g. 'researcher') or user ID
+  resource_type text NOT NULL CHECK (resource_type IN ('project', 'dataset', 'doc', 'derived_table', 'notebook')), -- Target resource category
+  resource_key text, -- Specific resource ID/slug, or NULL to apply to all of resource_type
+  permission text NOT NULL CHECK (permission IN ('view', 'edit', 'manage_members', 'link_dataset', 'create_derived', 'launch_notebook')), -- Action permitted/denied
+  effect text NOT NULL DEFAULT 'allow' CHECK (effect IN ('allow', 'deny')), -- Rule effect (allow or deny)
+  created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_acl_project_id ON w4h.project_acl_rules(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_acl_subject ON w4h.project_acl_rules(subject_type, subject_key);
+
+-- ---------------------------------------------------------------------------
+-- Project DB Tokens — tokens for direct programmatic database queries
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.project_db_tokens (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  user_id integer NOT NULL REFERENCES w4h.users(id) ON DELETE CASCADE,
+  token_hash text NOT NULL UNIQUE, -- Cryptographic hash of the database access token
+  expires_at timestamp without time zone NOT NULL, -- Expiration date and time
+  issued_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  revoked_at timestamp without time zone -- Cancellation date and time if manually revoked
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_db_tokens_lookup ON w4h.project_db_tokens(project_id, user_id, expires_at);
+
+-- ---------------------------------------------------------------------------
+-- Project Organizations — external institutions or partners associated with a project
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.project_organizations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  short text, -- Short name/abbreviation (e.g. 'NIH')
+  name text NOT NULL, -- Full name of organization (e.g. 'National Institutes of Health')
+  website_url text, -- Web URL for the organization
+  sort_order integer NOT NULL DEFAULT 0,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_organizations_project_id ON w4h.project_organizations(project_id, sort_order, name);
 
 -- ---------------------------------------------------------------------------
 -- HIPAA Audit Log — append-only record of all access and mutations to PHI.
