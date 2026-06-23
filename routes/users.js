@@ -11,6 +11,21 @@ import { isMailerConfigured, sendMail } from '../lib/mailer.js';
 const SCHEMA = 'w4h';
 const TABLE = 'users';
 
+router.post('/login', login);
+router.post('/token-valid', tokenValid);
+router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
+router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
+router.delete('/me/api-key', auth.authenticate, revokeMyApiKey);
+router.delete('/user/:email/api-key', auth.authenticate, revokeUserApiKeyByEmail);
+router.get('/', auth.authenticate, list);
+router.get('/user/:email', auth.authenticate, getByEmail);
+router.post('/profile', auth.authenticate, updateProfile);
+router.post('/add', auth.authenticate, addUser);
+router.post('/set', auth.authenticate, setUser);
+router.delete('/:email', auth.authenticate, del);
+router.get('/roles', auth.authenticate, roles);
+
+
 function pickProjectIds(user) {
   if (!user || typeof user !== 'object') return [];
   return normalizeProjectIds(user.project_ids);
@@ -61,20 +76,6 @@ async function ensureAdminAssignedToAllProjects(userId) {
     [userId]
   );
 }
-
-router.post('/login', login);
-router.post('/token-valid', tokenValid);
-router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
-router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
-router.delete('/me/api-key', auth.authenticate, revokeMyApiKey);
-router.delete('/user/:email/api-key', auth.authenticate, revokeUserApiKeyByEmail);
-router.get('/', auth.authenticate, list);
-router.get('/user/:email', auth.authenticate, getByEmail);
-router.post('/profile', auth.authenticate, updateProfile);
-router.post('/add', auth.authenticate, addUser);
-router.post('/set', auth.authenticate, setUser);
-router.delete('/:email', auth.authenticate, del);
-router.get('/roles', auth.authenticate, roles);
 
 function roles(req, res) {
   if (req.user.role !== 'admin') {
@@ -461,6 +462,7 @@ async function list(req, res) {
   if (req.user.role !== 'admin') {
     return res.json(null);
   }
+
   try {
     const result = await query(
       `SELECT
@@ -482,9 +484,6 @@ async function list(req, res) {
                SELECT ARRAY_AGG(us.project_id ORDER BY s.name)
                FROM ${SCHEMA}.user_projects us
                LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
-               SELECT ARRAY_AGG(us.project_id ORDER BY s.name)
-               FROM ${SCHEMA}.user_projects us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                WHERE us.user_id = u.id
              ),
              '{}'
@@ -500,8 +499,6 @@ async function list(req, res) {
                SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
                FROM ${SCHEMA}.user_projects us
                LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
-               FROM ${SCHEMA}.user_projects us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                WHERE us.user_id = u.id
              ),
              ''
@@ -510,6 +507,7 @@ async function list(req, res) {
        FROM ${SCHEMA}.${TABLE} u
        ORDER BY u.email ASC`
     );
+
     res.json(result.rows);
   } catch (error) {
     console.error('List users error:', error);
