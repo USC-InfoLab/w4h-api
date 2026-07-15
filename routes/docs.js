@@ -7,7 +7,7 @@ import { DOCS_TABLE, DOC_TYPES_TABLE, query } from '../db.js';
 import { authenticate } from '../auth.js';
 import { USER_ROLES } from '../lib/utils/user.js';
 import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter } from '../lib/utils/docs.js';
-import { renderDoc } from '../lib/utils/md-render.js';
+import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
 
 import crypto from 'crypto';
 
@@ -290,7 +290,8 @@ async function put(req, res) {
     md = '',
   } = req.body;
 
-  const { html, toc } = renderDoc(md);
+  const cleanedMd = stripLeadingTitleHeading(md, title);
+  const { html, toc } = renderDoc(cleanedMd);
   const tocJson = JSON.stringify(toc);
 
   try {
@@ -349,7 +350,7 @@ async function put(req, res) {
     const result = await query(queryText, [
       id || null, finalSlug, title, card_title, card_order, doc_type, description,
       action_label, sort_order, hidden, is_feature_card, show_in_docs,
-      md, html, tocJson, req.user.email || null
+      cleanedMd, html, tocJson, req.user.email || null
     ]);
 
     res.json(result.rows[0]);

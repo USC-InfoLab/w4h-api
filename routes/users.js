@@ -12,6 +12,8 @@ const SCHEMA = 'w4h';
 const TABLE = 'users';
 
 router.post('/login', login);
+router.post('/send-code', sendLoginCode);
+router.post('/verify-code', verifyLoginCode);
 router.post('/token-valid', tokenValid);
 router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
 router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
@@ -28,7 +30,7 @@ router.get('/roles', auth.authenticate, roles);
 
 function pickProjectIds(user) {
   if (!user || typeof user !== 'object') return [];
-  return normalizeProjectIds(user.project_ids);
+  return normalizeProjectIds(user.project_ids ?? user.study_ids);
 }
 
 function normalizeProjectIds(input) {
@@ -60,7 +62,7 @@ async function syncUserProjects(userId, role, requestedProjectIds = []) {
       `INSERT INTO ${SCHEMA}.user_projects (user_id, project_id)
        SELECT $1, UNNEST($2::text[])
        ON CONFLICT (user_id, project_id) DO NOTHING`,
-      [userId, studyIds]
+      [userId, projectIds]
     );
   }
 
@@ -418,9 +420,6 @@ async function getByEmail(req, res) {
                SELECT ARRAY_AGG(us.project_id ORDER BY s.name)
                FROM ${SCHEMA}.user_projects us
                LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
-               SELECT ARRAY_AGG(us.project_id ORDER BY s.name)
-               FROM ${SCHEMA}.user_projects us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                WHERE us.user_id = u.id
              ),
              '{}'
@@ -434,8 +433,6 @@ async function getByEmail(req, res) {
            ELSE COALESCE(
              (
                SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
-               FROM ${SCHEMA}.user_projects us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                FROM ${SCHEMA}.user_projects us
                LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
                WHERE us.user_id = u.id
@@ -512,6 +509,209 @@ async function list(req, res) {
   } catch (error) {
     console.error('List users error:', error);
     res.status(500).json({ error: error.message });
+  }
+}
+
+const LOGIN_CODE_TTL_MINUTES = 10;
+const LOGIN_CODE_MAX_SENDS = 3;
+const LOGIN_CODE_SEND_WINDOW_MINUTES = 15;
+const LOGIN_CODE_MAX_ATTEMPTS = 5;
+
+function hashLoginCode(code) {
+  return crypto.createHash('sha256').update(String(code).trim()).digest('hex');
+}
+
+function generateLoginCode() {
+  return String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+}
+
+async function writeAuthAudit(req, { userId, action, details }) {
+  try {
+    await query(
+      `INSERT INTO ${SCHEMA}.audit_log (user_id, action, resource_type, ip_address, user_agent, details)
+       VALUES ($1, $2, 'user', $3, $4, $5)`,
+      [
+        userId ?? null,
+        action,
+        req.ip || null,
+        req.get('user-agent') || null,
+        details ? JSON.stringify(details) : null
+      ]
+    );
+  } catch (err) {
+    console.warn('Auth audit log write failed:', err.message);
+  }
+}
+
+async function sendLoginCode(req, res) {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ error: { message: 'Email is required.' } });
+    }
+
+    if (!isMailerConfigured()) {
+      return res.status(503).json({
+        error: {
+          message: 'Email is not configured. Ask your administrator to set up SMTP, or sign in with your password.'
+        }
+      });
+    }
+
+    const userResult = await query(
+      `SELECT id, name, email FROM ${SCHEMA}.${TABLE} WHERE lower(trim(email)) = $1`,
+      [email]
+    );
+
+    if (userResult.rowCount === 0) {
+      return res.status(404).json({ error: { message: 'No account found for that email address.' } });
+    }
+
+    const user = userResult.rows[0];
+
+    const recentSends = await query(
+      `SELECT COUNT(*)::int AS count
+       FROM ${SCHEMA}.login_codes
+       WHERE user_id = $1
+         AND created_at > now() - ($2 || ' minutes')::interval`,
+      [user.id, String(LOGIN_CODE_SEND_WINDOW_MINUTES)]
+    );
+
+    if (recentSends.rows[0].count >= LOGIN_CODE_MAX_SENDS) {
+      return res.status(429).json({
+        error: { message: 'Too many code requests. Please wait a few minutes and try again.' }
+      });
+    }
+
+    await query(
+      `DELETE FROM ${SCHEMA}.login_codes
+       WHERE user_id = $1 AND (used_at IS NOT NULL OR expires_at < now())`,
+      [user.id]
+    );
+
+    const code = generateLoginCode();
+    const codeHash = hashLoginCode(code);
+
+    await query(
+      `INSERT INTO ${SCHEMA}.login_codes (user_id, code_hash, expires_at)
+       VALUES ($1, $2, now() + ($3 || ' minutes')::interval)`,
+      [user.id, codeHash, String(LOGIN_CODE_TTL_MINUTES)]
+    );
+
+    try {
+      await sendMail({
+        to: user.email,
+        subject: 'Your W4H sign-in code',
+        text: `Hello ${user.name || user.email},\n\nYour W4H sign-in code is: ${code}\n\nThis code expires in ${LOGIN_CODE_TTL_MINUTES} minutes. If you did not request it, ignore this email.\n`,
+        html: `<p>Hello ${user.name || user.email},</p><p>Your W4H sign-in code is:</p><p style="font-size:1.5em;font-weight:bold;letter-spacing:0.15em">${code}</p><p>This code expires in ${LOGIN_CODE_TTL_MINUTES} minutes. If you did not request it, you can ignore this email.</p>`
+      });
+    } catch (mailError) {
+      console.error('sendLoginCode mail error:', mailError);
+      return res.status(502).json({
+        error: { message: 'Could not send email. Check SMTP settings or try signing in with your password.' }
+      });
+    }
+
+    await writeAuthAudit(req, {
+      userId: user.id,
+      action: 'user.login_code_sent',
+      details: { email: user.email }
+    });
+
+    res.json({
+      success: true,
+      message: `A sign-in code was sent to ${user.email}. It expires in ${LOGIN_CODE_TTL_MINUTES} minutes.`
+    });
+  } catch (error) {
+    console.error('sendLoginCode error:', error);
+    res.status(500).json({ error: { message: 'Failed to send sign-in code.' } });
+  }
+}
+
+async function verifyLoginCode(req, res) {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    const code = String(req.body.code || '').trim();
+
+    if (!email || !code) {
+      return res.status(400).json({ error: { message: 'Email and verification code are required.' } });
+    }
+
+    if (!/^\d{6}$/.test(code)) {
+      return res.status(400).json({ error: { message: 'Enter the 6-digit code from your email.' } });
+    }
+
+    const userResult = await query(
+      `SELECT id, name, email, role FROM ${SCHEMA}.${TABLE} WHERE lower(trim(email)) = $1`,
+      [email]
+    );
+
+    if (userResult.rowCount === 0) {
+      return res.status(401).json({ error: { message: 'Invalid email or verification code.' } });
+    }
+
+    const user = userResult.rows[0];
+    const codeHash = hashLoginCode(code);
+
+    const codeResult = await query(
+      `SELECT id, attempts
+       FROM ${SCHEMA}.login_codes
+       WHERE user_id = $1
+         AND code_hash = $2
+         AND used_at IS NULL
+         AND expires_at > now()
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [user.id, codeHash]
+    );
+
+    if (codeResult.rowCount === 0) {
+      await query(
+        `UPDATE ${SCHEMA}.login_codes
+         SET attempts = attempts + 1
+         WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()`,
+        [user.id]
+      );
+      await writeAuthAudit(req, {
+        userId: user.id,
+        action: 'user.login_code_failed',
+        details: { email: user.email, reason: 'invalid_code' }
+      });
+      return res.status(401).json({ error: { message: 'Invalid or expired verification code.' } });
+    }
+
+    const codeRow = codeResult.rows[0];
+    if (codeRow.attempts >= LOGIN_CODE_MAX_ATTEMPTS) {
+      await query(`UPDATE ${SCHEMA}.login_codes SET used_at = now() WHERE id = $1`, [codeRow.id]);
+      return res.status(429).json({
+        error: { message: 'Too many failed attempts. Request a new code.' }
+      });
+    }
+
+    await query(`UPDATE ${SCHEMA}.login_codes SET used_at = now() WHERE id = $1`, [codeRow.id]);
+
+    if (user.role === 'admin') {
+      await ensureAdminAssignedToAllProjects(user.id);
+    }
+
+    const userInfo = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role
+    };
+    const token = auth.sign(userInfo);
+
+    await writeAuthAudit(req, {
+      userId: user.id,
+      action: 'user.login_code_success',
+      details: { email: user.email }
+    });
+
+    res.json({ user: userInfo, token });
+  } catch (error) {
+    console.error('verifyLoginCode error:', error);
+    res.status(500).json({ error: { message: 'Login failed.' } });
   }
 }
 

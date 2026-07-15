@@ -150,15 +150,7 @@ async function getProjectOverview(req, res) {
     const pc = await resolveDatasetProjectLinkColumn();
 
     const [membersRes, datasetsRes, notebooksRes, docsRes, orgsRes, derivedOrgsRes, aclRes] = await Promise.all([
-      query(
-        `SELECT pm.user_id, pm.role, pm.joined_at,
-                u.name, u.email, u.role AS user_role
-         FROM w4h.project_members pm
-         JOIN w4h.users u ON u.id = pm.user_id
-         WHERE pm.project_id = $1::uuid
-         ORDER BY pm.joined_at ASC`,
-        [projectId]
-      ),
+      Promise.resolve({ rows: await listMembers(projectId) }),
       query(
         `SELECT pd.dataset_id, pd.access_type, pd.approved_at,
                 d.name, d.description, d.${pc} AS dataset_project_id
@@ -269,12 +261,6 @@ async function createProject(req, res) {
     );
 
     const project = inserted.rows[0];
-    await query(
-      `INSERT INTO w4h.project_members (project_id, user_id, role, invited_by)
-       VALUES ($1::uuid, $2, 'owner', $2)
-       ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
-      [project.id, req.user.id]
-    );
 
     res.status(201).json(project);
   } catch (error) {
@@ -399,14 +385,20 @@ async function resolveMemberUserId(row) {
   return found.rowCount ? found.rows[0].id : null;
 }
 
+async function isPlatformAdminUserId(userId) {
+  const res = await query(`SELECT role FROM w4h.users WHERE id = $1`, [userId]);
+  return res.rowCount > 0 && res.rows[0].role === USER_ROLES.ADMIN;
+}
+
 async function listMembers(projectId) {
   const fresh = await query(
     `SELECT pm.user_id, pm.role, pm.joined_at, u.name, u.email, u.role AS user_role
      FROM w4h.project_members pm
      JOIN w4h.users u ON u.id = pm.user_id
      WHERE pm.project_id = $1::uuid
+       AND u.role <> $2
      ORDER BY pm.joined_at ASC`,
-    [projectId]
+    [projectId, USER_ROLES.ADMIN]
   );
   return fresh.rows;
 }
@@ -438,6 +430,11 @@ async function addProjectMember(req, res) {
     if (!Number.isInteger(userId)) {
       const email = String(req.body?.email || '').trim();
       return res.status(400).json({ error: email ? `Unknown user email: ${email}` : 'Member user_id or email is required' });
+    }
+    if (await isPlatformAdminUserId(userId)) {
+      return res.status(400).json({
+        error: 'Platform admin accounts are not project members. Use Created by for the provisioning admin; add researchers or clinicians here.'
+      });
     }
 
     await query(
@@ -549,6 +546,7 @@ async function replaceProjectMembers(req, res) {
         if (email) unresolvedEmails.push(email);
         continue;
       }
+      if (await isPlatformAdminUserId(userId)) continue;
       resolved.push({ userId, role });
     }
 

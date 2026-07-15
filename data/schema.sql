@@ -76,6 +76,22 @@ CREATE INDEX IF NOT EXISTS idx_user_projects_user_id ON w4h.user_projects(user_i
 CREATE INDEX IF NOT EXISTS idx_user_projects_project_id ON w4h.user_projects(project_id);
 
 -- ---------------------------------------------------------------------------
+-- Login codes — short-lived email OTP for passwordless sign-in (SMTP required)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.login_codes (
+  id          SERIAL PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES w4h.users(id) ON DELETE CASCADE,
+  code_hash   TEXT NOT NULL,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  used_at     TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_codes_user_id ON w4h.login_codes(user_id);
+CREATE INDEX IF NOT EXISTS idx_login_codes_expires_at ON w4h.login_codes(expires_at);
+
+-- ---------------------------------------------------------------------------
 -- Docs — documentation pages and knowledgebase articles
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.docs (
