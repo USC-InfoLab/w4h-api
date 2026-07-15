@@ -1,0 +1,11 @@
+SELECT * FROM w4h.users
+ORDER BY id ASC
+
+SELECT * FROM w4h.datasets
+ORDER BY id ASC 
+
+SELECT * FROM w4h.docs
+ORDER BY id ASC
+
+SELECT * FROM w4h.studies
+ORDER BY id ASC

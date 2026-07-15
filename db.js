@@ -6,9 +6,11 @@ types.setTypeParser(1700, d => parseFloat(d));
 export const SCHEMA_NAME = 'w4h';
 export const USERS_TABLE_NAME = 'users';
 export const DOCS_TABLE_NAME = 'docs';
+export const DOC_TYPES_TABLE_NAME = 'doc_types';
 export const USERS_USER_PROJECTS = 'user_projects';
 
 export const DOCS_TABLE = `${SCHEMA_NAME}.${DOCS_TABLE_NAME}`;
+export const DOC_TYPES_TABLE = `${SCHEMA_NAME}.${DOC_TYPES_TABLE_NAME}`;
 export const USER_TABLE = `${SCHEMA_NAME}.${USERS_TABLE_NAME}`;
 export const USER_PROJECTS_TABLE = `${SCHEMA_NAME}.${USERS_USER_PROJECTS}`;
 

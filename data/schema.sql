@@ -99,7 +99,19 @@ CREATE TABLE IF NOT EXISTS w4h.docs (
   CONSTRAINT docs_slug_key UNIQUE (slug)
 );
 
+-- Track who last updated each doc (email of in-app editor, or git author on import)
+ALTER TABLE w4h.docs ADD COLUMN IF NOT EXISTS updated_by text COLLATE pg_catalog."default";
+
 CREATE INDEX IF NOT EXISTS idx_docs_slug ON w4h.docs(slug);
+
+-- ---------------------------------------------------------------------------
+-- Doc Types — sidebar groupings and doc-type picker options
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.doc_types (
+  slug text PRIMARY KEY,
+  label text NOT NULL,
+  sort_order integer NOT NULL DEFAULT 0
+);
 
 -- ---------------------------------------------------------------------------
 -- Project Members — user roles and permissions within specific projects
