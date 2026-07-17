@@ -7,6 +7,15 @@ import * as auth from '../auth.js';
 import jwt from 'jsonwebtoken';
 import { validatePassword } from '../lib/utils/password-validator.js';
 import { isMailerConfigured, sendMail } from '../lib/mailer.js';
+import {
+  USER_ROLES,
+  USER_ROLES_NAMES,
+  isSuperAdmin,
+  isTeamAdmin,
+  canManageUsers,
+  isAssignablePlatformRole,
+  rolesAssignableBy,
+} from '../lib/utils/user.js';
 
 const SCHEMA = 'w4h';
 const TABLE = 'users';
@@ -45,13 +54,44 @@ function normalizeProjectIds(input) {
   )];
 }
 
+function normalizeTeamIds(input) {
+  const list = Array.isArray(input) ? input : (input == null || input === '' ? [] : [input]);
+  return [...new Set(
+    list
+      .map(id => (id == null ? '' : String(id).trim()))
+      .filter(Boolean)
+  )];
+}
+
 async function getAllProjectIds() {
   const result = await query(`SELECT id FROM ${SCHEMA}.projects ORDER BY name ASC`);
   return result.rows.map(row => row.id);
 }
 
+async function getTeamIdsForUser(userId) {
+  const result = await query(
+    `SELECT team_id::text AS team_id FROM ${SCHEMA}.team_members WHERE user_id = $1`,
+    [userId]
+  );
+  return result.rows.map(r => r.team_id);
+}
+
+async function syncUserTeams(userId, teamIds = []) {
+  const ids = normalizeTeamIds(teamIds);
+  await query(`DELETE FROM ${SCHEMA}.team_members WHERE user_id = $1`, [userId]);
+  if (ids.length > 0) {
+    await query(
+      `INSERT INTO ${SCHEMA}.team_members (user_id, team_id)
+       SELECT $1, UNNEST($2::uuid[])
+       ON CONFLICT (team_id, user_id) DO NOTHING`,
+      [userId, ids]
+    );
+  }
+  return ids;
+}
+
 async function syncUserProjects(userId, role, requestedProjectIds = []) {
-  const projectIds = role === 'admin'
+  const projectIds = isSuperAdmin(role)
     ? await getAllProjectIds()
     : normalizeProjectIds(requestedProjectIds);
 
@@ -79,11 +119,27 @@ async function ensureAdminAssignedToAllProjects(userId) {
   );
 }
 
+async function buildUserSessionInfo(user) {
+  const teamIds = await getTeamIdsForUser(user.id);
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    team_ids: teamIds,
+    team_id: teamIds[0] || null,
+  };
+}
+
 function roles(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.json(null);
+  const allowed = rolesAssignableBy(req.user.role);
+  if (!allowed.length) {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
-  res.json(['clinician', 'researcher', 'admin']);
+  res.json(allowed.map(value => ({
+    value,
+    text: USER_ROLES_NAMES[value] || value,
+  })));
 }
 
 function tokenValid(req, res) {
@@ -101,8 +157,8 @@ function tokenValid(req, res) {
 }
 
 async function del(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.json(null);
+  if (!isSuperAdmin(req.user.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
     const targetResult = await query(
@@ -114,8 +170,8 @@ async function del(req, res) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    if (targetResult.rows[0].role === 'admin') {
-      return res.status(400).json({ error: 'Admin users cannot be deleted' });
+    if (isSuperAdmin(targetResult.rows[0].role)) {
+      return res.status(400).json({ error: 'Super admin users cannot be deleted' });
     }
 
     await query(`DELETE FROM ${SCHEMA}.${TABLE} WHERE email = $1`, [req.params.email]);
@@ -190,7 +246,7 @@ async function revokeMyApiKey(req, res) {
 }
 
 async function revokeUserApiKeyByEmail(req, res) {
-  if (req.user.role !== 'admin') {
+  if (!isSuperAdmin(req.user.role)) {
     return res.status(403).json({ error: 'Admin privileges required' });
   }
   try {
@@ -217,8 +273,8 @@ async function revokeUserApiKeyByEmail(req, res) {
 }
 
 async function setUser(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.json(null);
+  if (!canManageUsers(req.user.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
     const { user } = req.body;
@@ -241,11 +297,17 @@ async function setUser(req, res) {
     }
 
     const existingUser = existingResult.rows[0];
-    if (existingUser.role === 'admin' && user.role !== 'admin') {
-      return res.status(400).json({ error: 'Admin role cannot be changed' });
+    if (isSuperAdmin(existingUser.role) && !isSuperAdmin(user.role)) {
+      return res.status(400).json({ error: 'Super admin role cannot be changed' });
     }
 
-    const effectiveRole = existingUser.role === 'admin' ? 'admin' : user.role;
+    const allowed = rolesAssignableBy(req.user.role);
+    const requestedRole = user.role;
+    if (requestedRole && !isSuperAdmin(existingUser.role) && !allowed.includes(requestedRole)) {
+      return res.status(403).json({ error: 'Cannot assign this role' });
+    }
+
+    const effectiveRole = isSuperAdmin(existingUser.role) ? existingUser.role : (requestedRole || existingUser.role);
     
     if (user.password) {
       const passwordValidation = validatePassword(user.password);
@@ -258,7 +320,7 @@ async function setUser(req, res) {
     const params = [user.name, user.email, effectiveRole];
 
     if (user.password) {
-      const hashedPassword = bcrypt.hashSync(user.password, process.env.BCRYPT_ROUNDS);
+      const hashedPassword = bcrypt.hashSync(user.password, +process.env.BCRYPT_ROUNDS || 12);
       params.push(hashedPassword);
       fields.push(`password = $${params.length}`);
     }
@@ -275,7 +337,28 @@ async function setUser(req, res) {
     );
 
     if (result.rowCount > 0) {
-      await syncUserProjects(result.rows[0].id, result.rows[0].role, pickProjectIds(user));
+      const userId = result.rows[0].id;
+      const role = result.rows[0].role;
+      const teamIds = normalizeTeamIds(user.team_ids ?? user.team_id);
+
+      if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+        const myTeams = await getTeamIdsForUser(req.user.id);
+        if (teamIds.length && !teamIds.every((id) => myTeams.includes(id))) {
+          return res.status(403).json({ error: 'Can only assign users to your own team(s)' });
+        }
+      }
+
+      if (isSuperAdmin(role)) {
+        await syncUserTeams(userId, []);
+        await ensureAdminAssignedToAllProjects(userId);
+      } else if (Object.prototype.hasOwnProperty.call(user, 'team_ids')
+        || Object.prototype.hasOwnProperty.call(user, 'team_id')) {
+        if (!teamIds.length) {
+          return res.status(400).json({ error: 'At least one team is required for this role' });
+        }
+        await syncUserTeams(userId, teamIds);
+      }
+
       res.json({ success: true, message: 'User updated' });
     } else {
       res.json({ error: 'User not found' });
@@ -287,8 +370,8 @@ async function setUser(req, res) {
 }
 
 async function addUser(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.json(null);
+  if (!canManageUsers(req.user.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
     const { user } = req.body;
@@ -297,9 +380,30 @@ async function addUser(req, res) {
     const name = (user.name || email || '').trim();
     const role = user.role;
     const password = user.password;
+    const teamIds = normalizeTeamIds(user.team_ids ?? user.team_id);
 
     if (!email || !role || !password) {
       return res.status(400).json({ error: 'email, role, and password are required' });
+    }
+
+    if (!isAssignablePlatformRole(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    const allowed = rolesAssignableBy(req.user.role);
+    if (!allowed.includes(role)) {
+      return res.status(403).json({ error: 'Cannot assign this role' });
+    }
+
+    if (role !== USER_ROLES.SUPER_ADMIN && teamIds.length === 0) {
+      return res.status(400).json({ error: 'At least one team is required for this role' });
+    }
+
+    if (isTeamAdmin(req.user.role)) {
+      const myTeams = await getTeamIdsForUser(req.user.id);
+      if (!teamIds.length || !teamIds.every(id => myTeams.includes(id))) {
+        return res.status(403).json({ error: 'Can only invite users to your own team(s)' });
+      }
     }
 
     const passwordValidation = validatePassword(password);
@@ -307,7 +411,7 @@ async function addUser(req, res) {
       return res.status(400).json({ error: passwordValidation.message });
     }
 
-    const hashedPassword = bcrypt.hashSync(password, process.env.BCRYPT_ROUNDS);
+    const hashedPassword = bcrypt.hashSync(password, +process.env.BCRYPT_ROUNDS || 12);
 
     const insertResult = await query(
       `INSERT INTO ${SCHEMA}.${TABLE} (name, email, password, role)
@@ -316,16 +420,24 @@ async function addUser(req, res) {
       [name, email, hashedPassword, role]
     );
 
-    await syncUserProjects(insertResult.rows[0].id, insertResult.rows[0].role, pickProjectIds(user));
+    const newUserId = insertResult.rows[0].id;
+    await syncUserTeams(newUserId, teamIds);
 
+    // Project membership is managed on the project, not at user create —
+    // except Super admins who retain access to all projects.
+    if (isSuperAdmin(role)) {
+      await ensureAdminAssignedToAllProjects(newUserId);
+    }
+
+    const roleLabel = USER_ROLES_NAMES[role] || role;
     let mailWarning = null;
     if (isMailerConfigured()) {
       try {
         await sendMail({
           to: email,
           subject: 'Your W4H account is ready',
-          text: `Hello ${name},\n\nAn account has been created for you in W4H with role: ${role}.\nYou can now sign in to the W4H portal.\n`,
-          html: `<p>Hello ${name},</p><p>An account has been created for you in <strong>W4H</strong> with role: <strong>${role}</strong>.</p><p>You can now sign in to the W4H portal.</p>`
+          text: `Hello ${name},\n\nAn account has been created for you in W4H with role: ${roleLabel}.\nYou can now sign in to the W4H portal.\n`,
+          html: `<p>Hello ${name},</p><p>An account has been created for you in <strong>W4H</strong> with role: <strong>${roleLabel}</strong>.</p><p>You can now sign in to the W4H portal.</p>`
         });
       } catch (mailError) {
         mailWarning = mailError.message;
@@ -364,7 +476,7 @@ async function updateProfile(req, res) {
         return res.status(400).json({ error: passwordValidation.message });
       }
 
-      const hashedPassword = bcrypt.hashSync(user.password, process.env.BCRYPT_ROUNDS);
+      const hashedPassword = bcrypt.hashSync(user.password, +process.env.BCRYPT_ROUNDS || 12);
       params.push(hashedPassword);
       updates.push(`password = $${params.length}`);
     }
@@ -396,10 +508,11 @@ async function updateProfile(req, res) {
 }
 
 async function getByEmail(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.json(null);
+  if (!canManageUsers(req.user.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
+    const email = decodeURIComponent(String(req.params.email || ''));
     const result = await query(
       `SELECT
          u.id,
@@ -410,45 +523,37 @@ async function getByEmail(req, res) {
          u.api_key_prefix,
          u.api_key_created_at,
          (u.api_key_hash IS NOT NULL) AS api_key_active,
-         CASE
-           WHEN u.role = 'admin' THEN COALESCE(
-             (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.projects s),
-             '{}'
-           )
-           ELSE COALESCE(
-             (
-               SELECT ARRAY_AGG(us.project_id ORDER BY s.name)
-               FROM ${SCHEMA}.user_projects us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
-               WHERE us.user_id = u.id
-             ),
-             '{}'
-           )
-         END AS project_ids,
-         CASE
-           WHEN u.role = 'admin' THEN COALESCE(
-             (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.projects s),
-             ''
-           )
-           ELSE COALESCE(
-             (
-               SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
-               FROM ${SCHEMA}.user_projects us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
-               WHERE us.user_id = u.id
-             ),
-             ''
-           )
-         END AS projects
+         COALESCE((
+           SELECT ARRAY_AGG(t.id::text ORDER BY t.name)
+           FROM ${SCHEMA}.team_members tm
+           JOIN ${SCHEMA}.teams t ON t.id = tm.team_id
+           WHERE tm.user_id = u.id
+         ), '{}') AS team_ids,
+         COALESCE((
+           SELECT STRING_AGG(t.name, ', ' ORDER BY t.name)
+           FROM ${SCHEMA}.team_members tm
+           JOIN ${SCHEMA}.teams t ON t.id = tm.team_id
+           WHERE tm.user_id = u.id
+         ), '') AS teams
        FROM ${SCHEMA}.${TABLE} u
        WHERE u.email = $1`,
-      [decodeURIComponent(String(req.params.email || ''))]
+      [email]
     );
-    if (result.rows.length > 0) {
-      res.json(result.rows[0]);
-    } else {
-      res.json(null);
+    if (!result.rowCount) {
+      return res.json(null);
     }
+
+    const row = result.rows[0];
+    if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+      const myTeams = await getTeamIdsForUser(req.user.id);
+      const theirTeams = Array.isArray(row.team_ids) ? row.team_ids.map(String) : [];
+      const overlap = theirTeams.some((id) => myTeams.includes(id));
+      if (!overlap && row.id !== req.user.id) {
+        return res.status(403).json({ error: 'Unauthorized' });
+      }
+    }
+
+    res.json(row);
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ error: error.message });
@@ -456,11 +561,28 @@ async function getByEmail(req, res) {
 }
 
 async function list(req, res) {
-  if (req.user.role !== 'admin') {
-    return res.json(null);
+  if (!canManageUsers(req.user.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
 
   try {
+    const params = [];
+    let where = '';
+
+    if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+      const myTeams = await getTeamIdsForUser(req.user.id);
+      if (!myTeams.length) {
+        return res.json([]);
+      }
+      params.push(myTeams);
+      where = `
+        WHERE EXISTS (
+          SELECT 1 FROM ${SCHEMA}.team_members tm
+          WHERE tm.user_id = u.id AND tm.team_id = ANY($1::uuid[])
+        )
+      `;
+    }
+
     const result = await query(
       `SELECT
          u.id,
@@ -471,38 +593,28 @@ async function list(req, res) {
          u.api_key_prefix,
          u.api_key_created_at,
          (u.api_key_hash IS NOT NULL) AS api_key_active,
-         CASE
-           WHEN u.role = 'admin' THEN COALESCE(
-             (SELECT ARRAY_AGG(s.id ORDER BY s.name) FROM ${SCHEMA}.projects s),
-             '{}'
-           )
-           ELSE COALESCE(
-             (
-               SELECT ARRAY_AGG(us.project_id ORDER BY s.name)
-               FROM ${SCHEMA}.user_projects us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
-               WHERE us.user_id = u.id
-             ),
-             '{}'
-           )
-         END AS project_ids,
-         CASE
-           WHEN u.role = 'admin' THEN COALESCE(
-             (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name) FROM ${SCHEMA}.projects s),
-             ''
-           )
-           ELSE COALESCE(
-             (
-               SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
-               FROM ${SCHEMA}.user_projects us
-               LEFT JOIN ${SCHEMA}.projects s ON s.id = us.project_id
-               WHERE us.user_id = u.id
-             ),
-             ''
-           )
-         END AS projects
+         COALESCE((
+           SELECT ARRAY_AGG(t.id::text ORDER BY t.name)
+           FROM ${SCHEMA}.team_members tm
+           JOIN ${SCHEMA}.teams t ON t.id = tm.team_id
+           WHERE tm.user_id = u.id
+         ), '{}') AS team_ids,
+         COALESCE((
+           SELECT STRING_AGG(t.name, ', ' ORDER BY t.name)
+           FROM ${SCHEMA}.team_members tm
+           JOIN ${SCHEMA}.teams t ON t.id = tm.team_id
+           WHERE tm.user_id = u.id
+         ), '') AS teams,
+         COALESCE((
+           SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
+           FROM ${SCHEMA}.project_members pm
+           JOIN ${SCHEMA}.projects p ON p.id = pm.project_id
+           WHERE pm.user_id = u.id
+         ), '') AS projects
        FROM ${SCHEMA}.${TABLE} u
-       ORDER BY u.email ASC`
+       ${where}
+       ORDER BY u.name ASC NULLS LAST, u.email ASC`,
+      params
     );
 
     res.json(result.rows);
@@ -690,16 +802,11 @@ async function verifyLoginCode(req, res) {
 
     await query(`UPDATE ${SCHEMA}.login_codes SET used_at = now() WHERE id = $1`, [codeRow.id]);
 
-    if (user.role === 'admin') {
+    if (isSuperAdmin(user.role)) {
       await ensureAdminAssignedToAllProjects(user.id);
     }
 
-    const userInfo = {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role
-    };
+    const userInfo = await buildUserSessionInfo(user);
     const token = auth.sign(userInfo);
 
     await writeAuthAudit(req, {
@@ -739,16 +846,11 @@ async function login(req, res) {
       return res.json({ error: { message: 'Invalid Email or Password!' } });
     }
 
-    if (user.role === 'admin') {
+    if (isSuperAdmin(user.role)) {
       await ensureAdminAssignedToAllProjects(user.id);
     }
 
-    const userInfo = {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role
-    };
+    const userInfo = await buildUserSessionInfo(user);
 
     const token = auth.sign(userInfo);
     userInfo.token = token;

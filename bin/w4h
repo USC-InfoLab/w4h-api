@@ -42,9 +42,11 @@ program
   .alias('conf')
   .description('print configuration')
   .action(() => {
-    let connection = JSON.parse(process.env.DB_CONNECTION);
-    delete connection.user;
-    delete connection.password;
+    const connection = {
+      host: process.env.DB_HOST,
+      port: process.env.DB_PORT,
+      database: process.env.DB_DATABASE,
+    };
     console.log(important('cwd:', process.cwd()));
     console.log(important('path:', __dirname + '/' + program._name));
     console.log(info('configuration:'));

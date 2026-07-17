@@ -2,7 +2,7 @@ import express from 'express';
 const router = express.Router();
 
 import { authenticateJwtOrApiKey } from '../auth.js';
-import { USER_ROLES } from '../lib/utils/user.js';
+import { isSuperAdmin, isTeamAdmin, canAccessAdminUi } from '../lib/utils/user.js';
 import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 
@@ -13,17 +13,299 @@ router.post('/projects-admin', authenticateJwtOrApiKey, addProjectAdmin);
 router.put('/projects-admin/:id', authenticateJwtOrApiKey, setProjectAdmin);
 router.get('/tableinfo', authenticateJwtOrApiKey, tableInfo);
 router.get('/', authenticateJwtOrApiKey, listDatasets);
+router.post('/', authenticateJwtOrApiKey, createDataset);
+router.patch('/:id', authenticateJwtOrApiKey, updateDataset);
 router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
-const DATASET_ALLOWED_ROLES = new Set(['admin', 'researcher', 'clinician']);
+const DATASET_ALLOWED_ROLES = new Set([
+  'admin', 'super_admin', 'team_admin', 'project_user', 'researcher', 'clinician'
+]);
 
 function canAccessDatasets(user) {
   return !!user && DATASET_ALLOWED_ROLES.has(user.role);
 }
 
+function canManageDatasets(user) {
+  return !!user && canAccessAdminUi(user.role);
+}
+
 function isAdmin(user) {
-  return !!user && user.role === USER_ROLES.ADMIN;
+  return !!user && isSuperAdmin(user.role);
+}
+
+function slugifyDatasetId(input) {
+  return String(input || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+}
+
+async function getTeamIdsForUser(userId) {
+  const res = await query(
+    `SELECT team_id::text AS team_id FROM w4h.team_members WHERE user_id = $1`,
+    [userId]
+  );
+  return res.rows.map((r) => r.team_id);
+}
+
+async function canAccessTeam(user, teamId) {
+  if (!user || !teamId) return false;
+  if (isSuperAdmin(user.role)) return true;
+  return (await getTeamIdsForUser(user.id)).includes(String(teamId));
+}
+
+async function ensureUniqueDatasetId(base) {
+  const baseId = slugifyDatasetId(base) || `dataset-${Date.now()}`;
+  let id = baseId;
+  let i = 1;
+  while (true) {
+    const check = await query(`SELECT id FROM w4h.datasets WHERE id = $1`, [id]);
+    if (!check.rowCount) return id;
+    id = `${baseId}-${i}`;
+    i += 1;
+  }
+}
+
+const CATALOG_SELECT = `
+  SELECT d.id, d.name, d.description, d.team_id, d.project_id,
+         d.device_type, d.sampling_rate, d.subject_count,
+         d.date_start, d.date_end, d.irb_reference,
+         d.created_by, d.created_at, d.updated_at,
+         t.name AS team_name, t.slug AS team_slug,
+         'local'::text AS source_kind,
+         'Local'::text AS source_label
+  FROM w4h.datasets d
+  LEFT JOIN w4h.teams t ON t.id = d.team_id
+`;
+
+async function listDatasetsCatalog(req, res) {
+  try {
+    if (isSuperAdmin(req.user.role)) {
+      const result = await query(`
+        ${CATALOG_SELECT}
+        ORDER BY d.name ASC NULLS LAST, d.id ASC
+      `);
+      return res.json(
+        result.rows.map((row) => ({
+          ...row,
+          source_kind: 'local',
+          source_label: 'Local'
+        }))
+      );
+    }
+
+    const teamIds = await getTeamIdsForUser(req.user.id);
+    if (!teamIds.length) return res.json([]);
+
+    const owned = await query(
+      `
+      SELECT d.id, d.name, d.description, d.team_id, d.project_id,
+             d.device_type, d.sampling_rate, d.subject_count,
+             d.date_start, d.date_end, d.irb_reference,
+             d.created_by, d.created_at, d.updated_at,
+             t.name AS team_name, t.slug AS team_slug,
+             'local'::text AS source_kind,
+             'Local'::text AS source_label
+      FROM w4h.datasets d
+      LEFT JOIN w4h.teams t ON t.id = d.team_id
+      WHERE d.team_id = ANY($1::uuid[])
+      ORDER BY d.name ASC NULLS LAST, d.id ASC
+      `,
+      [teamIds]
+    );
+
+    const shared = await query(
+      `
+      SELECT DISTINCT ON (d.id)
+             d.id, d.name, d.description, d.team_id, d.project_id,
+             d.device_type, d.sampling_rate, d.subject_count,
+             d.date_start, d.date_end, d.irb_reference,
+             d.created_by, d.created_at, d.updated_at,
+             ot.name AS team_name, ot.slug AS team_slug,
+             'shared'::text AS source_kind,
+             CASE
+               WHEN ot.name IS NOT NULL THEN 'Shared by ' || ot.name
+               ELSE 'Shared'
+             END AS source_label
+      FROM w4h.dataset_shares ds
+      JOIN w4h.datasets d ON d.id = ds.dataset_id
+      LEFT JOIN w4h.teams ot ON ot.id = d.team_id
+      WHERE ds.target_team_id = ANY($1::uuid[])
+        AND (d.team_id IS NULL OR NOT (d.team_id = ANY($1::uuid[])))
+      ORDER BY d.id, d.name ASC NULLS LAST
+      `,
+      [teamIds]
+    );
+
+    const byId = new Map();
+    for (const row of owned.rows) byId.set(row.id, row);
+    for (const row of shared.rows) {
+      if (!byId.has(row.id)) byId.set(row.id, row);
+    }
+    res.json(
+      [...byId.values()].sort((a, b) =>
+        String(a.name || a.id).localeCompare(String(b.name || b.id), undefined, { sensitivity: 'base' })
+      )
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to list datasets' });
+  }
+}
+
+async function createDataset(req, res) {
+  if (!canManageDatasets(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name is required' });
+
+    let teamId = req.body?.team_id == null ? null : String(req.body.team_id).trim();
+    if (!teamId && isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+      const myTeams = await getTeamIdsForUser(req.user.id);
+      if (myTeams.length === 1) teamId = myTeams[0];
+    }
+    if (!teamId) return res.status(400).json({ error: 'team_id is required' });
+
+    const teamCheck = await query(`SELECT id FROM w4h.teams WHERE id = $1::uuid`, [teamId]);
+    if (!teamCheck.rowCount) return res.status(400).json({ error: 'Unknown team_id' });
+    if (!(await canAccessTeam(req.user, teamId))) {
+      return res.status(403).json({ error: 'Unauthorized for this team' });
+    }
+
+    const id = await ensureUniqueDatasetId(req.body?.id || name);
+    const description = req.body?.description == null ? null : String(req.body.description).trim();
+    const deviceType = req.body?.device_type == null ? null : String(req.body.device_type).trim();
+    const samplingRate = req.body?.sampling_rate == null ? null : String(req.body.sampling_rate).trim();
+    const subjectCount =
+      req.body?.subject_count === '' || req.body?.subject_count == null
+        ? null
+        : Number(req.body.subject_count);
+    const dateStart = req.body?.date_start || null;
+    const dateEnd = req.body?.date_end || null;
+    const irbReference = req.body?.irb_reference == null ? null : String(req.body.irb_reference).trim();
+
+    if (subjectCount != null && !Number.isFinite(subjectCount)) {
+      return res.status(400).json({ error: 'subject_count must be a number' });
+    }
+
+    const inserted = await query(
+      `INSERT INTO w4h.datasets
+         (id, name, description, team_id, device_type, sampling_rate, subject_count,
+          date_start, date_end, irb_reference, created_by)
+       VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING id`,
+      [
+        id,
+        name,
+        description || null,
+        teamId,
+        deviceType || null,
+        samplingRate || null,
+        subjectCount,
+        dateStart,
+        dateEnd,
+        irbReference || null,
+        req.user.id ?? null
+      ]
+    );
+
+    const fresh = await query(
+      `${CATALOG_SELECT} WHERE d.id = $1`,
+      [inserted.rows[0].id]
+    );
+    res.status(201).json(fresh.rows[0]);
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Dataset id already exists' });
+    }
+    res.status(500).json({ error: error.message || 'Failed to create dataset' });
+  }
+}
+
+async function updateDataset(req, res) {
+  if (!canManageDatasets(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const existing = await query(
+      `SELECT id, team_id FROM w4h.datasets WHERE id = $1`,
+      [datasetId]
+    );
+    if (!existing.rowCount) return res.status(404).json({ error: 'Dataset not found' });
+
+    const currentTeamId = existing.rows[0].team_id;
+    if (currentTeamId && !(await canAccessTeam(req.user, currentTeamId))) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    if (!currentTeamId && !isSuperAdmin(req.user.role)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const fields = [];
+    const params = [];
+    const allowed = [
+      ['name', 'name'],
+      ['description', 'description'],
+      ['device_type', 'device_type'],
+      ['sampling_rate', 'sampling_rate'],
+      ['date_start', 'date_start'],
+      ['date_end', 'date_end'],
+      ['irb_reference', 'irb_reference']
+    ];
+
+    for (const [bodyKey, column] of allowed) {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, bodyKey)) {
+        const val = req.body[bodyKey];
+        params.push(val === '' || val == null ? null : val);
+        fields.push(`${column} = $${params.length}`);
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'subject_count')) {
+      const raw = req.body.subject_count;
+      const subjectCount = raw === '' || raw == null ? null : Number(raw);
+      if (subjectCount != null && !Number.isFinite(subjectCount)) {
+        return res.status(400).json({ error: 'subject_count must be a number' });
+      }
+      params.push(subjectCount);
+      fields.push(`subject_count = $${params.length}`);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'team_id')) {
+      if (!isSuperAdmin(req.user.role)) {
+        return res.status(403).json({ error: 'Only Super admins can change the owning team' });
+      }
+      const teamId = req.body.team_id == null || req.body.team_id === ''
+        ? null
+        : String(req.body.team_id).trim();
+      if (teamId) {
+        const teamCheck = await query(`SELECT id FROM w4h.teams WHERE id = $1::uuid`, [teamId]);
+        if (!teamCheck.rowCount) return res.status(400).json({ error: 'Unknown team_id' });
+      }
+      params.push(teamId);
+      fields.push(`team_id = $${params.length}::uuid`);
+    }
+
+    if (!fields.length) {
+      return res.status(400).json({ error: 'No updatable fields provided' });
+    }
+
+    fields.push('updated_at = NOW()');
+    params.push(datasetId);
+    await query(
+      `UPDATE w4h.datasets SET ${fields.join(', ')} WHERE id = $${params.length}`,
+      params
+    );
+
+    const fresh = await query(`${CATALOG_SELECT} WHERE d.id = $1`, [datasetId]);
+    res.json(fresh.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to update dataset' });
+  }
 }
 
 async function listProjectsAdmin(req, res) {
@@ -153,7 +435,7 @@ async function listProjects(req, res) {
   `;
   const params = [];
 
-  if (req.user.role !== USER_ROLES.ADMIN) {
+  if (!isSuperAdmin(req.user.role)) {
     sql += `
       WHERE EXISTS (
         SELECT 1
@@ -182,7 +464,7 @@ async function tableInfo(req, res) {
 
   try {
     const pc = await resolveDatasetProjectLinkColumn();
-    const datasetAccessResult = req.user.role === USER_ROLES.ADMIN
+    const datasetAccessResult = isSuperAdmin(req.user.role)
       ? await query(
         `SELECT id, ${pc} AS dataset_project_id FROM w4h.datasets WHERE id = $1`,
         [req.query.dataset_id]
@@ -375,6 +657,11 @@ async function listDatasets(req, res) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
+  // Admin catalog (team-scoped) — used by /admin/datasets
+  if (canAccessAdminUi(req.user.role) || req.query.catalog === '1') {
+    return listDatasetsCatalog(req, res);
+  }
+
   const pc = await resolveDatasetProjectLinkColumn();
   let sql = `
     SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
@@ -382,7 +669,7 @@ async function listDatasets(req, res) {
   `;
   const params = [];
 
-  if (req.user.role !== USER_ROLES.ADMIN) {
+  if (!isSuperAdmin(req.user.role)) {
     sql += `
       JOIN w4h.user_projects us
         ON us.project_id = d.${pc}
@@ -394,7 +681,7 @@ async function listDatasets(req, res) {
   const filterProjectId = req.query.project_id;
   if (filterProjectId) {
     params.push(filterProjectId);
-    sql += params.length === 1 && req.user.role === USER_ROLES.ADMIN
+    sql += params.length === 1 && isSuperAdmin(req.user.role)
       ? ` WHERE d.${pc} = $${params.length}`
       : ` AND d.${pc} = $${params.length}`;
   }
@@ -435,8 +722,51 @@ async function getDataset(req, res) {
   }
 
   const { id } = req.params;
+
+  // Admin catalog detail
+  if (canAccessAdminUi(req.user.role) || req.query.catalog === '1') {
+    try {
+      const result = await query(`${CATALOG_SELECT} WHERE d.id = $1`, [id]);
+      if (!result.rowCount) {
+        return res.status(404).json({ error: 'Dataset not found' });
+      }
+      const row = result.rows[0];
+      if (!isSuperAdmin(req.user.role)) {
+        const teamIds = await getTeamIdsForUser(req.user.id);
+        const owned = row.team_id && teamIds.includes(String(row.team_id));
+        if (!owned) {
+          const shared = await query(
+            `SELECT 1 FROM w4h.dataset_shares
+             WHERE dataset_id = $1 AND target_team_id = ANY($2::uuid[])
+             LIMIT 1`,
+            [id, teamIds]
+          );
+          if (!shared.rowCount) {
+            return res.status(403).json({ error: 'Unauthorized' });
+          }
+        }
+      }
+      let tables = [];
+      try {
+        const tablesRes = await query(
+          `SELECT name, metabase_url, source_name, source_url
+           FROM w4h.tables
+           WHERE dataset_id = $1
+           ORDER BY name ASC`,
+          [id]
+        );
+        tables = tablesRes.rows;
+      } catch {
+        tables = [];
+      }
+      return res.json({ ...row, tables });
+    } catch (error) {
+      return res.status(500).json({ error: error.message || 'Failed to load dataset' });
+    }
+  }
+
   const pc = await resolveDatasetProjectLinkColumn();
-  const result = req.user.role === USER_ROLES.ADMIN
+  const result = isSuperAdmin(req.user.role)
     ? await query(
       `SELECT id, ${pc} AS dataset_project_id, name, description
        FROM w4h.datasets

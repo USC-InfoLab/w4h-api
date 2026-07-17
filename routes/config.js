@@ -3,7 +3,7 @@ const router = express.Router();
 import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { USER_ROLES } from '../lib/utils/user.js';
+import { isSuperAdmin } from '../lib/utils/user.js';
 import crypto from 'crypto';
 import pkg from 'pg';
 const { Pool } = pkg;
@@ -19,26 +19,82 @@ const __dirname = path.dirname(__filename);
 // Helpers
 // ---------------------------------------------------------------------------
 
-const isAdmin = user => !!user && user.role === USER_ROLES.ADMIN;
+const isAdmin = user => !!user && isSuperAdmin(user.role);
 
-async function writeEnvValues(keyValues) {
-  const envPath = path.join(__dirname, '..', '.env');
-  let envContent = '';
+// Keep `.env` formatting consistent with `.env.example` by rewriting `.env`
+// from the template (preserves ordering + comments).
+const ENV_PATH = path.join(__dirname, '..', '.env');
+const ENV_EXAMPLE_PATH = path.join(__dirname, '..', '.env.example');
 
-  if (await fs.pathExists(envPath)) {
-    envContent = await fs.readFile(envPath, 'utf8');
+function parseEnvValues(envContent = '') {
+  const values = {};
+  const lines = String(envContent).split(/\r?\n/);
+
+  for (const line of lines) {
+    // Match `KEY=value` only (non-comment lines)
+    const m = /^\s*([A-Z0-9_]+)\s*=(.*)\s*$/.exec(line);
+    if (!m) continue;
+    values[m[1]] = m[2];
   }
 
-  Object.keys(keyValues).forEach((key) => {
-    const value = keyValues[key] ?? '';
-    const regex = new RegExp(`^${key}=.*$`, 'gm');
-    // Remove all existing occurrences, then append once
-    envContent = envContent.replace(regex, '').replace(/\n{2,}/g, '\n');
-    envContent = envContent.trimEnd() + `\n${key}=${value}`;
-    process.env[key] = String(value);
-  });
+  return values;
+}
 
-  await fs.writeFile(envPath, envContent.trim() + '\n');
+function extractTemplateKeys(templateContent) {
+  const keys = [];
+  const lines = String(templateContent).split(/\r?\n/);
+  const keyLineRe = /^\s*([A-Z0-9_]+)\s*=/;
+
+  for (const line of lines) {
+    const m = keyLineRe.exec(line);
+    if (m) keys.push(m[1]);
+  }
+  return keys;
+}
+
+function applyValuesToTemplate(templateContent, mergedValues, templateKeys) {
+  let out = String(templateContent);
+
+  for (const key of templateKeys) {
+    if (!Object.prototype.hasOwnProperty.call(mergedValues, key)) continue;
+    const value = mergedValues[key] ?? '';
+    const lineRe = new RegExp(`^${key}=.*$`, 'm');
+    out = out.replace(lineRe, `${key}=${value}`);
+  }
+
+  return out;
+}
+
+async function writeEnvValues(keyValues) {
+  if (!(await fs.pathExists(ENV_EXAMPLE_PATH))) {
+    throw new Error(`Missing ${path.basename(ENV_EXAMPLE_PATH)} — cannot preserve formatting`);
+  }
+
+  const template = await fs.readFile(ENV_EXAMPLE_PATH, 'utf8');
+  const templateKeys = extractTemplateKeys(template);
+
+  const existingValues = (await fs.pathExists(ENV_PATH))
+    ? parseEnvValues(await fs.readFile(ENV_PATH, 'utf8'))
+    : {};
+
+  const mergedValues = { ...existingValues, ...keyValues };
+
+  // Rewrite `.env` from `.env.example` to guarantee stable ordering/comments
+  let out = applyValuesToTemplate(template, mergedValues, templateKeys);
+
+  // If callers pass keys not present in the template, append them.
+  const missingKeys = Object.keys(keyValues).filter(k => !templateKeys.includes(k));
+  if (missingKeys.length) {
+    const extra = missingKeys.map(k => `${k}=${keyValues[k] ?? ''}`).join('\n');
+    out = out.trimEnd() + `\n${extra}\n`;
+  }
+
+  await fs.writeFile(ENV_PATH, out.trimEnd() + '\n');
+
+  // Keep runtime env in sync for keys we just changed
+  Object.keys(keyValues).forEach((key) => {
+    process.env[key] = String(keyValues[key] ?? '');
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +235,10 @@ async function postMailerSettings(req, res) {
   }
 }
 
-/** POST /config/mailer-test — Send a test email. Admin only. */
+/** POST /config/mailer-test — Send a test email. Admin only.
+ *  Optional SMTP fields in the body are used for this send only (no Save required).
+ *  Omitted password falls back to the saved SMTP_PASS.
+ */
 async function postMailerTest(req, res) {
   if (!isAdmin(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -190,15 +249,36 @@ async function postMailerTest(req, res) {
     return res.status(400).json({ success: false, error: 'Test recipient email is required' });
   }
 
+  const smtpOverrides = {
+    host: req.body?.host,
+    port: req.body?.port,
+    secure: req.body?.secure,
+    user: req.body?.user,
+    password: req.body?.password,
+    from: req.body?.from,
+    replyTo: req.body?.replyTo
+  };
+
+  // If the client sent any SMTP field, treat this as an override payload
+  const hasOverride = ['host', 'port', 'from', 'user', 'password', 'replyTo'].some(
+    (k) => req.body?.[k] !== undefined && req.body?.[k] !== null && String(req.body[k]).trim() !== ''
+  ) || req.body?.secure !== undefined;
+
   try {
     await sendMail({
       to,
       subject: 'W4H SMTP Test',
       text: 'SMTP test email from W4H settings.',
-      html: '<p>SMTP test email from <strong>W4H</strong> settings.</p>'
+      html: '<p>SMTP test email from <strong>W4H</strong> settings.</p>',
+      smtp: hasOverride ? smtpOverrides : null
     });
 
-    return res.json({ success: true, message: `Test email sent to ${to}` });
+    return res.json({
+      success: true,
+      message: hasOverride
+        ? `Test email sent to ${to} using the form values (not saved yet).`
+        : `Test email sent to ${to}`
+    });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -352,14 +432,6 @@ async function postInitDatabase(req, res) {
       await testPool.end();
     }
 
-    // Connection successful, update .env file
-    const envPath = path.join(__dirname, '..', '.env');
-    let envContent = '';
-
-    if (await fs.pathExists(envPath)) {
-      envContent = await fs.readFile(envPath, 'utf8');
-    }
-
     // Generate TOKEN_SECRET if it doesn't exist
     if (!process.env.TOKEN_SECRET) {
       process.env.TOKEN_SECRET = crypto.randomBytes(64).toString('hex');
@@ -375,19 +447,8 @@ async function postInitDatabase(req, res) {
       TOKEN_SECRET: process.env.TOKEN_SECRET
     };
 
-    Object.keys(dbConfig).forEach(key => {
-      const regex = new RegExp(`^${key}=.*$`, 'gm');
-      // Remove all existing occurrences, then append once
-      envContent = envContent.replace(regex, '').replace(/\n{2,}/g, '\n');
-      envContent = envContent.trimEnd() + `\n${key}=${dbConfig[key]}`;
-    });
-
-    await fs.writeFile(envPath, envContent.trim() + '\n');
-
-    // Update process.env
-    Object.keys(dbConfig).forEach(key => {
-      process.env[key] = dbConfig[key];
-    });
+    // Connection successful — update `.env` in a stable, template-driven way
+    await writeEnvValues(dbConfig);
 
     // Reset the database pool with new credentials
     await db.resetPool();
@@ -491,8 +552,10 @@ async function postAdminSetup(req, res) {
     }
 
     const token = auth.sign({
+      id: adminResult.user.id,
       email: adminResult.user.email,
-      role: 'admin',
+      name: adminResult.user.name,
+      role: 'super_admin',
       firstTimeLogin: true
     });
 
@@ -516,9 +579,10 @@ async function postAdminSetup(req, res) {
       token,
       ...(mailWarning ? { mailWarning: `Admin created but email failed: ${mailWarning}` } : {}),
       user: {
+        id: adminResult.user.id,
         email: adminResult.user.email,
         name: adminResult.user.name,
-        role: 'admin',
+        role: 'super_admin',
         firstTimeLogin: true
       }
     });

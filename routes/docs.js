@@ -5,12 +5,26 @@ const router = express.Router();
 
 import { DOCS_TABLE, DOC_TYPES_TABLE, query } from '../db.js';
 import { authenticate } from '../auth.js';
-import { USER_ROLES } from '../lib/utils/user.js';
+import { USER_ROLES, isSuperAdmin, canAccessAdminUi } from '../lib/utils/user.js';
 import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter } from '../lib/utils/docs.js';
 import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
 
 import crypto from 'crypto';
 
+function canManageDocs(role) {
+  return isSuperAdmin(role);
+}
+
+function canReadDocs(role) {
+  return canAccessAdminUi(role)
+    || role === USER_ROLES.PROJECT_USER
+    || role === USER_ROLES.RESEARCHER
+    || role === USER_ROLES.CLINICIAN;
+}
+
+function isLegacyResearcher(role) {
+  return role === USER_ROLES.RESEARCHER || role === USER_ROLES.PROJECT_USER;
+}
 
 // Docs routes
 router.get('/', authenticate, list);
@@ -26,7 +40,7 @@ router.delete('/:slug', authenticate, del);
 
 // Admin-only: refresh docs from source (overwrites existing docs with same slug)
 async function refreshDocs(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN) {
+  if (!canManageDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
@@ -43,7 +57,7 @@ async function refreshDocs(req, res) {
 }
 
 async function listDocTypes(req, res) {
-  if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
+  if (!canReadDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -101,7 +115,7 @@ async function listDocTypes(req, res) {
 }
 
 async function createDocType(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN) {
+  if (!canManageDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -140,7 +154,7 @@ async function createDocType(req, res) {
 }
 
 async function exportDocs(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN) {
+  if (!canManageDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -188,7 +202,7 @@ async function exportDocs(req, res) {
 }
 
 async function featureCards(req, res) {
-  if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
+  if (!canReadDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -209,7 +223,7 @@ async function featureCards(req, res) {
 }
 
 async function list(req, res) {
-  if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
+  if (!canReadDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -230,7 +244,7 @@ async function list(req, res) {
         sort_order ASC`
     );
 
-    if (req.user.role === USER_ROLES.RESEARCHER) {
+    if (isLegacyResearcher(req.user.role)) {
       //filter out docs with slugs starting with a different city and -datasets
       const cityPrefix = req.user.city_id ? `${req.user.city_id}-` : '';
 
@@ -245,7 +259,7 @@ async function list(req, res) {
 }
 
 async function get(req, res) {
-  if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
+  if (!canReadDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -267,7 +281,7 @@ async function get(req, res) {
 
 // PUT /docs/:slug  → update a doc by slug (admin/researcher only)
 async function put(req, res) {
-  if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
+  if (!canReadDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -362,7 +376,7 @@ async function put(req, res) {
 
 // DELETE /docs/:slug  → delete a doc by slug (admin ONLY)
 async function del(req, res) {
-  if (req.user.role !== USER_ROLES.ADMIN) { // Restricted to Admin
+  if (!canManageDocs(req.user.role)) { // Restricted to Admin
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -388,7 +402,7 @@ async function del(req, res) {
 }
 
 async function search(req, res) {
-  if (![USER_ROLES.ADMIN, USER_ROLES.RESEARCHER].includes(req.user.role)) {
+  if (!canReadDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 

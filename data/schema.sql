@@ -4,14 +4,18 @@ CREATE SCHEMA IF NOT EXISTS w4h;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ---------------------------------------------------------------------------
--- Users — application users (admins, researchers, clinicians)
+-- Users — platform roles: super_admin · team_admin · project_user
+-- (legacy values admin / researcher / clinician still accepted until migrated)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.users (
   id SERIAL PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
   password VARCHAR(255) NOT NULL,
-  role VARCHAR(50) NOT NULL CHECK (role IN ('admin', 'researcher', 'clinician')),
+  role VARCHAR(50) NOT NULL CHECK (role IN (
+    'super_admin', 'team_admin', 'project_user',
+    'admin', 'researcher', 'clinician'
+  )),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -135,7 +139,7 @@ CREATE TABLE IF NOT EXISTS w4h.doc_types (
 CREATE TABLE IF NOT EXISTS w4h.project_members (
   project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
   user_id integer NOT NULL REFERENCES w4h.users(id) ON DELETE CASCADE,
-  role text NOT NULL CHECK (role IN ('owner', 'editor', 'viewer', 'admin')), -- Member access role (owner, editor, viewer, admin)
+  role text NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')), -- Member access role (owner, editor, viewer)
   invited_by integer REFERENCES w4h.users(id) ON DELETE SET NULL, -- User who invited this member
   joined_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (project_id, user_id)
@@ -291,3 +295,77 @@ CREATE TABLE IF NOT EXISTS w4h.survey_responses (
 
 CREATE INDEX IF NOT EXISTS idx_survey_responses_user_id     ON w4h.survey_responses(user_id);
 CREATE INDEX IF NOT EXISTS idx_survey_responses_survey_type ON w4h.survey_responses(survey_type);
+
+-- ---------------------------------------------------------------------------
+-- Teams — research teams / trials (tenancy boundary)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.teams (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  slug text UNIQUE NOT NULL,
+  name text NOT NULL,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deactivated')),
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_teams_slug ON w4h.teams(slug);
+CREATE INDEX IF NOT EXISTS idx_teams_status ON w4h.teams(status);
+
+CREATE TABLE IF NOT EXISTS w4h.team_members (
+  team_id uuid NOT NULL REFERENCES w4h.teams(id) ON DELETE CASCADE,
+  user_id integer NOT NULL REFERENCES w4h.users(id) ON DELETE CASCADE,
+  PRIMARY KEY (team_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_team_members_user_id ON w4h.team_members(user_id);
+
+-- Projects belong to exactly one owning team (ADR-012)
+ALTER TABLE w4h.projects ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE RESTRICT;
+CREATE INDEX IF NOT EXISTS idx_projects_team_id ON w4h.projects(team_id);
+
+-- Datasets belong to an owning team (nullable for legacy catalog rows)
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_datasets_team_id ON w4h.datasets(team_id);
+
+-- Dataset catalog metadata (D-02)
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS device_type text;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS sampling_rate text;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS subject_count integer;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS date_start date;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS date_end date;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS irb_reference text;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+-- Cross-team dataset shares (ADR-002 / ADR-012) — push-share registry
+CREATE TABLE IF NOT EXISTS w4h.dataset_shares (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  dataset_id text NOT NULL REFERENCES w4h.datasets(id) ON DELETE CASCADE,
+  target_team_id uuid NOT NULL REFERENCES w4h.teams(id) ON DELETE CASCADE,
+  target_project_id uuid REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  access_type text NOT NULL DEFAULT 'read' CHECK (access_type IN ('read', 'read_write')),
+  shared_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  shared_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT unique_dataset_team_project_share
+    UNIQUE (dataset_id, target_team_id, target_project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dataset_shares_lookup
+  ON w4h.dataset_shares (dataset_id, target_team_id);
+CREATE INDEX IF NOT EXISTS idx_dataset_shares_target_team
+  ON w4h.dataset_shares (target_team_id);
+
+-- Project membership roles: owner / editor / viewer only (migrate legacy admin → editor)
+UPDATE w4h.project_members SET role = 'editor' WHERE role = 'admin';
+ALTER TABLE w4h.project_members DROP CONSTRAINT IF EXISTS project_members_role_check;
+ALTER TABLE w4h.project_members ADD CONSTRAINT project_members_role_check
+  CHECK (role IN ('owner', 'editor', 'viewer'));
+
+-- Widen role check on existing databases (CREATE TABLE IF NOT EXISTS does not alter checks)
+ALTER TABLE w4h.users DROP CONSTRAINT IF EXISTS users_role_check;
+ALTER TABLE w4h.users ADD CONSTRAINT users_role_check
+  CHECK (role IN (
+    'super_admin', 'team_admin', 'project_user',
+    'admin', 'researcher', 'clinician'
+  ));

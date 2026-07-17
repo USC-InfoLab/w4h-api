@@ -15,12 +15,12 @@ import express from 'express';
 import cors from 'cors';
 
 import users from './routes/users.js';
-import mailer from './routes/mailer.js';
 import datasets from './routes/datasets.js';
 import docs from './routes/docs.js';
 import config from './routes/config.js';
 import platform from './routes/platform.js';
 import projects from './routes/projects.js';
+import teams from './routes/teams.js';
 
 const app = express();
 app.use(cors());
@@ -40,12 +40,12 @@ app.listen(process.env.PORT, () => {
 });
 
 app.use('/users', users);
-app.use('/mailer', mailer);
 app.use('/datasets', datasets);
 app.use('/docs', docs);
 app.use('/config', config);
 app.use('/platform', platform);
 app.use('/projects', projects);
+app.use('/teams', teams);
 
 app.get('/', async function (req, res) {
   const { stdout } = await execa`git rev-parse --short HEAD`;

@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { query } from './db.js';
+import { isSuperAdmin, canAccessAdminUi } from './lib/utils/user.js';
 
 export const USER_API_KEY_PREFIX = 'w4h_sk_';
 
@@ -21,6 +22,30 @@ export function credentialLooksLikeJwt(token) {
   return parts.length === 3 && parts.every(p => p.length > 0);
 }
 
+/** Ensure JWT payloads always expose a numeric user id (older tokens may omit it). */
+async function ensureUserIdOnPayload(decoded) {
+  if (!decoded || typeof decoded !== 'object') return decoded;
+  if (decoded.id != null && decoded.id !== '') return decoded;
+
+  const email = typeof decoded.email === 'string' ? decoded.email.trim() : '';
+  if (!email) return decoded;
+
+  const result = await query(
+    `SELECT id, name, email, role FROM w4h.users WHERE lower(trim(email)) = lower(trim($1))`,
+    [email]
+  );
+  if (!result.rowCount) return decoded;
+
+  const u = result.rows[0];
+  return {
+    ...decoded,
+    id: u.id,
+    name: decoded.name || u.name,
+    email: decoded.email || u.email,
+    role: decoded.role || u.role,
+  };
+}
+
 const authenticate = function (req, res, next) {
   const authorization = req.headers.authorization;
   if (!authorization) {
@@ -36,8 +61,15 @@ const authenticate = function (req, res, next) {
       return res.sendStatus(403);
     }
 
-    req.user = decoded;
-    next();
+    ensureUserIdOnPayload(decoded)
+      .then((user) => {
+        req.user = user;
+        next();
+      })
+      .catch((e) => {
+        console.error('authenticate ensureUserId:', e);
+        res.sendStatus(500);
+      });
   });
 };
 
@@ -52,9 +84,16 @@ function authenticateJwtOrApiKey(req, res, next) {
       if (err) {
         return res.sendStatus(403);
       }
-      req.user = decoded;
-      req.authVia = 'jwt';
-      next();
+      ensureUserIdOnPayload(decoded)
+        .then((user) => {
+          req.user = user;
+          req.authVia = 'jwt';
+          next();
+        })
+        .catch((e) => {
+          console.error('authenticateJwtOrApiKey ensureUserId:', e);
+          res.status(500).json({ error: e.message || 'Authentication failed' });
+        });
     });
   }
 
@@ -87,7 +126,7 @@ const sign = function (user) {
 };
 
 const requireAdmin = function (req, res, next) {
-  if (!req.user || req.user.role !== 'admin') {
+  if (!req.user || !isSuperAdmin(req.user.role)) {
     return res.status(403).json({
       success: false,
       error: 'Access denied. Admin privileges required.'
@@ -96,4 +135,14 @@ const requireAdmin = function (req, res, next) {
   next();
 };
 
-export { authenticate, authenticateJwtOrApiKey, sign, requireAdmin };
+const requireAdminUi = function (req, res, next) {
+  if (!req.user || !canAccessAdminUi(req.user.role)) {
+    return res.status(403).json({
+      success: false,
+      error: 'Access denied. Admin privileges required.'
+    });
+  }
+  next();
+};
+
+export { authenticate, authenticateJwtOrApiKey, sign, requireAdmin, requireAdminUi };
