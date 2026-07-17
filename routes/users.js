@@ -24,6 +24,10 @@ router.post('/login', login);
 router.post('/send-code', sendLoginCode);
 router.post('/verify-code', verifyLoginCode);
 router.post('/token-valid', tokenValid);
+router.get('/invite/:token', getInvite);
+router.post('/invite/accept', acceptInvite);
+router.post('/invite/resend', auth.authenticate, resendInvite);
+router.post('/invite/revoke', auth.authenticate, revokeInvite);
 router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
 router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
 router.delete('/me/api-key', auth.authenticate, revokeMyApiKey);
@@ -35,6 +39,81 @@ router.post('/add', auth.authenticate, addUser);
 router.post('/set', auth.authenticate, setUser);
 router.delete('/:email', auth.authenticate, del);
 router.get('/roles', auth.authenticate, roles);
+
+const INVITE_TTL_HOURS = Math.max(1, parseInt(process.env.INVITE_TTL_HOURS, 10) || 72);
+
+function hashInviteToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+function appBaseUrl() {
+  return String(process.env.APP_URL || '').replace(/\/+$/, '');
+}
+
+function inviteAcceptUrl(rawToken) {
+  const base = appBaseUrl();
+  if (!base) return null;
+  return `${base}/invite/${encodeURIComponent(rawToken)}`;
+}
+
+async function createInvitation(userId, invitedBy) {
+  const rawToken = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = hashInviteToken(rawToken);
+  await query(
+    `UPDATE ${SCHEMA}.invitations
+     SET revoked_at = now()
+     WHERE user_id = $1 AND used_at IS NULL AND revoked_at IS NULL`,
+    [userId]
+  );
+  await query(
+    `INSERT INTO ${SCHEMA}.invitations (user_id, token_hash, invited_by, expires_at)
+     VALUES ($1, $2, $3, now() + ($4 || ' hours')::interval)`,
+    [userId, tokenHash, invitedBy ?? null, String(INVITE_TTL_HOURS)]
+  );
+  return rawToken;
+}
+
+async function sendInviteEmail({ email, name, roleLabel, rawToken }) {
+  const link = inviteAcceptUrl(rawToken);
+  if (!link) {
+    throw new Error('APP_URL is not configured; cannot build invitation link');
+  }
+  const greeting = name || email;
+  await sendMail({
+    to: email,
+    subject: 'Activate your W4H account',
+    text:
+      `Hello ${greeting},\n\n` +
+      `You have been invited to W4H` +
+      (roleLabel ? ` as ${roleLabel}` : '') +
+      `.\n\n` +
+      `Set your password and activate your account using this link (expires in ${INVITE_TTL_HOURS} hours):\n` +
+      `${link}\n\n` +
+      `If you did not expect this invitation, you can ignore this email.\n`,
+    html:
+      `<p>Hello ${greeting},</p>` +
+      `<p>You have been invited to <strong>W4H</strong>` +
+      (roleLabel ? ` as <strong>${roleLabel}</strong>` : '') +
+      `.</p>` +
+      `<p><a href="${link}">Set your password and activate your account</a></p>` +
+      `<p>This link expires in ${INVITE_TTL_HOURS} hours. If you did not expect this invitation, you can ignore this email.</p>`
+  });
+  return link;
+}
+
+function assertUserCanAuthenticate(user) {
+  if (!user) return { ok: false, message: 'Invalid Email or Password!' };
+  if (user.status === 'invited') {
+    return { ok: false, message: 'Account not activated. Check your email for the invitation link.' };
+  }
+  if (user.status === 'discontinued') {
+    return { ok: false, message: 'This account has been discontinued.' };
+  }
+  if (!user.password) {
+    return { ok: false, message: 'Invalid Email or Password!' };
+  }
+  return { ok: true };
+}
 
 
 function pickProjectIds(user) {
@@ -323,6 +402,8 @@ async function setUser(req, res) {
       const hashedPassword = bcrypt.hashSync(user.password, +process.env.BCRYPT_ROUNDS || 12);
       params.push(hashedPassword);
       fields.push(`password = $${params.length}`);
+      // Admin-set password activates an invited account (escape hatch when email is unavailable).
+      fields.push(`status = 'active'`);
     }
 
     params.push(targetId || targetEmail);
@@ -379,11 +460,16 @@ async function addUser(req, res) {
     const email = (user.email || '').trim();
     const name = (user.name || email || '').trim();
     const role = user.role;
-    const password = user.password;
     const teamIds = normalizeTeamIds(user.team_ids ?? user.team_id);
 
-    if (!email || !role || !password) {
-      return res.status(400).json({ error: 'email, role, and password are required' });
+    if (!email || !role) {
+      return res.status(400).json({ error: 'email and role are required' });
+    }
+
+    if (!appBaseUrl()) {
+      return res.status(503).json({
+        error: 'APP_URL is not configured. Set APP_URL to the public app base URL so invitation links can be generated.'
+      });
     }
 
     if (!isAssignablePlatformRole(role)) {
@@ -406,18 +492,11 @@ async function addUser(req, res) {
       }
     }
 
-    const passwordValidation = validatePassword(password);
-    if (!passwordValidation.valid) {
-      return res.status(400).json({ error: passwordValidation.message });
-    }
-
-    const hashedPassword = bcrypt.hashSync(password, +process.env.BCRYPT_ROUNDS || 12);
-
     const insertResult = await query(
-      `INSERT INTO ${SCHEMA}.${TABLE} (name, email, password, role)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO ${SCHEMA}.${TABLE} (name, email, password, role, status)
+       VALUES ($1, $2, NULL, $3, 'invited')
        RETURNING id, role`,
-      [name, email, hashedPassword, role]
+      [name, email, role]
     );
 
     const newUserId = insertResult.rows[0].id;
@@ -430,31 +509,306 @@ async function addUser(req, res) {
     }
 
     const roleLabel = USER_ROLES_NAMES[role] || role;
+    const rawToken = await createInvitation(newUserId, req.user.id);
+    const inviteUrl = inviteAcceptUrl(rawToken);
+
     let mailWarning = null;
     if (isMailerConfigured()) {
       try {
-        await sendMail({
-          to: email,
-          subject: 'Your W4H account is ready',
-          text: `Hello ${name},\n\nAn account has been created for you in W4H with role: ${roleLabel}.\nYou can now sign in to the W4H portal.\n`,
-          html: `<p>Hello ${name},</p><p>An account has been created for you in <strong>W4H</strong> with role: <strong>${roleLabel}</strong>.</p><p>You can now sign in to the W4H portal.</p>`
+        await sendInviteEmail({ email, name, roleLabel, rawToken });
+      } catch (mailError) {
+        mailWarning = mailError.message;
+      }
+    } else {
+      mailWarning = 'SMTP is not configured; share the invitation link securely with the user.';
+    }
+
+    await writeAuthAudit(req, {
+      userId: req.user.id,
+      action: 'user.invite_sent',
+      details: { invited_user_id: newUserId, email, role }
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Invitation created',
+      status: 'invited',
+      inviteUrl,
+      ...(mailWarning ? { mailWarning } : {})
+    });
+  } catch (error) {
+    if (error.code === '23505' || /users_email_key|duplicate key/i.test(error.message || '')) {
+      return res.status(409).json({ error: 'A user with this email already exists' });
+    }
+
+    console.error('Add user error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function getInvite(req, res) {
+  try {
+    const rawToken = String(req.params.token || '').trim();
+    if (!rawToken) {
+      return res.status(400).json({ error: 'Invitation token is required' });
+    }
+
+    const result = await query(
+      `SELECT i.id, i.expires_at, i.used_at, i.revoked_at,
+              u.id AS user_id, u.name, u.email, u.status, u.role
+       FROM ${SCHEMA}.invitations i
+       JOIN ${SCHEMA}.${TABLE} u ON u.id = i.user_id
+       WHERE i.token_hash = $1`,
+      [hashInviteToken(rawToken)]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'Invitation not found' });
+    }
+
+    const row = result.rows[0];
+    if (row.used_at) {
+      return res.status(410).json({ error: 'This invitation has already been used' });
+    }
+    if (row.revoked_at) {
+      return res.status(410).json({ error: 'This invitation has been revoked' });
+    }
+    if (new Date(row.expires_at) <= new Date()) {
+      return res.status(410).json({ error: 'This invitation has expired' });
+    }
+    if (row.status === 'discontinued') {
+      return res.status(403).json({ error: 'This account has been discontinued' });
+    }
+
+    res.json({
+      email: row.email,
+      name: row.name,
+      role: row.role,
+      expires_at: row.expires_at
+    });
+  } catch (error) {
+    console.error('getInvite error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function acceptInvite(req, res) {
+  try {
+    const rawToken = String(req.body?.token || '').trim();
+    const password = req.body?.password;
+    const name = (req.body?.name || '').trim();
+
+    if (!rawToken || !password) {
+      return res.status(400).json({ error: 'token and password are required' });
+    }
+
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ error: passwordValidation.message });
+    }
+
+    const result = await query(
+      `SELECT i.id AS invite_id, i.expires_at, i.used_at, i.revoked_at,
+              u.id AS user_id, u.email, u.name, u.status, u.role
+       FROM ${SCHEMA}.invitations i
+       JOIN ${SCHEMA}.${TABLE} u ON u.id = i.user_id
+       WHERE i.token_hash = $1`,
+      [hashInviteToken(rawToken)]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'Invitation not found' });
+    }
+
+    const row = result.rows[0];
+    if (row.used_at) {
+      return res.status(410).json({ error: 'This invitation has already been used' });
+    }
+    if (row.revoked_at) {
+      return res.status(410).json({ error: 'This invitation has been revoked' });
+    }
+    if (new Date(row.expires_at) <= new Date()) {
+      return res.status(410).json({ error: 'This invitation has expired' });
+    }
+    if (row.status === 'discontinued') {
+      return res.status(403).json({ error: 'This account has been discontinued' });
+    }
+
+    const hashedPassword = bcrypt.hashSync(password, +process.env.BCRYPT_ROUNDS || 12);
+    const displayName = name || row.name || row.email;
+
+    await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET password = $1, name = $2, status = 'active', updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
+      [hashedPassword, displayName, row.user_id]
+    );
+    await query(
+      `UPDATE ${SCHEMA}.invitations SET used_at = now() WHERE id = $1`,
+      [row.invite_id]
+    );
+    await query(
+      `UPDATE ${SCHEMA}.invitations
+       SET revoked_at = now()
+       WHERE user_id = $1 AND id <> $2 AND used_at IS NULL AND revoked_at IS NULL`,
+      [row.user_id, row.invite_id]
+    );
+
+    if (isSuperAdmin(row.role)) {
+      await ensureAdminAssignedToAllProjects(row.user_id);
+    }
+
+    const userInfo = await buildUserSessionInfo({
+      id: row.user_id,
+      name: displayName,
+      email: row.email,
+      role: row.role
+    });
+    const token = auth.sign(userInfo);
+
+    await writeAuthAudit(req, {
+      userId: row.user_id,
+      action: 'user.invite_accepted',
+      details: { email: row.email }
+    });
+
+    res.json({ success: true, user: { ...userInfo, token }, token });
+  } catch (error) {
+    console.error('acceptInvite error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function resendInvite(req, res) {
+  if (!canManageUsers(req.user.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    if (!appBaseUrl()) {
+      return res.status(503).json({
+        error: 'APP_URL is not configured. Set APP_URL to the public app base URL so invitation links can be generated.'
+      });
+    }
+
+    const email = (req.body?.email || '').trim();
+    const userId = req.body?.user_id || null;
+    if (!email && !userId) {
+      return res.status(400).json({ error: 'email or user_id is required' });
+    }
+
+    const identifyClause = userId ? 'id = $1' : 'email = $1';
+    const identifyValue = userId || email;
+    const userResult = await query(
+      `SELECT id, name, email, role, status FROM ${SCHEMA}.${TABLE} WHERE ${identifyClause}`,
+      [identifyValue]
+    );
+
+    if (!userResult.rowCount) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const target = userResult.rows[0];
+    if (target.status !== 'invited') {
+      return res.status(400).json({ error: 'Only invited (not yet activated) users can receive a new invitation' });
+    }
+
+    if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+      const myTeams = await getTeamIdsForUser(req.user.id);
+      const theirTeams = await getTeamIdsForUser(target.id);
+      if (!theirTeams.some((id) => myTeams.includes(id))) {
+        return res.status(403).json({ error: 'Unauthorized' });
+      }
+    }
+
+    const rawToken = await createInvitation(target.id, req.user.id);
+    const inviteUrl = inviteAcceptUrl(rawToken);
+    const roleLabel = USER_ROLES_NAMES[target.role] || target.role;
+
+    let mailWarning = null;
+    if (isMailerConfigured()) {
+      try {
+        await sendInviteEmail({
+          email: target.email,
+          name: target.name,
+          roleLabel,
+          rawToken
         });
       } catch (mailError) {
         mailWarning = mailError.message;
       }
+    } else {
+      mailWarning = 'SMTP is not configured; share the invitation link securely with the user.';
     }
 
-    res.status(201).json({
+    await writeAuthAudit(req, {
+      userId: req.user.id,
+      action: 'user.invite_resent',
+      details: { invited_user_id: target.id, email: target.email }
+    });
+
+    res.json({
       success: true,
-      message: 'User created',
-      ...(mailWarning ? { mailWarning: `User created but email failed: ${mailWarning}` } : {})
+      message: 'Invitation resent',
+      inviteUrl,
+      ...(mailWarning ? { mailWarning } : {})
     });
   } catch (error) {
-    if (error.code === '23505') {
-      return res.status(409).json({ error: 'Email already exists' });
+    console.error('resendInvite error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function revokeInvite(req, res) {
+  if (!canManageUsers(req.user.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const email = (req.body?.email || '').trim();
+    const userId = req.body?.user_id || null;
+    if (!email && !userId) {
+      return res.status(400).json({ error: 'email or user_id is required' });
     }
 
-    console.error('Add user error:', error);
+    const identifyClause = userId ? 'id = $1' : 'email = $1';
+    const identifyValue = userId || email;
+    const userResult = await query(
+      `SELECT id, email, status FROM ${SCHEMA}.${TABLE} WHERE ${identifyClause}`,
+      [identifyValue]
+    );
+
+    if (!userResult.rowCount) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const target = userResult.rows[0];
+    if (target.status !== 'invited') {
+      return res.status(400).json({ error: 'Only pending invitations can be revoked' });
+    }
+
+    if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+      const myTeams = await getTeamIdsForUser(req.user.id);
+      const theirTeams = await getTeamIdsForUser(target.id);
+      if (!theirTeams.some((id) => myTeams.includes(id))) {
+        return res.status(403).json({ error: 'Unauthorized' });
+      }
+    }
+
+    await query(
+      `UPDATE ${SCHEMA}.invitations
+       SET revoked_at = now()
+       WHERE user_id = $1 AND used_at IS NULL AND revoked_at IS NULL`,
+      [target.id]
+    );
+
+    await writeAuthAudit(req, {
+      userId: req.user.id,
+      action: 'user.invite_revoked',
+      details: { invited_user_id: target.id, email: target.email }
+    });
+
+    res.json({ success: true, message: 'Invitation revoked' });
+  } catch (error) {
+    console.error('revokeInvite error:', error);
     res.status(500).json({ error: error.message });
   }
 }
@@ -519,6 +873,7 @@ async function getByEmail(req, res) {
          u.name,
          u.email,
          u.role,
+         u.status,
          u.created_at,
          u.api_key_prefix,
          u.api_key_created_at,
@@ -589,6 +944,7 @@ async function list(req, res) {
          u.name,
          u.email,
          u.role,
+         u.status,
          u.created_at,
          u.api_key_prefix,
          u.api_key_created_at,
@@ -671,7 +1027,7 @@ async function sendLoginCode(req, res) {
     }
 
     const userResult = await query(
-      `SELECT id, name, email FROM ${SCHEMA}.${TABLE} WHERE lower(trim(email)) = $1`,
+      `SELECT id, name, email, status FROM ${SCHEMA}.${TABLE} WHERE lower(trim(email)) = $1`,
       [email]
     );
 
@@ -680,6 +1036,16 @@ async function sendLoginCode(req, res) {
     }
 
     const user = userResult.rows[0];
+    if (user.status === 'invited') {
+      return res.status(403).json({
+        error: { message: 'Account not activated. Check your email for the invitation link.' }
+      });
+    }
+    if (user.status === 'discontinued') {
+      return res.status(403).json({
+        error: { message: 'This account has been discontinued.' }
+      });
+    }
 
     const recentSends = await query(
       `SELECT COUNT(*)::int AS count
@@ -754,7 +1120,7 @@ async function verifyLoginCode(req, res) {
     }
 
     const userResult = await query(
-      `SELECT id, name, email, role FROM ${SCHEMA}.${TABLE} WHERE lower(trim(email)) = $1`,
+      `SELECT id, name, email, role, status FROM ${SCHEMA}.${TABLE} WHERE lower(trim(email)) = $1`,
       [email]
     );
 
@@ -763,6 +1129,11 @@ async function verifyLoginCode(req, res) {
     }
 
     const user = userResult.rows[0];
+    const authCheck = assertUserCanAuthenticate(user);
+    if (!authCheck.ok) {
+      return res.status(403).json({ error: { message: authCheck.message } });
+    }
+
     const codeHash = hashLoginCode(code);
 
     const codeResult = await query(
@@ -832,7 +1203,7 @@ async function login(req, res) {
     }
 
     const result = await query(
-      `SELECT id, name, email, password, role FROM ${SCHEMA}.${TABLE} WHERE email = $1`,
+      `SELECT id, name, email, password, role, status FROM ${SCHEMA}.${TABLE} WHERE email = $1`,
       [email]
     );
 
@@ -841,7 +1212,11 @@ async function login(req, res) {
     }
 
     const user = result.rows[0];
-    
+    const authCheck = assertUserCanAuthenticate(user);
+    if (!authCheck.ok) {
+      return res.json({ error: { message: authCheck.message } });
+    }
+
     if (!bcrypt.compareSync(password, user.password)) {
       return res.json({ error: { message: 'Invalid Email or Password!' } });
     }

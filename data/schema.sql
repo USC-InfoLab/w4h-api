@@ -27,6 +27,30 @@ ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_prefix text;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_created_at timestamp with time zone;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key_hash ON w4h.users(api_key_hash) WHERE api_key_hash IS NOT NULL;
 
+-- User lifecycle: invited → active → discontinued (ADR-010)
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active';
+ALTER TABLE w4h.users DROP CONSTRAINT IF EXISTS users_status_check;
+ALTER TABLE w4h.users ADD CONSTRAINT users_status_check
+  CHECK (status IN ('invited', 'active', 'discontinued'));
+ALTER TABLE w4h.users ALTER COLUMN password DROP NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Invitations — time-limited tokens for password set / account activation (U-14)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.invitations (
+  id          SERIAL PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES w4h.users(id) ON DELETE CASCADE,
+  token_hash  TEXT NOT NULL UNIQUE,
+  invited_by  INTEGER REFERENCES w4h.users(id) ON DELETE SET NULL,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  used_at     TIMESTAMPTZ,
+  revoked_at  TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_invitations_user_id ON w4h.invitations(user_id);
+CREATE INDEX IF NOT EXISTS idx_invitations_expires_at ON w4h.invitations(expires_at);
+
 -- ---------------------------------------------------------------------------
 -- Projects — research workspaces/projects containing members, datasets, and notebooks
 -- ---------------------------------------------------------------------------

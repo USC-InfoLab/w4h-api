@@ -21,6 +21,8 @@ import config from './routes/config.js';
 import platform from './routes/platform.js';
 import projects from './routes/projects.js';
 import teams from './routes/teams.js';
+import { isConfigured } from './db.js';
+import { ensureSchema } from './lib/db-init.js';
 
 const app = express();
 app.use(cors());
@@ -35,8 +37,16 @@ app.on('uncaughtException', err => {
   process.send({ finish: false });
 });
 
-app.listen(process.env.PORT, () => {
+app.listen(process.env.PORT, async () => {
   console.log('App running at: http://localhost:' + process.env.PORT);
+  if (isConfigured()) {
+    try {
+      await ensureSchema();
+      console.log('✓ Database schema ensured');
+    } catch (err) {
+      console.warn('⚠ Schema ensure skipped/failed:', err.message);
+    }
+  }
 });
 
 app.use('/users', users);

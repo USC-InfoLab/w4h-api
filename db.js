@@ -120,7 +120,12 @@ export async function query(sql, params) {
         poolState: { idle: currentPool.idleCount, total: currentPool.totalCount, waiting: currentPool.waitingCount }
       });
     }
-    throw new Error(`Query failed: ${e.message}\nSQL: ${sql}`);
+    const wrapped = new Error(`Query failed: ${e.message}\nSQL: ${sql}`);
+    wrapped.code = e.code;
+    wrapped.detail = e.detail;
+    wrapped.constraint = e.constraint;
+    wrapped.cause = e;
+    throw wrapped;
   }
 }
 
