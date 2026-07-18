@@ -31,7 +31,7 @@ async function ensureUserIdOnPayload(decoded) {
   if (!email) return decoded;
 
   const result = await query(
-    `SELECT id, name, email, role FROM w4h.users WHERE lower(trim(email)) = lower(trim($1))`,
+    `SELECT id, name, email, role, status FROM w4h.users WHERE lower(trim(email)) = lower(trim($1))`,
     [email]
   );
   if (!result.rowCount) return decoded;
@@ -43,7 +43,26 @@ async function ensureUserIdOnPayload(decoded) {
     name: decoded.name || u.name,
     email: decoded.email || u.email,
     role: decoded.role || u.role,
+    status: u.status,
   };
+}
+
+async function assertUserAccountActive(user) {
+  if (!user?.id) {
+    return { ok: false, status: 403 };
+  }
+  const result = await query(
+    `SELECT status FROM w4h.users WHERE id = $1`,
+    [user.id]
+  );
+  if (!result.rowCount) {
+    return { ok: false, status: 403 };
+  }
+  const status = result.rows[0].status;
+  if (status === 'discontinued' || status === 'invited') {
+    return { ok: false, status: 403, reason: status };
+  }
+  return { ok: true, status };
 }
 
 const authenticate = function (req, res, next) {
@@ -62,7 +81,11 @@ const authenticate = function (req, res, next) {
     }
 
     ensureUserIdOnPayload(decoded)
-      .then((user) => {
+      .then(async (user) => {
+        const active = await assertUserAccountActive(user);
+        if (!active.ok) {
+          return res.sendStatus(403);
+        }
         req.user = user;
         next();
       })
@@ -85,7 +108,11 @@ function authenticateJwtOrApiKey(req, res, next) {
         return res.sendStatus(403);
       }
       ensureUserIdOnPayload(decoded)
-        .then((user) => {
+        .then(async (user) => {
+          const active = await assertUserAccountActive(user);
+          if (!active.ok) {
+            return res.status(403).json({ error: 'Account is not active' });
+          }
           req.user = user;
           req.authVia = 'jwt';
           next();
@@ -100,7 +127,7 @@ function authenticateJwtOrApiKey(req, res, next) {
   if (cred.startsWith(USER_API_KEY_PREFIX)) {
     const tokenHash = crypto.createHash('sha256').update(cred).digest('hex');
     return query(
-      `SELECT id, name, email, role FROM w4h.users WHERE api_key_hash = $1`,
+      `SELECT id, name, email, role, status FROM w4h.users WHERE api_key_hash = $1`,
       [tokenHash]
     )
       .then((result) => {
@@ -108,6 +135,9 @@ function authenticateJwtOrApiKey(req, res, next) {
           return res.status(401).json({ error: 'Invalid or revoked API key' });
         }
         const u = result.rows[0];
+        if (u.status !== 'active') {
+          return res.status(403).json({ error: 'Account is not active' });
+        }
         req.user = { id: u.id, name: u.name, email: u.email, role: u.role };
         req.authVia = 'api_key';
         next();

@@ -37,6 +37,8 @@ router.get('/user/:email', auth.authenticate, getByEmail);
 router.post('/profile', auth.authenticate, updateProfile);
 router.post('/add', auth.authenticate, addUser);
 router.post('/set', auth.authenticate, setUser);
+router.post('/discontinue', auth.authenticate, discontinueUser);
+router.post('/resume', auth.authenticate, resumeUser);
 router.delete('/:email', auth.authenticate, del);
 router.get('/roles', auth.authenticate, roles);
 
@@ -235,28 +237,147 @@ function tokenValid(req, res) {
   }
 }
 
+/** Hard delete is intentionally unsupported (ADR-010 / U-01). */
 async function del(req, res) {
-  if (!isSuperAdmin(req.user.role)) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  return res.status(405).json({
+    error: 'Users cannot be deleted. Use discontinue to suspend access (POST /users/discontinue).'
+  });
+}
+
+async function loadManageableUser(req, { email, userId }) {
+  if (!canManageUsers(req.user.role)) {
+    return { error: { status: 403, message: 'Unauthorized' } };
   }
+
+  const identifyClause = userId ? 'id = $1' : 'email = $1';
+  const identifyValue = userId || email;
+  if (!identifyValue) {
+    return { error: { status: 400, message: 'email or user_id is required' } };
+  }
+
+  const result = await query(
+    `SELECT id, name, email, role, status, (password IS NOT NULL) AS has_password
+     FROM ${SCHEMA}.${TABLE}
+     WHERE ${identifyClause}`,
+    [identifyValue]
+  );
+
+  if (!result.rowCount) {
+    return { error: { status: 404, message: 'User not found' } };
+  }
+
+  const target = result.rows[0];
+
+  if (isSuperAdmin(target.role)) {
+    return { error: { status: 400, message: 'Super admin accounts cannot be discontinued or resumed here' } };
+  }
+
+  if (Number(target.id) === Number(req.user.id)) {
+    return { error: { status: 400, message: 'You cannot discontinue your own account' } };
+  }
+
+  if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+    const myTeams = await getTeamIdsForUser(req.user.id);
+    const theirTeams = await getTeamIdsForUser(target.id);
+    if (!theirTeams.some((id) => myTeams.includes(id))) {
+      return { error: { status: 403, message: 'Unauthorized' } };
+    }
+    // Team admins may only manage Project users in their team.
+    if (!rolesAssignableBy(req.user.role).includes(target.role) && target.role !== 'researcher' && target.role !== 'clinician') {
+      return { error: { status: 403, message: 'Team admins can only discontinue Project users in their team' } };
+    }
+  }
+
+  return { target };
+}
+
+async function discontinueUser(req, res) {
   try {
-    const targetResult = await query(
-      `SELECT id, role, email FROM ${SCHEMA}.${TABLE} WHERE email = $1`,
-      [req.params.email]
+    const email = (req.body?.email || '').trim();
+    const userId = req.body?.user_id || null;
+    const loaded = await loadManageableUser(req, { email, userId });
+    if (loaded.error) {
+      return res.status(loaded.error.status).json({ error: loaded.error.message });
+    }
+
+    const target = loaded.target;
+    if (target.status === 'discontinued') {
+      return res.json({ success: true, message: 'User is already discontinued', status: 'discontinued' });
+    }
+
+    await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET status = 'discontinued',
+           api_key_hash = NULL,
+           api_key_prefix = NULL,
+           api_key_created_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [target.id]
     );
 
-    if (targetResult.rowCount === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    // Invalidate any unused invite tokens so the account cannot be activated while discontinued.
+    await query(
+      `UPDATE ${SCHEMA}.invitations
+       SET revoked_at = now()
+       WHERE user_id = $1 AND used_at IS NULL AND revoked_at IS NULL`,
+      [target.id]
+    );
 
-    if (isSuperAdmin(targetResult.rows[0].role)) {
-      return res.status(400).json({ error: 'Super admin users cannot be deleted' });
-    }
+    await writeAuthAudit(req, {
+      userId: req.user.id,
+      action: 'user.discontinued',
+      details: { target_user_id: target.id, email: target.email }
+    });
 
-    await query(`DELETE FROM ${SCHEMA}.${TABLE} WHERE email = $1`, [req.params.email]);
-    res.json({ success: true, message: 'User deleted' });
+    res.json({
+      success: true,
+      message: 'User discontinued. Login and API access are suspended; the account record is retained.',
+      status: 'discontinued'
+    });
   } catch (error) {
-    console.error('Delete user error:', error);
+    console.error('Discontinue user error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function resumeUser(req, res) {
+  try {
+    const email = (req.body?.email || '').trim();
+    const userId = req.body?.user_id || null;
+    const loaded = await loadManageableUser(req, { email, userId });
+    if (loaded.error) {
+      return res.status(loaded.error.status).json({ error: loaded.error.message });
+    }
+
+    const target = loaded.target;
+    if (target.status !== 'discontinued') {
+      return res.status(400).json({ error: 'Only discontinued users can be resumed' });
+    }
+
+    const nextStatus = target.has_password ? 'active' : 'invited';
+    await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET status = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
+      [nextStatus, target.id]
+    );
+
+    await writeAuthAudit(req, {
+      userId: req.user.id,
+      action: 'user.resumed',
+      details: { target_user_id: target.id, email: target.email, status: nextStatus }
+    });
+
+    res.json({
+      success: true,
+      message: nextStatus === 'active'
+        ? 'User resumed. They can sign in again; new API keys must be issued if needed.'
+        : 'User resumed as invited. Resend an invitation so they can activate their account.',
+      status: nextStatus
+    });
+  } catch (error) {
+    console.error('Resume user error:', error);
     res.status(500).json({ error: error.message });
   }
 }
