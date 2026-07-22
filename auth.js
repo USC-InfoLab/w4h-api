@@ -1,7 +1,7 @@
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { query } from './db.js';
-import { isSuperAdmin, canAccessAdminUi } from './lib/utils/user.js';
+import { isSuperAdmin, canAccessAdminUi, canManageTeamAsync } from './lib/utils/user.js';
 
 export const USER_API_KEY_PREFIX = 'w4h_sk_';
 
@@ -155,24 +155,52 @@ const sign = function (user) {
   return jwt.sign(user, process.env.TOKEN_SECRET, { expiresIn: 86400 });
 };
 
-const requireAdmin = function (req, res, next) {
-  if (!req.user || !isSuperAdmin(req.user.role)) {
-    return res.status(403).json({
-      success: false,
-      error: 'Access denied. Admin privileges required.'
-    });
-  }
-  next();
-};
-
-const requireAdminUi = function (req, res, next) {
+/** Platform Admin only (Super admin). Team admins must not pass this gate. */
+const requirePlatformAdmin = function (req, res, next) {
   if (!req.user || !canAccessAdminUi(req.user.role)) {
     return res.status(403).json({
       success: false,
-      error: 'Access denied. Admin privileges required.'
+      error: 'Access denied. Platform admin privileges required.'
     });
   }
   next();
 };
 
-export { authenticate, authenticateJwtOrApiKey, sign, requireAdmin, requireAdminUi };
+/** Team-scoped management (Super admin, platform Team admin, or team_members.role = team_admin). */
+const requireTeamAdmin = function (req, res, next) {
+  if (!req.user) {
+    return res.status(403).json({
+      success: false,
+      error: 'Access denied. Team admin privileges required.'
+    });
+  }
+  Promise.resolve(canManageTeamAsync(req.user))
+    .then((ok) => {
+      if (!ok) {
+        return res.status(403).json({
+          success: false,
+          error: 'Access denied. Team admin privileges required.'
+        });
+      }
+      next();
+    })
+    .catch((e) => {
+      console.error('requireTeamAdmin:', e);
+      res.sendStatus(500);
+    });
+};
+
+/** @deprecated Use requirePlatformAdmin */
+const requireAdmin = requirePlatformAdmin;
+/** @deprecated Use requirePlatformAdmin */
+const requireAdminUi = requirePlatformAdmin;
+
+export {
+  authenticate,
+  authenticateJwtOrApiKey,
+  sign,
+  requireAdmin,
+  requireAdminUi,
+  requirePlatformAdmin,
+  requireTeamAdmin,
+};

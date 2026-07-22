@@ -25,6 +25,7 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON w4h.users(email);
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_hash text;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_prefix text;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_created_at timestamp with time zone;
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_last_used_at timestamp with time zone;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key_hash ON w4h.users(api_key_hash) WHERE api_key_hash IS NOT NULL;
 
 -- User lifecycle: invited → active → discontinued (ADR-010)
@@ -338,10 +339,29 @@ CREATE INDEX IF NOT EXISTS idx_teams_status ON w4h.teams(status);
 CREATE TABLE IF NOT EXISTS w4h.team_members (
   team_id uuid NOT NULL REFERENCES w4h.teams(id) ON DELETE CASCADE,
   user_id integer NOT NULL REFERENCES w4h.users(id) ON DELETE CASCADE,
+  role text NOT NULL DEFAULT 'member'
+    CHECK (role IN ('team_admin', 'member')),
   PRIMARY KEY (team_id, user_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_team_members_user_id ON w4h.team_members(user_id);
+
+-- Per-team roles (ADR-004 / MVP v0.11): backfill + widen existing installs
+ALTER TABLE w4h.team_members ADD COLUMN IF NOT EXISTS role text;
+UPDATE w4h.team_members tm
+SET role = CASE
+  WHEN u.role IN ('team_admin', 'admin') THEN 'team_admin'
+  ELSE 'member'
+END
+FROM w4h.users u
+WHERE u.id = tm.user_id
+  AND (tm.role IS NULL OR tm.role NOT IN ('team_admin', 'member'));
+UPDATE w4h.team_members SET role = 'member' WHERE role IS NULL;
+ALTER TABLE w4h.team_members ALTER COLUMN role SET DEFAULT 'member';
+ALTER TABLE w4h.team_members ALTER COLUMN role SET NOT NULL;
+ALTER TABLE w4h.team_members DROP CONSTRAINT IF EXISTS team_members_role_check;
+ALTER TABLE w4h.team_members ADD CONSTRAINT team_members_role_check
+  CHECK (role IN ('team_admin', 'member'));
 
 -- Projects belong to exactly one owning team (ADR-012)
 ALTER TABLE w4h.projects ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE RESTRICT;
@@ -361,6 +381,10 @@ ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS irb_reference text;
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL;
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP;
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+-- Discoverable catalog listing (D-23): metadata visible to other teams; share still required to use
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS discoverable boolean NOT NULL DEFAULT true;
+CREATE INDEX IF NOT EXISTS idx_datasets_discoverable ON w4h.datasets (discoverable) WHERE discoverable = true;
 
 -- Cross-team dataset shares (ADR-002 / ADR-012) — push-share registry
 CREATE TABLE IF NOT EXISTS w4h.dataset_shares (

@@ -7,14 +7,18 @@ import * as auth from '../auth.js';
 import jwt from 'jsonwebtoken';
 import { validatePassword } from '../lib/utils/password-validator.js';
 import { isMailerConfigured, sendMail } from '../lib/mailer.js';
+import { recordUsageEventSafe } from '../lib/utils/usage.js';
 import {
   USER_ROLES,
   USER_ROLES_NAMES,
+  TEAM_MEMBER_ROLES,
   isSuperAdmin,
   isTeamAdmin,
-  canManageUsers,
   isAssignablePlatformRole,
   rolesAssignableBy,
+  authCapabilities,
+  normalizeTeamMemberRole,
+  canManageTeamAsync,
 } from '../lib/utils/user.js';
 
 const SCHEMA = 'w4h';
@@ -26,21 +30,21 @@ router.post('/verify-code', verifyLoginCode);
 router.post('/token-valid', tokenValid);
 router.get('/invite/:token', getInvite);
 router.post('/invite/accept', acceptInvite);
-router.post('/invite/resend', auth.authenticate, resendInvite);
-router.post('/invite/revoke', auth.authenticate, revokeInvite);
+router.post('/invite/resend', auth.authenticate, auth.requireTeamAdmin, resendInvite);
+router.post('/invite/revoke', auth.authenticate, auth.requireTeamAdmin, revokeInvite);
 router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
 router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
 router.delete('/me/api-key', auth.authenticate, revokeMyApiKey);
-router.delete('/user/:email/api-key', auth.authenticate, revokeUserApiKeyByEmail);
-router.get('/', auth.authenticate, list);
-router.get('/user/:email', auth.authenticate, getByEmail);
+router.delete('/user/:email/api-key', auth.authenticate, auth.requirePlatformAdmin, revokeUserApiKeyByEmail);
+router.get('/', auth.authenticate, auth.requireTeamAdmin, list);
+router.get('/user/:email', auth.authenticate, auth.requireTeamAdmin, getByEmail);
 router.post('/profile', auth.authenticate, updateProfile);
-router.post('/add', auth.authenticate, addUser);
-router.post('/set', auth.authenticate, setUser);
-router.post('/discontinue', auth.authenticate, discontinueUser);
-router.post('/resume', auth.authenticate, resumeUser);
-router.delete('/:email', auth.authenticate, del);
-router.get('/roles', auth.authenticate, roles);
+router.post('/add', auth.authenticate, auth.requireTeamAdmin, addUser);
+router.post('/set', auth.authenticate, auth.requireTeamAdmin, setUser);
+router.post('/discontinue', auth.authenticate, auth.requireTeamAdmin, discontinueUser);
+router.post('/resume', auth.authenticate, auth.requireTeamAdmin, resumeUser);
+router.delete('/:email', auth.authenticate, auth.requirePlatformAdmin, del);
+router.get('/roles', auth.authenticate, auth.requireTeamAdmin, roles);
 
 const INVITE_TTL_HOURS = Math.max(1, parseInt(process.env.INVITE_TTL_HOURS, 10) || 72);
 
@@ -103,7 +107,7 @@ async function sendInviteEmail({ email, name, roleLabel, rawToken }) {
   return link;
 }
 
-function assertUserCanAuthenticate(user) {
+function assertUserCanAuthenticate(user, { requirePassword = true } = {}) {
   if (!user) return { ok: false, message: 'Invalid Email or Password!' };
   if (user.status === 'invited') {
     return { ok: false, message: 'Account not activated. Check your email for the invitation link.' };
@@ -111,7 +115,8 @@ function assertUserCanAuthenticate(user) {
   if (user.status === 'discontinued') {
     return { ok: false, message: 'This account has been discontinued.' };
   }
-  if (!user.password) {
+  // Password login needs a stored hash; email-code login does not.
+  if (requirePassword && !user.password) {
     return { ok: false, message: 'Invalid Email or Password!' };
   }
   return { ok: true };
@@ -144,6 +149,37 @@ function normalizeTeamIds(input) {
   )];
 }
 
+/** Accept team_ids[] or teams: [{ team_id|id, role }] and return [{ team_id, role }]. */
+function normalizeTeamsWithRoles(input, defaultRole = TEAM_MEMBER_ROLES.MEMBER) {
+  if (!Array.isArray(input)) {
+    return normalizeTeamIds(input).map((team_id) => ({
+      team_id,
+      role: normalizeTeamMemberRole(defaultRole),
+    }));
+  }
+  if (!input.length) return [];
+
+  if (typeof input[0] === 'object' && input[0] != null) {
+    const out = [];
+    const seen = new Set();
+    for (const row of input) {
+      const team_id = String(row.team_id ?? row.id ?? '').trim();
+      if (!team_id || seen.has(team_id)) continue;
+      seen.add(team_id);
+      out.push({
+        team_id,
+        role: normalizeTeamMemberRole(row.role || defaultRole),
+      });
+    }
+    return out;
+  }
+
+  return normalizeTeamIds(input).map((team_id) => ({
+    team_id,
+    role: normalizeTeamMemberRole(defaultRole),
+  }));
+}
+
 async function getAllProjectIds() {
   const result = await query(`SELECT id FROM ${SCHEMA}.projects ORDER BY name ASC`);
   return result.rows.map(row => row.id);
@@ -157,18 +193,48 @@ async function getTeamIdsForUser(userId) {
   return result.rows.map(r => r.team_id);
 }
 
-async function syncUserTeams(userId, teamIds = []) {
-  const ids = normalizeTeamIds(teamIds);
+async function getTeamMembershipsForUser(userId) {
+  const result = await query(
+    `SELECT tm.team_id::text AS team_id, tm.role AS team_role, t.name AS team_name
+     FROM ${SCHEMA}.team_members tm
+     JOIN ${SCHEMA}.teams t ON t.id = tm.team_id
+     WHERE tm.user_id = $1
+     ORDER BY t.name ASC`,
+    [userId]
+  );
+  return result.rows.map((r) => ({
+    team_id: r.team_id,
+    role: r.team_role || TEAM_MEMBER_ROLES.MEMBER,
+    name: r.team_name,
+  }));
+}
+
+async function syncUserTeams(userId, teamsInput = [], defaultRole = TEAM_MEMBER_ROLES.MEMBER) {
+  const teams = normalizeTeamsWithRoles(teamsInput, defaultRole);
   await query(`DELETE FROM ${SCHEMA}.team_members WHERE user_id = $1`, [userId]);
-  if (ids.length > 0) {
+  for (const t of teams) {
     await query(
-      `INSERT INTO ${SCHEMA}.team_members (user_id, team_id)
-       SELECT $1, UNNEST($2::uuid[])
-       ON CONFLICT (team_id, user_id) DO NOTHING`,
-      [userId, ids]
+      `INSERT INTO ${SCHEMA}.team_members (user_id, team_id, role)
+       VALUES ($1, $2::uuid, $3)
+       ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [userId, t.team_id, t.role]
     );
   }
-  return ids;
+  return teams;
+}
+
+/** Keep legacy users.role in sync with whether the user is team_admin on any team. */
+async function syncPlatformRoleFromMemberships(userId, currentRole) {
+  if (isSuperAdmin(currentRole)) return currentRole;
+  const hasAdmin = await query(
+    `SELECT 1 FROM ${SCHEMA}.team_members WHERE user_id = $1 AND role = 'team_admin' LIMIT 1`,
+    [userId]
+  );
+  const nextRole = hasAdmin.rowCount ? USER_ROLES.TEAM_ADMIN : USER_ROLES.PROJECT_USER;
+  if (nextRole !== currentRole) {
+    await query(`UPDATE ${SCHEMA}.${TABLE} SET role = $1 WHERE id = $2`, [nextRole, userId]);
+  }
+  return nextRole;
 }
 
 async function syncUserProjects(userId, role, requestedProjectIds = []) {
@@ -201,7 +267,8 @@ async function ensureAdminAssignedToAllProjects(userId) {
 }
 
 async function buildUserSessionInfo(user) {
-  const teamIds = await getTeamIdsForUser(user.id);
+  const memberships = await getTeamMembershipsForUser(user.id);
+  const teamIds = memberships.map((m) => m.team_id);
   return {
     id: user.id,
     name: user.name,
@@ -209,18 +276,28 @@ async function buildUserSessionInfo(user) {
     role: user.role,
     team_ids: teamIds,
     team_id: teamIds[0] || null,
+    team_memberships: memberships,
+    caps: await authCapabilities(user),
   };
 }
 
 function roles(req, res) {
-  const allowed = rolesAssignableBy(req.user.role);
-  if (!allowed.length) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-  res.json(allowed.map(value => ({
-    value,
-    text: USER_ROLES_NAMES[value] || value,
-  })));
+  Promise.resolve(canManageTeamAsync(req.user)).then(async (ok) => {
+    if (!ok) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    let allowed = rolesAssignableBy(req.user.role);
+    if (!allowed.length && await canManageTeamAsync(req.user) && !isSuperAdmin(req.user.role)) {
+      allowed = [USER_ROLES.PROJECT_USER];
+    }
+    res.json(allowed.map((value) => ({
+      value,
+      text: USER_ROLES_NAMES[value] || value,
+    })));
+  }).catch((e) => {
+    console.error('roles:', e);
+    res.status(500).json({ error: e.message });
+  });
 }
 
 function tokenValid(req, res) {
@@ -245,7 +322,7 @@ async function del(req, res) {
 }
 
 async function loadManageableUser(req, { email, userId }) {
-  if (!canManageUsers(req.user.role)) {
+  if (!(await canManageTeamAsync(req.user))) {
     return { error: { status: 403, message: 'Unauthorized' } };
   }
 
@@ -276,7 +353,7 @@ async function loadManageableUser(req, { email, userId }) {
     return { error: { status: 400, message: 'You cannot discontinue your own account' } };
   }
 
-  if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+  if (!isSuperAdmin(req.user.role) && (await canManageTeamAsync(req.user))) {
     const myTeams = await getTeamIdsForUser(req.user.id);
     const theirTeams = await getTeamIdsForUser(target.id);
     if (!theirTeams.some((id) => myTeams.includes(id))) {
@@ -385,7 +462,7 @@ async function resumeUser(req, res) {
 async function getMyApiKeyMeta(req, res) {
   try {
     const result = await query(
-      `SELECT api_key_prefix, api_key_created_at, (api_key_hash IS NOT NULL) AS api_key_active
+      `SELECT api_key_prefix, api_key_created_at, api_key_last_used_at, (api_key_hash IS NOT NULL) AS api_key_active
        FROM ${SCHEMA}.${TABLE} WHERE id = $1`,
       [req.user.id]
     );
@@ -396,7 +473,8 @@ async function getMyApiKeyMeta(req, res) {
     res.json({
       active: row.api_key_active,
       api_key_prefix: row.api_key_prefix,
-      api_key_created_at: row.api_key_created_at
+      api_key_created_at: row.api_key_created_at,
+      api_key_last_used_at: row.api_key_last_used_at
     });
   } catch (error) {
     console.error('getMyApiKeyMeta:', error);
@@ -473,7 +551,7 @@ async function revokeUserApiKeyByEmail(req, res) {
 }
 
 async function setUser(req, res) {
-  if (!canManageUsers(req.user.role)) {
+  if (!(await canManageTeamAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
@@ -540,10 +618,15 @@ async function setUser(req, res) {
 
     if (result.rowCount > 0) {
       const userId = result.rows[0].id;
-      const role = result.rows[0].role;
-      const teamIds = normalizeTeamIds(user.team_ids ?? user.team_id);
+      let role = result.rows[0].role;
+      const defaultMemberRole = isTeamAdmin(role)
+        ? TEAM_MEMBER_ROLES.TEAM_ADMIN
+        : TEAM_MEMBER_ROLES.MEMBER;
+      const teamsInput = user.teams ?? user.team_memberships ?? user.team_ids ?? user.team_id;
+      const teams = normalizeTeamsWithRoles(teamsInput, defaultMemberRole);
+      const teamIds = teams.map((t) => t.team_id);
 
-      if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+      if (!isSuperAdmin(req.user.role) && (await canManageTeamAsync(req.user))) {
         const myTeams = await getTeamIdsForUser(req.user.id);
         if (teamIds.length && !teamIds.every((id) => myTeams.includes(id))) {
           return res.status(403).json({ error: 'Can only assign users to your own team(s)' });
@@ -553,15 +636,18 @@ async function setUser(req, res) {
       if (isSuperAdmin(role)) {
         await syncUserTeams(userId, []);
         await ensureAdminAssignedToAllProjects(userId);
-      } else if (Object.prototype.hasOwnProperty.call(user, 'team_ids')
+      } else if (Object.prototype.hasOwnProperty.call(user, 'teams')
+        || Object.prototype.hasOwnProperty.call(user, 'team_memberships')
+        || Object.prototype.hasOwnProperty.call(user, 'team_ids')
         || Object.prototype.hasOwnProperty.call(user, 'team_id')) {
-        if (!teamIds.length) {
+        if (!teams.length) {
           return res.status(400).json({ error: 'At least one team is required for this role' });
         }
-        await syncUserTeams(userId, teamIds);
+        await syncUserTeams(userId, teams, defaultMemberRole);
+        role = await syncPlatformRoleFromMemberships(userId, role);
       }
 
-      res.json({ success: true, message: 'User updated' });
+      res.json({ success: true, message: 'User updated', role });
     } else {
       res.json({ error: 'User not found' });
     }
@@ -572,7 +658,7 @@ async function setUser(req, res) {
 }
 
 async function addUser(req, res) {
-  if (!canManageUsers(req.user.role)) {
+  if (!(await canManageTeamAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
@@ -581,7 +667,14 @@ async function addUser(req, res) {
     const email = (user.email || '').trim();
     const name = (user.name || email || '').trim();
     const role = user.role;
-    const teamIds = normalizeTeamIds(user.team_ids ?? user.team_id);
+    const defaultMemberRole = isTeamAdmin(role)
+      ? TEAM_MEMBER_ROLES.TEAM_ADMIN
+      : TEAM_MEMBER_ROLES.MEMBER;
+    const teams = normalizeTeamsWithRoles(
+      user.teams ?? user.team_memberships ?? user.team_ids ?? user.team_id,
+      defaultMemberRole
+    );
+    const teamIds = teams.map((t) => t.team_id);
 
     if (!email || !role) {
       return res.status(400).json({ error: 'email and role are required' });
@@ -597,7 +690,10 @@ async function addUser(req, res) {
       return res.status(400).json({ error: 'Invalid role' });
     }
 
-    const allowed = rolesAssignableBy(req.user.role);
+    let allowed = rolesAssignableBy(req.user.role);
+    if (!allowed.length && !isSuperAdmin(req.user.role) && (await canManageTeamAsync(req.user))) {
+      allowed = [USER_ROLES.PROJECT_USER];
+    }
     if (!allowed.includes(role)) {
       return res.status(403).json({ error: 'Cannot assign this role' });
     }
@@ -606,7 +702,7 @@ async function addUser(req, res) {
       return res.status(400).json({ error: 'At least one team is required for this role' });
     }
 
-    if (isTeamAdmin(req.user.role)) {
+    if (!isSuperAdmin(req.user.role) && (await canManageTeamAsync(req.user))) {
       const myTeams = await getTeamIdsForUser(req.user.id);
       if (!teamIds.length || !teamIds.every(id => myTeams.includes(id))) {
         return res.status(403).json({ error: 'Can only invite users to your own team(s)' });
@@ -621,7 +717,10 @@ async function addUser(req, res) {
     );
 
     const newUserId = insertResult.rows[0].id;
-    await syncUserTeams(newUserId, teamIds);
+    await syncUserTeams(newUserId, teams, defaultMemberRole);
+    if (!isSuperAdmin(role)) {
+      await syncPlatformRoleFromMemberships(newUserId, role);
+    }
 
     // Project membership is managed on the project, not at user create —
     // except Super admins who retain access to all projects.
@@ -801,7 +900,7 @@ async function acceptInvite(req, res) {
 }
 
 async function resendInvite(req, res) {
-  if (!canManageUsers(req.user.role)) {
+  if (!(await canManageTeamAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
@@ -833,7 +932,7 @@ async function resendInvite(req, res) {
       return res.status(400).json({ error: 'Only invited (not yet activated) users can receive a new invitation' });
     }
 
-    if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+    if (!isSuperAdmin(req.user.role) && (await canManageTeamAsync(req.user))) {
       const myTeams = await getTeamIdsForUser(req.user.id);
       const theirTeams = await getTeamIdsForUser(target.id);
       if (!theirTeams.some((id) => myTeams.includes(id))) {
@@ -880,7 +979,7 @@ async function resendInvite(req, res) {
 }
 
 async function revokeInvite(req, res) {
-  if (!canManageUsers(req.user.role)) {
+  if (!(await canManageTeamAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
@@ -906,7 +1005,7 @@ async function revokeInvite(req, res) {
       return res.status(400).json({ error: 'Only pending invitations can be revoked' });
     }
 
-    if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+    if (!isSuperAdmin(req.user.role) && (await canManageTeamAsync(req.user))) {
       const myTeams = await getTeamIdsForUser(req.user.id);
       const theirTeams = await getTeamIdsForUser(target.id);
       if (!theirTeams.some((id) => myTeams.includes(id))) {
@@ -983,7 +1082,7 @@ async function updateProfile(req, res) {
 }
 
 async function getByEmail(req, res) {
-  if (!canManageUsers(req.user.role)) {
+  if (!(await canManageTeamAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
@@ -1020,7 +1119,7 @@ async function getByEmail(req, res) {
     }
 
     const row = result.rows[0];
-    if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+    if (!isSuperAdmin(req.user.role) && (await canManageTeamAsync(req.user))) {
       const myTeams = await getTeamIdsForUser(req.user.id);
       const theirTeams = Array.isArray(row.team_ids) ? row.team_ids.map(String) : [];
       const overlap = theirTeams.some((id) => myTeams.includes(id));
@@ -1029,7 +1128,11 @@ async function getByEmail(req, res) {
       }
     }
 
-    res.json(row);
+    const memberships = await getTeamMembershipsForUser(row.id);
+    res.json({
+      ...row,
+      team_memberships: memberships,
+    });
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ error: error.message });
@@ -1037,7 +1140,7 @@ async function getByEmail(req, res) {
 }
 
 async function list(req, res) {
-  if (!canManageUsers(req.user.role)) {
+  if (!(await canManageTeamAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -1045,7 +1148,7 @@ async function list(req, res) {
     const params = [];
     let where = '';
 
-    if (isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
+    if (!isSuperAdmin(req.user.role) && (await canManageTeamAsync(req.user))) {
       const myTeams = await getTeamIdsForUser(req.user.id);
       if (!myTeams.length) {
         return res.json([]);
@@ -1083,18 +1186,51 @@ async function list(req, res) {
            WHERE tm.user_id = u.id
          ), '') AS teams,
          COALESCE((
-           SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
+           SELECT json_agg(
+             json_build_object(
+               'team_id', t.id::text,
+               'name', t.name,
+               'role', tm.role
+             )
+             ORDER BY t.name
+           )
+           FROM ${SCHEMA}.team_members tm
+           JOIN ${SCHEMA}.teams t ON t.id = tm.team_id
+           WHERE tm.user_id = u.id
+         ), '[]'::json) AS team_memberships,
+         COALESCE((
+           SELECT STRING_AGG(
+             p.name || ' (' || pm.role || ')',
+             ', ' ORDER BY p.name
+           )
            FROM ${SCHEMA}.project_members pm
            JOIN ${SCHEMA}.projects p ON p.id = pm.project_id
            WHERE pm.user_id = u.id
-         ), '') AS projects
+         ), '') AS projects,
+         COALESCE((
+           SELECT json_agg(
+             json_build_object(
+               'project_id', p.id::text,
+               'name', p.name,
+               'role', pm.role
+             )
+             ORDER BY p.name
+           )
+           FROM ${SCHEMA}.project_members pm
+           JOIN ${SCHEMA}.projects p ON p.id = pm.project_id
+           WHERE pm.user_id = u.id
+         ), '[]'::json) AS project_memberships
        FROM ${SCHEMA}.${TABLE} u
        ${where}
        ORDER BY u.name ASC NULLS LAST, u.email ASC`,
       params
     );
 
-    res.json(result.rows);
+    res.json(result.rows.map((row) => ({
+      ...row,
+      team_memberships: Array.isArray(row.team_memberships) ? row.team_memberships : [],
+      project_memberships: Array.isArray(row.project_memberships) ? row.project_memberships : [],
+    })));
   } catch (error) {
     console.error('List users error:', error);
     res.status(500).json({ error: error.message });
@@ -1250,7 +1386,7 @@ async function verifyLoginCode(req, res) {
     }
 
     const user = userResult.rows[0];
-    const authCheck = assertUserCanAuthenticate(user);
+    const authCheck = assertUserCanAuthenticate(user, { requirePassword: false });
     if (!authCheck.ok) {
       return res.status(403).json({ error: { message: authCheck.message } });
     }
@@ -1307,6 +1443,12 @@ async function verifyLoginCode(req, res) {
       details: { email: user.email }
     });
 
+    recordUsageEventSafe({
+      userId: user.id,
+      eventType: 'user.login',
+      metadata: { method: 'email_code', auth_method: 'jwt' },
+    });
+
     res.json({ user: userInfo, token });
   } catch (error) {
     console.error('verifyLoginCode error:', error);
@@ -1350,6 +1492,12 @@ async function login(req, res) {
 
     const token = auth.sign(userInfo);
     userInfo.token = token;
+
+    recordUsageEventSafe({
+      userId: user.id,
+      eventType: 'user.login',
+      metadata: { method: 'password', auth_method: 'jwt' },
+    });
 
     res.json(userInfo);
   } catch (error) {

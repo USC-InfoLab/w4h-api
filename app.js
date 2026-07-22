@@ -23,12 +23,14 @@ import projects from './routes/projects.js';
 import teams from './routes/teams.js';
 import { isConfigured } from './db.js';
 import { ensureSchema } from './lib/db-init.js';
+import { attachApiKeyUsageLogger } from './lib/utils/usage.js';
 
 const app = express();
 app.use(cors());
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(attachApiKeyUsageLogger);
 
 app.use(express.static(path.join(__dirname, 'public')));
 

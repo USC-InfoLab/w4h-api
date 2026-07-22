@@ -1,16 +1,17 @@
 import express from 'express';
 import crypto from 'crypto';
 
-import { authenticateJwtOrApiKey } from '../auth.js';
+import { authenticateJwtOrApiKey, requireTeamAdmin } from '../auth.js';
 import { authenticateJwtApiKeyOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
 import { query } from '../db.js';
-import { isSuperAdmin, isTeamAdmin } from '../lib/utils/user.js';
+import { isSuperAdmin, isTeamAdmin, isTeamAdminOnTeam } from '../lib/utils/user.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
+import { writeAuditLogSafe } from '../lib/utils/audit.js';
 
 const router = express.Router();
 
 router.get('/', authenticateJwtOrApiKey, listProjects);
-router.post('/', authenticateJwtOrApiKey, createProject);
+router.post('/', authenticateJwtOrApiKey, requireTeamAdmin, createProject);
 
 router.get('/:id/db-tokens', authenticateJwtOrApiKey, listProjectDbTokens);
 router.delete('/:id/db-tokens/purge-inactive', authenticateJwtOrApiKey, purgeInactiveProjectDbTokens);
@@ -99,17 +100,46 @@ async function canManageProject(projectId, user) {
   return !!member && ['owner', 'editor'].includes(member.role);
 }
 
-/** Linkable set = team-owned ∪ inbound shares (ADR-012). Legacy null team_id datasets stay linkable as Local. */
-async function fetchLinkableDatasets(projectId, teamId) {
+/** Team ids where the user is an effective Team admin (null = Super admin → all teams). */
+async function getAdminTeamIdsForUser(user) {
+  if (!user?.id) return [];
+  if (isSuperAdmin(user.role)) return null;
+  const adminRes = await query(
+    `SELECT team_id::text AS team_id
+     FROM w4h.team_members
+     WHERE user_id = $1 AND role = 'team_admin'`,
+    [user.id]
+  );
+  let ids = adminRes.rows.map((r) => r.team_id);
+  // Legacy platform team_admin: treat all memberships as admin-scoped
+  if (!ids.length && isTeamAdmin(user.role)) {
+    const all = await query(
+      `SELECT team_id::text AS team_id FROM w4h.team_members WHERE user_id = $1`,
+      [user.id]
+    );
+    ids = all.rows.map((r) => r.team_id);
+  }
+  return ids;
+}
+
+/**
+ * Linkable set (ADR-012 + dual-hat Team admin UX):
+ * 1) Owned by the project's team (local)
+ * 2) Inbound shares to the project's team (shared)
+ * 3) Owned by other teams the actor admins — listed so they can link; linking auto-shares to the project team
+ */
+async function fetchLinkableDatasets(projectId, teamId, user = null) {
   if (!teamId) return [];
 
   const owned = await query(
     `SELECT d.id, d.name, d.description, d.team_id,
+            t.name AS owner_team_name,
             'local'::text AS source_kind,
             NULL::text AS shared_by_team_id,
             NULL::text AS shared_by_team_name,
             'read_write'::text AS max_access_type
      FROM w4h.datasets d
+     LEFT JOIN w4h.teams t ON t.id = d.team_id
      WHERE d.team_id = $1::uuid
         OR d.team_id IS NULL
      ORDER BY d.name ASC NULLS LAST, d.id ASC`,
@@ -118,6 +148,7 @@ async function fetchLinkableDatasets(projectId, teamId) {
 
   const shared = await query(
     `SELECT d.id, d.name, d.description, d.team_id,
+            ot.name AS owner_team_name,
             'shared'::text AS source_kind,
             ot.id::text AS shared_by_team_id,
             ot.name AS shared_by_team_name,
@@ -135,7 +166,7 @@ async function fetchLinkableDatasets(projectId, teamId) {
   for (const row of owned.rows) {
     byId.set(row.id, {
       ...row,
-      source_label: 'Local'
+      source_label: 'This team'
     });
   }
   for (const row of shared.rows) {
@@ -147,9 +178,105 @@ async function fetchLinkableDatasets(projectId, teamId) {
         : 'Shared'
     });
   }
+
+  if (user) {
+    const adminTeamIds = await getAdminTeamIdsForUser(user);
+    let managed;
+    if (adminTeamIds === null) {
+      // Super admin: every other team's datasets
+      managed = await query(
+        `SELECT d.id, d.name, d.description, d.team_id,
+                t.name AS owner_team_name,
+                'managed'::text AS source_kind,
+                t.id::text AS shared_by_team_id,
+                t.name AS shared_by_team_name,
+                'read_write'::text AS max_access_type
+         FROM w4h.datasets d
+         LEFT JOIN w4h.teams t ON t.id = d.team_id
+         WHERE d.team_id IS NOT NULL
+           AND d.team_id IS DISTINCT FROM $1::uuid
+         ORDER BY d.name ASC NULLS LAST, d.id ASC`,
+        [teamId]
+      );
+    } else if (adminTeamIds.length) {
+      managed = await query(
+        `SELECT d.id, d.name, d.description, d.team_id,
+                t.name AS owner_team_name,
+                'managed'::text AS source_kind,
+                t.id::text AS shared_by_team_id,
+                t.name AS shared_by_team_name,
+                'read_write'::text AS max_access_type
+         FROM w4h.datasets d
+         LEFT JOIN w4h.teams t ON t.id = d.team_id
+         WHERE d.team_id = ANY($1::uuid[])
+           AND d.team_id IS DISTINCT FROM $2::uuid
+         ORDER BY d.name ASC NULLS LAST, d.id ASC`,
+        [adminTeamIds, teamId]
+      );
+    }
+    if (managed) {
+      for (const row of managed.rows) {
+        if (byId.has(row.id)) continue;
+        byId.set(row.id, {
+          ...row,
+          source_label: row.owner_team_name
+            ? `Your team · ${row.owner_team_name}`
+            : 'Your other team'
+        });
+      }
+    }
+  }
+
   return [...byId.values()].sort((a, b) =>
     String(a.name || a.id).localeCompare(String(b.name || b.id), undefined, { sensitivity: 'base' })
   );
+}
+
+/** Ensure a team-wide share exists when linking a dataset owned by another team (dual-hat / Super admin). */
+async function ensureInboundShareForLink(req, datasetMeta, projectTeamId) {
+  if (!datasetMeta?.team_id || String(datasetMeta.team_id) === String(projectTeamId)) {
+    return;
+  }
+  if (datasetMeta.source_kind === 'shared') return;
+
+  const existing = await query(
+    `SELECT id FROM w4h.dataset_shares
+     WHERE dataset_id = $1
+       AND target_team_id = $2::uuid
+       AND target_project_id IS NULL
+     LIMIT 1`,
+    [datasetMeta.id, projectTeamId]
+  );
+  if (existing.rowCount) return;
+
+  const canSource = await isTeamAdminOnTeam(
+    req.user.id,
+    datasetMeta.team_id,
+    req.user.role
+  );
+  if (!canSource && !isSuperAdmin(req.user.role)) {
+    const err = new Error('Unauthorized to share this dataset into the project team');
+    err.status = 403;
+    throw err;
+  }
+
+  const inserted = await query(
+    `INSERT INTO w4h.dataset_shares
+       (dataset_id, target_team_id, target_project_id, access_type, shared_by)
+     VALUES ($1, $2::uuid, NULL, 'read', $3)
+     RETURNING id::text AS id`,
+    [datasetMeta.id, projectTeamId, req.user.id]
+  );
+  writeAuditLogSafe(req, {
+    action: 'sharing.create',
+    resourceType: 'dataset_share',
+    resourceId: inserted.rows[0]?.id,
+    details: {
+      dataset_id: datasetMeta.id,
+      target_team_id: projectTeamId,
+      reason: 'auto_share_on_project_link',
+    },
+  });
 }
 
 async function listEligibleTeamMembers(teamId) {
@@ -260,7 +387,7 @@ async function listLinkableDatasets(req, res) {
   }
   try {
     const teamId = await getProjectTeamId(projectId);
-    res.json(await fetchLinkableDatasets(projectId, teamId));
+    res.json(await fetchLinkableDatasets(projectId, teamId, req.user));
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to list linkable datasets' });
   }
@@ -344,7 +471,7 @@ async function getProjectOverview(req, res) {
            ORDER BY created_at ASC`,
           [projectId]
         ),
-        fetchLinkableDatasets(projectId, project.team_id),
+        fetchLinkableDatasets(projectId, project.team_id, req.user),
         listEligibleTeamMembers(project.team_id)
       ]);
 
@@ -814,7 +941,7 @@ async function replaceProjectDatasets(req, res) {
   try {
     const datasets = Array.isArray(req.body?.datasets) ? req.body.datasets : [];
     const teamId = await getProjectTeamId(projectId);
-    const linkable = await fetchLinkableDatasets(projectId, teamId);
+    const linkable = await fetchLinkableDatasets(projectId, teamId, req.user);
     const linkableById = new Map(linkable.map((d) => [String(d.id), d]));
 
     await query(`DELETE FROM w4h.project_datasets WHERE project_id = $1::uuid`, [projectId]);
@@ -826,6 +953,13 @@ async function replaceProjectDatasets(req, res) {
       if (!meta) {
         return res.status(400).json({
           error: `Dataset is not linkable to this project: ${datasetId}`
+        });
+      }
+      try {
+        await ensureInboundShareForLink(req, meta, teamId);
+      } catch (shareErr) {
+        return res.status(shareErr.status || 400).json({
+          error: shareErr.message || 'Failed to share dataset into project team'
         });
       }
       let accessType = row?.access_type === 'read_write' ? 'read_write' : 'read';

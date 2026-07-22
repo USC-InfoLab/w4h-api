@@ -4,8 +4,8 @@ import archiver from 'archiver';
 const router = express.Router();
 
 import { DOCS_TABLE, DOC_TYPES_TABLE, query } from '../db.js';
-import { authenticate } from '../auth.js';
-import { USER_ROLES, isSuperAdmin, canAccessAdminUi } from '../lib/utils/user.js';
+import { authenticate, requirePlatformAdmin } from '../auth.js';
+import { USER_ROLES, isSuperAdmin, isTeamAdmin, canAccessAdminUi } from '../lib/utils/user.js';
 import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter } from '../lib/utils/docs.js';
 import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
 
@@ -17,6 +17,7 @@ function canManageDocs(role) {
 
 function canReadDocs(role) {
   return canAccessAdminUi(role)
+    || isTeamAdmin(role)
     || role === USER_ROLES.PROJECT_USER
     || role === USER_ROLES.RESEARCHER
     || role === USER_ROLES.CLINICIAN;
@@ -26,30 +27,60 @@ function isLegacyResearcher(role) {
   return role === USER_ROLES.RESEARCHER || role === USER_ROLES.PROJECT_USER;
 }
 
-// Docs routes
+// Docs routes — platform doc write/import/export is Super admin only
 router.get('/', authenticate, list);
 router.get('/search', authenticate, search);
 router.get('/cards/feature', authenticate, featureCards);
-router.get('/export', authenticate, exportDocs);
-router.post('/refresh', authenticate, refreshDocs);
+router.get('/export', authenticate, requirePlatformAdmin, exportDocs);
+router.get('/refresh/preview', authenticate, requirePlatformAdmin, previewRefreshDocs);
+router.post('/refresh', authenticate, requirePlatformAdmin, refreshDocs);
 router.get('/types', authenticate, listDocTypes);
-router.post('/types', authenticate, createDocType);
+router.post('/types', authenticate, requirePlatformAdmin, createDocType);
 router.get('/:slug', authenticate, get);
-router.put('/:slug', authenticate, put);
-router.delete('/:slug', authenticate, del);
+router.put('/:slug', authenticate, requirePlatformAdmin, put);
+router.delete('/:slug', authenticate, requirePlatformAdmin, del);
 
-// Admin-only: refresh docs from source (overwrites existing docs with same slug)
+// Admin-only: preview DB ↔ docs-repo differences before refresh
+async function previewRefreshDocs(req, res) {
+  if (!canManageDocs(req.user.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const { previewDocsSync } = await import('../lib/utils/docs.js');
+    const result = await previewDocsSync();
+    if (!result.ok) {
+      return res.status(400).json({ success: false, reason: result.reason });
+    }
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// Admin-only: refresh docs from source with optional per-file decisions
+// Body: { decisions?: { conflicts, dbOnly, repoOnly } }
+// conflicts[slug]: 'repo' | 'platform'  — platform skips overwrite (keeps DB)
+// dbOnly[slug]: 'keep' | 'delete'
+// repoOnly[slug]: 'import' | 'skip'
 async function refreshDocs(req, res) {
   if (!canManageDocs(req.user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
-    const { importDocs } = await import('../lib/utils/docs.js');
-    const result = await importDocs();
+    const { applyDocsSync } = await import('../lib/utils/docs.js');
+    const decisions = req.body?.decisions && typeof req.body.decisions === 'object'
+      ? req.body.decisions
+      : {};
+    const result = await applyDocsSync(decisions);
     if (result.imported) {
-      res.json({ success: true, count: result.count });
+      res.json({
+        success: true,
+        count: result.count,
+        deleted: result.deleted || 0,
+        skipped: result.skipped || 0,
+      });
     } else {
-      res.status(400).json({ success: false, reason: result.reason });
+      res.status(400).json({ success: false, reason: result.reason, skipped: result.skipped || 0 });
     }
   } catch (e) {
     res.status(500).json({ error: e.message });

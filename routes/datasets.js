@@ -1,20 +1,34 @@
 import express from 'express';
 const router = express.Router();
 
-import { authenticateJwtOrApiKey } from '../auth.js';
-import { isSuperAdmin, isTeamAdmin, canAccessAdminUi } from '../lib/utils/user.js';
+import { authenticateJwtOrApiKey, requireTeamAdmin, requirePlatformAdmin } from '../auth.js';
+import {
+  isSuperAdmin,
+  isTeamAdmin,
+  canManageTeam,
+  canManageTeamAsync,
+  isTeamAdminOnTeam,
+} from '../lib/utils/user.js';
 import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
+import { writeAuditLogSafe } from '../lib/utils/audit.js';
 
 router.get('/projects', authenticateJwtOrApiKey, listProjects);
-router.get('/projects-admin', authenticateJwtOrApiKey, listProjectsAdmin);
-router.get('/projects-admin/:id', authenticateJwtOrApiKey, getProjectAdmin);
-router.post('/projects-admin', authenticateJwtOrApiKey, addProjectAdmin);
-router.put('/projects-admin/:id', authenticateJwtOrApiKey, setProjectAdmin);
+// Legacy projects-admin CRUD is platform-wide — Super admin only
+router.get('/projects-admin', authenticateJwtOrApiKey, requirePlatformAdmin, listProjectsAdmin);
+router.get('/projects-admin/:id', authenticateJwtOrApiKey, requirePlatformAdmin, getProjectAdmin);
+router.post('/projects-admin', authenticateJwtOrApiKey, requirePlatformAdmin, addProjectAdmin);
+router.put('/projects-admin/:id', authenticateJwtOrApiKey, requirePlatformAdmin, setProjectAdmin);
 router.get('/tableinfo', authenticateJwtOrApiKey, tableInfo);
 router.get('/', authenticateJwtOrApiKey, listDatasets);
-router.post('/', authenticateJwtOrApiKey, createDataset);
-router.patch('/:id', authenticateJwtOrApiKey, updateDataset);
+router.post('/', authenticateJwtOrApiKey, requireTeamAdmin, createDataset);
+// Share registry (ADR-002 / ADR-012) — register before /:id
+router.get('/shares', authenticateJwtOrApiKey, requireTeamAdmin, listDatasetShares);
+router.get('/share-targets', authenticateJwtOrApiKey, requireTeamAdmin, listShareTargets);
+router.delete('/shares/:shareId', authenticateJwtOrApiKey, requireTeamAdmin, revokeDatasetShare);
+router.get('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, listSharesForDataset);
+router.post('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, createDatasetShare);
+router.patch('/:id', authenticateJwtOrApiKey, requireTeamAdmin, updateDataset);
 router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
@@ -27,7 +41,7 @@ function canAccessDatasets(user) {
 }
 
 function canManageDatasets(user) {
-  return !!user && canAccessAdminUi(user.role);
+  return !!user && canManageTeam(user.role);
 }
 
 function isAdmin(user) {
@@ -56,6 +70,27 @@ async function canAccessTeam(user, teamId) {
   return (await getTeamIdsForUser(user.id)).includes(String(teamId));
 }
 
+/**
+ * Access via project link (ADR-012): datasets.project_id is legacy text and must not be
+ * compared to user_projects.project_id (uuid). Use project_datasets instead.
+ */
+function sqlDatasetAccessibleToUser(userParam, datasetAlias = 'd') {
+  return `(
+    EXISTS (
+      SELECT 1
+      FROM w4h.project_datasets pd
+      JOIN w4h.project_members pm ON pm.project_id = pd.project_id
+      WHERE pd.dataset_id = ${datasetAlias}.id AND pm.user_id = ${userParam}
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM w4h.project_datasets pd
+      JOIN w4h.user_projects us ON us.project_id = pd.project_id
+      WHERE pd.dataset_id = ${datasetAlias}.id AND us.user_id = ${userParam}
+    )
+  )`;
+}
+
 async function ensureUniqueDatasetId(base) {
   const baseId = slugifyDatasetId(base) || `dataset-${Date.now()}`;
   let id = baseId;
@@ -72,13 +107,62 @@ const CATALOG_SELECT = `
   SELECT d.id, d.name, d.description, d.team_id, d.project_id,
          d.device_type, d.sampling_rate, d.subject_count,
          d.date_start, d.date_end, d.irb_reference,
+         d.discoverable,
          d.created_by, d.created_at, d.updated_at,
          t.name AS team_name, t.slug AS team_slug,
+         COALESCE((
+           SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
+           FROM w4h.project_datasets pd
+           JOIN w4h.projects p ON p.id = pd.project_id
+           WHERE pd.dataset_id = d.id
+         ), '') AS project_names,
+         COALESCE((
+           SELECT json_agg(
+             json_build_object('id', p.id::text, 'name', p.name)
+             ORDER BY p.name
+           )
+           FROM w4h.project_datasets pd
+           JOIN w4h.projects p ON p.id = pd.project_id
+           WHERE pd.dataset_id = d.id
+         ), '[]'::json) AS projects,
          'local'::text AS source_kind,
          'Local'::text AS source_label
   FROM w4h.datasets d
   LEFT JOIN w4h.teams t ON t.id = d.team_id
 `;
+
+/** Shared catalog column list (owned / shared / listed variants differ in source_kind + projects). */
+const CATALOG_COLS = `
+             d.id, d.name, d.description, d.team_id, d.project_id,
+             d.device_type, d.sampling_rate, d.subject_count,
+             d.date_start, d.date_end, d.irb_reference,
+             d.discoverable,
+             d.created_by, d.created_at, d.updated_at
+`;
+
+/** Signal-table count for catalog list/detail (0 when w4h.tables is not provisioned). */
+async function attachTableCounts(rows) {
+  if (!rows?.length) return rows || [];
+  let tableMap = {};
+  try {
+    const tablesRes = await query(
+      `SELECT dataset_id, COUNT(*)::int AS n
+       FROM w4h.tables
+       WHERE dataset_id = ANY($1::text[])
+       GROUP BY dataset_id`,
+      [rows.map((r) => r.id)]
+    );
+    tableMap = Object.fromEntries((tablesRes.rows || []).map((r) => [r.dataset_id, r.n]));
+  } catch {
+    // Signal-table catalog not provisioned yet.
+  }
+  return rows.map((r) => ({
+    ...r,
+    project_names: r.project_names || '',
+    projects: Array.isArray(r.projects) ? r.projects : [],
+    table_count: tableMap[r.id] ?? 0,
+  }));
+}
 
 async function listDatasetsCatalog(req, res) {
   try {
@@ -87,13 +171,7 @@ async function listDatasetsCatalog(req, res) {
         ${CATALOG_SELECT}
         ORDER BY d.name ASC NULLS LAST, d.id ASC
       `);
-      return res.json(
-        result.rows.map((row) => ({
-          ...row,
-          source_kind: 'local',
-          source_label: 'Local'
-        }))
-      );
+      return res.json(await attachTableCounts(result.rows));
     }
 
     const teamIds = await getTeamIdsForUser(req.user.id);
@@ -101,11 +179,23 @@ async function listDatasetsCatalog(req, res) {
 
     const owned = await query(
       `
-      SELECT d.id, d.name, d.description, d.team_id, d.project_id,
-             d.device_type, d.sampling_rate, d.subject_count,
-             d.date_start, d.date_end, d.irb_reference,
-             d.created_by, d.created_at, d.updated_at,
+      SELECT ${CATALOG_COLS},
              t.name AS team_name, t.slug AS team_slug,
+             COALESCE((
+               SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
+               FROM w4h.project_datasets pd
+               JOIN w4h.projects p ON p.id = pd.project_id
+               WHERE pd.dataset_id = d.id
+             ), '') AS project_names,
+             COALESCE((
+               SELECT json_agg(
+                 json_build_object('id', p.id::text, 'name', p.name)
+                 ORDER BY p.name
+               )
+               FROM w4h.project_datasets pd
+               JOIN w4h.projects p ON p.id = pd.project_id
+               WHERE pd.dataset_id = d.id
+             ), '[]'::json) AS projects,
              'local'::text AS source_kind,
              'Local'::text AS source_label
       FROM w4h.datasets d
@@ -119,11 +209,23 @@ async function listDatasetsCatalog(req, res) {
     const shared = await query(
       `
       SELECT DISTINCT ON (d.id)
-             d.id, d.name, d.description, d.team_id, d.project_id,
-             d.device_type, d.sampling_rate, d.subject_count,
-             d.date_start, d.date_end, d.irb_reference,
-             d.created_by, d.created_at, d.updated_at,
+             ${CATALOG_COLS},
              ot.name AS team_name, ot.slug AS team_slug,
+             COALESCE((
+               SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
+               FROM w4h.project_datasets pd
+               JOIN w4h.projects p ON p.id = pd.project_id
+               WHERE pd.dataset_id = d.id
+             ), '') AS project_names,
+             COALESCE((
+               SELECT json_agg(
+                 json_build_object('id', p.id::text, 'name', p.name)
+                 ORDER BY p.name
+               )
+               FROM w4h.project_datasets pd
+               JOIN w4h.projects p ON p.id = pd.project_id
+               WHERE pd.dataset_id = d.id
+             ), '[]'::json) AS projects,
              'shared'::text AS source_kind,
              CASE
                WHEN ot.name IS NOT NULL THEN 'Shared by ' || ot.name
@@ -139,17 +241,46 @@ async function listDatasetsCatalog(req, res) {
       [teamIds]
     );
 
+    const listed = await query(
+      `
+      SELECT ${CATALOG_COLS},
+             ot.name AS team_name, ot.slug AS team_slug,
+             ''::text AS project_names,
+             '[]'::json AS projects,
+             'listed'::text AS source_kind,
+             CASE
+               WHEN ot.name IS NOT NULL THEN 'Listed · ' || ot.name
+               ELSE 'Listed'
+             END AS source_label
+      FROM w4h.datasets d
+      LEFT JOIN w4h.teams ot ON ot.id = d.team_id
+      WHERE d.discoverable = true
+        AND d.team_id IS NOT NULL
+        AND NOT (d.team_id = ANY($1::uuid[]))
+        AND NOT EXISTS (
+          SELECT 1 FROM w4h.dataset_shares ds
+          WHERE ds.dataset_id = d.id
+            AND ds.target_team_id = ANY($1::uuid[])
+        )
+      ORDER BY d.name ASC NULLS LAST, d.id ASC
+      `,
+      [teamIds]
+    );
+
     const byId = new Map();
     for (const row of owned.rows) byId.set(row.id, row);
     for (const row of shared.rows) {
       if (!byId.has(row.id)) byId.set(row.id, row);
     }
-    res.json(
-      [...byId.values()].sort((a, b) =>
-        String(a.name || a.id).localeCompare(String(b.name || b.id), undefined, { sensitivity: 'base' })
-      )
+    for (const row of listed.rows) {
+      if (!byId.has(row.id)) byId.set(row.id, row);
+    }
+    const merged = [...byId.values()].sort((a, b) =>
+      String(a.name || a.id).localeCompare(String(b.name || b.id), undefined, { sensitivity: 'base' })
     );
+    res.json(await attachTableCounts(merged));
   } catch (error) {
+    console.error('listDatasetsCatalog:', error);
     res.status(500).json({ error: error.message || 'Failed to list datasets' });
   }
 }
@@ -186,6 +317,9 @@ async function createDataset(req, res) {
     const dateStart = req.body?.date_start || null;
     const dateEnd = req.body?.date_end || null;
     const irbReference = req.body?.irb_reference == null ? null : String(req.body.irb_reference).trim();
+    const discoverable = req.body?.discoverable === false || req.body?.discoverable === 'false'
+      ? false
+      : true;
 
     if (subjectCount != null && !Number.isFinite(subjectCount)) {
       return res.status(400).json({ error: 'subject_count must be a number' });
@@ -194,8 +328,8 @@ async function createDataset(req, res) {
     const inserted = await query(
       `INSERT INTO w4h.datasets
          (id, name, description, team_id, device_type, sampling_rate, subject_count,
-          date_start, date_end, irb_reference, created_by)
-       VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, $10, $11)
+          date_start, date_end, irb_reference, created_by, discoverable)
+       VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id`,
       [
         id,
@@ -208,7 +342,8 @@ async function createDataset(req, res) {
         dateStart,
         dateEnd,
         irbReference || null,
-        req.user.id ?? null
+        req.user.id ?? null,
+        discoverable,
       ]
     );
 
@@ -275,6 +410,13 @@ async function updateDataset(req, res) {
       fields.push(`subject_count = $${params.length}`);
     }
 
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'discoverable')) {
+      const raw = req.body.discoverable;
+      const on = raw === true || raw === 'true' || raw === 1 || raw === '1';
+      params.push(!!on);
+      fields.push(`discoverable = $${params.length}`);
+    }
+
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'team_id')) {
       if (!isSuperAdmin(req.user.role)) {
         return res.status(403).json({ error: 'Only Super admins can change the owning team' });
@@ -314,16 +456,15 @@ async function listProjectsAdmin(req, res) {
   }
 
   try {
-    const pc = await resolveDatasetProjectLinkColumn();
     const result = await query(
       `SELECT
          s.id,
          s.name,
          s.description,
-         COUNT(DISTINCT d.id)::int AS dataset_count,
+         COUNT(DISTINCT pd.dataset_id)::int AS dataset_count,
          COUNT(DISTINCT us.user_id)::int AS user_count
        FROM w4h.projects s
-       LEFT JOIN w4h.datasets d ON d.${pc} = s.id
+       LEFT JOIN w4h.project_datasets pd ON pd.project_id = s.id
        LEFT JOIN w4h.user_projects us ON us.project_id = s.id
        GROUP BY s.id, s.name, s.description
        ORDER BY s.name ASC`
@@ -472,9 +613,7 @@ async function tableInfo(req, res) {
       : await query(
         `SELECT d.id, d.${pc} AS dataset_project_id
          FROM w4h.datasets d
-         JOIN w4h.user_projects us
-           ON us.project_id = d.${pc}
-         WHERE d.id = $1 AND us.user_id = $2`,
+         WHERE d.id = $1 AND ${sqlDatasetAccessibleToUser('$2')}`,
         [req.query.dataset_id, req.user.id]
       );
 
@@ -653,67 +792,76 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
 }
 
 async function listDatasets(req, res) {
-  if (!canAccessDatasets(req.user)) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-
-  // Admin catalog (team-scoped) — used by /admin/datasets
-  if (canAccessAdminUi(req.user.role) || req.query.catalog === '1') {
-    return listDatasetsCatalog(req, res);
-  }
-
-  const pc = await resolveDatasetProjectLinkColumn();
-  let sql = `
-    SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
-    FROM w4h.datasets d
-  `;
-  const params = [];
-
-  if (!isSuperAdmin(req.user.role)) {
-    sql += `
-      JOIN w4h.user_projects us
-        ON us.project_id = d.${pc}
-    `;
-    params.push(req.user.id);
-    sql += ` WHERE us.user_id = $${params.length}`;
-  }
-
-  const filterProjectId = req.query.project_id;
-  if (filterProjectId) {
-    params.push(filterProjectId);
-    sql += params.length === 1 && isSuperAdmin(req.user.role)
-      ? ` WHERE d.${pc} = $${params.length}`
-      : ` AND d.${pc} = $${params.length}`;
-  }
-
-  sql += ` ORDER BY name ASC`;
-
-  const result = await query(sql, params);
-
-  if (result.rows.length === 0) {
-    return res.json([]);
-  }
-
-  const datasetIds = result.rows.map(d => d.id);
-  const tableConfigs = await query(`
-    SELECT dataset_id, name, metabase_url, source_name, source_url
-    FROM w4h.tables
-    WHERE dataset_id = ANY($1)
-  `, [datasetIds]);
-
-  const datasets = [];
-  const queryMapByCatalogProject = new Map();
-
-  for (const d of result.rows) {
-    const cp = d.dataset_project_id;
-    if (!queryMapByCatalogProject.has(cp)) {
-      queryMapByCatalogProject.set(cp, await getQueryMap(cp));
+  try {
+    if (!canAccessDatasets(req.user)) {
+      return res.status(403).json({ error: 'Unauthorized' });
     }
 
-    datasets.push(await processDataset(d, req.user, queryMapByCatalogProject.get(cp), tableConfigs.rows));
-  }
+    // Team catalog for Team admin / Super admin (admin UI).
+    // Default managers to catalog when not filtering by project_id — avoids the legacy
+    // datasets.project_id (text) = user_projects.project_id (uuid) join crash.
+    if ((await canManageTeamAsync(req.user)) && (req.query.catalog === '1' || !req.query.project_id)) {
+      return listDatasetsCatalog(req, res);
+    }
 
-  res.json(datasets);
+    const pc = await resolveDatasetProjectLinkColumn();
+    let sql = `
+      SELECT DISTINCT d.id, d.${pc} AS dataset_project_id, d.name, d.description
+      FROM w4h.datasets d
+    `;
+    const params = [];
+    const where = [];
+
+    if (!isSuperAdmin(req.user.role)) {
+      params.push(req.user.id);
+      where.push(sqlDatasetAccessibleToUser(`$${params.length}`));
+    }
+
+    const filterProjectId = req.query.project_id;
+    if (filterProjectId) {
+      params.push(filterProjectId);
+      where.push(`EXISTS (
+        SELECT 1 FROM w4h.project_datasets pd
+        WHERE pd.dataset_id = d.id AND pd.project_id = $${params.length}::uuid
+      )`);
+    }
+
+    if (where.length) {
+      sql += ` WHERE ${where.join(' AND ')}`;
+    }
+
+    sql += ` ORDER BY name ASC`;
+
+    const result = await query(sql, params);
+
+    if (result.rows.length === 0) {
+      return res.json([]);
+    }
+
+    const datasetIds = result.rows.map(d => d.id);
+    const tableConfigs = await query(`
+      SELECT dataset_id, name, metabase_url, source_name, source_url
+      FROM w4h.tables
+      WHERE dataset_id = ANY($1)
+    `, [datasetIds]);
+
+    const datasets = [];
+    const queryMapByCatalogProject = new Map();
+
+    for (const d of result.rows) {
+      const cp = d.dataset_project_id;
+      if (!queryMapByCatalogProject.has(cp)) {
+        queryMapByCatalogProject.set(cp, await getQueryMap(cp));
+      }
+
+      datasets.push(await processDataset(d, req.user, queryMapByCatalogProject.get(cp), tableConfigs.rows));
+    }
+
+    res.json(datasets);
+  } catch (error) {
+    console.error('listDatasets error:', error);
+    res.status(500).json({ error: error.message || 'Failed to list datasets' });
+  }
 }
 
 async function getDataset(req, res) {
@@ -723,8 +871,8 @@ async function getDataset(req, res) {
 
   const { id } = req.params;
 
-  // Admin catalog detail
-  if (canAccessAdminUi(req.user.role) || req.query.catalog === '1') {
+  // Team catalog detail — Team admin / Super admin
+  if (await canManageTeamAsync(req.user)) {
     try {
       const result = await query(`${CATALOG_SELECT} WHERE d.id = $1`, [id]);
       if (!result.rowCount) {
@@ -742,7 +890,20 @@ async function getDataset(req, res) {
             [id, teamIds]
           );
           if (!shared.rowCount) {
-            return res.status(403).json({ error: 'Unauthorized' });
+            if (!row.discoverable) {
+              return res.status(403).json({ error: 'Unauthorized' });
+            }
+            // Discoverable listing: metadata only (D-23 / S-10)
+            const [enriched] = await attachTableCounts([{
+              ...row,
+              project_names: '',
+              projects: [],
+              tables: [],
+              source_kind: 'listed',
+              source_label: row.team_name ? `Listed · ${row.team_name}` : 'Listed',
+              table_count: 0,
+            }]);
+            return res.json(enriched);
           }
         }
       }
@@ -759,7 +920,8 @@ async function getDataset(req, res) {
       } catch {
         tables = [];
       }
-      return res.json({ ...row, tables });
+      const [enriched] = await attachTableCounts([{ ...row, tables }]);
+      return res.json(enriched);
     } catch (error) {
       return res.status(500).json({ error: error.message || 'Failed to load dataset' });
     }
@@ -776,9 +938,7 @@ async function getDataset(req, res) {
     : await query(
       `SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
        FROM w4h.datasets d
-       JOIN w4h.user_projects us
-         ON us.project_id = d.${pc}
-       WHERE d.id = $1 AND us.user_id = $2`,
+       WHERE d.id = $1 AND ${sqlDatasetAccessibleToUser('$2')}`,
       [id, req.user.id]
     );
 
@@ -799,6 +959,266 @@ async function getDataset(req, res) {
   const processedDataset = await processDataset(dataset, req.user, QUERY_MAP, tableConfigs.rows);
 
   res.json(processedDataset);
+}
+
+const SHARE_SELECT = `
+  SELECT ds.id::text AS id,
+         ds.dataset_id,
+         d.name AS dataset_name,
+         d.team_id::text AS owner_team_id,
+         ot.name AS owner_team_name,
+         ds.target_team_id::text AS target_team_id,
+         tt.name AS target_team_name,
+         ds.target_project_id::text AS target_project_id,
+         p.name AS target_project_name,
+         ds.access_type,
+         ds.shared_at,
+         ds.shared_by,
+         u.name AS shared_by_name,
+         u.email AS shared_by_email
+  FROM w4h.dataset_shares ds
+  JOIN w4h.datasets d ON d.id = ds.dataset_id
+  LEFT JOIN w4h.teams ot ON ot.id = d.team_id
+  JOIN w4h.teams tt ON tt.id = ds.target_team_id
+  LEFT JOIN w4h.projects p ON p.id = ds.target_project_id
+  LEFT JOIN w4h.users u ON u.id = ds.shared_by
+`;
+
+async function assertCanManageDatasetShares(user, datasetId) {
+  const ds = await query(
+    `SELECT id, name, team_id::text AS team_id FROM w4h.datasets WHERE id = $1`,
+    [datasetId]
+  );
+  if (!ds.rowCount) return { error: 'Dataset not found', status: 404 };
+  const row = ds.rows[0];
+  if (!row.team_id) {
+    return { error: 'Dataset has no owning team; assign a team before sharing', status: 400 };
+  }
+  if (!(await isTeamAdminOnTeam(user.id, row.team_id, user.role))) {
+    return { error: 'Unauthorized', status: 403 };
+  }
+  return { dataset: row };
+}
+
+async function listShareTargets(req, res) {
+  try {
+    if (!(await canManageTeamAsync(req.user))) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    const teamsRes = await query(
+      `SELECT id::text AS id, name, slug
+       FROM w4h.teams
+       WHERE status = 'active'
+       ORDER BY name ASC`
+    );
+    let projects = [];
+    const teamId = req.query.team_id ? String(req.query.team_id).trim() : '';
+    if (teamId) {
+      const projectsRes = await query(
+        `SELECT id::text AS id, name, slug, status
+         FROM w4h.projects
+         WHERE team_id = $1::uuid AND status = 'active'
+         ORDER BY name ASC`,
+        [teamId]
+      );
+      projects = projectsRes.rows;
+    }
+    res.json({ teams: teamsRes.rows, projects });
+  } catch (error) {
+    console.error('listShareTargets error:', error);
+    res.status(500).json({ error: error.message || 'Failed to list share targets' });
+  }
+}
+
+async function listDatasetShares(req, res) {
+  try {
+    if (!(await canManageTeamAsync(req.user))) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    let outboundSql = `${SHARE_SELECT}`;
+    let inboundSql = `${SHARE_SELECT}`;
+    const outboundParams = [];
+    const inboundParams = [];
+
+    if (!isSuperAdmin(req.user.role)) {
+      const teamIds = await getTeamIdsForUser(req.user.id);
+      if (!teamIds.length) {
+        return res.json({ outbound: [], inbound: [] });
+      }
+      outboundParams.push(teamIds);
+      outboundSql += ` WHERE d.team_id = ANY($1::uuid[])`;
+      inboundParams.push(teamIds);
+      inboundSql += ` WHERE ds.target_team_id = ANY($1::uuid[])`;
+    }
+
+    outboundSql += ` ORDER BY ds.shared_at DESC`;
+    inboundSql += ` ORDER BY ds.shared_at DESC`;
+
+    const [outbound, inbound] = await Promise.all([
+      query(outboundSql, outboundParams),
+      query(inboundSql, inboundParams),
+    ]);
+
+    res.json({
+      outbound: outbound.rows.map((r) => ({ ...r, direction: 'outbound' })),
+      inbound: inbound.rows.map((r) => ({ ...r, direction: 'inbound' })),
+    });
+  } catch (error) {
+    console.error('listDatasetShares error:', error);
+    res.status(500).json({ error: error.message || 'Failed to list shares' });
+  }
+}
+
+async function listSharesForDataset(req, res) {
+  try {
+    const check = await assertCanManageDatasetShares(req.user, req.params.id);
+    if (check.error) return res.status(check.status).json({ error: check.error });
+
+    const result = await query(
+      `${SHARE_SELECT} WHERE ds.dataset_id = $1 ORDER BY ds.shared_at DESC`,
+      [req.params.id]
+    );
+    res.json(result.rows.map((r) => ({ ...r, direction: 'outbound' })));
+  } catch (error) {
+    console.error('listSharesForDataset error:', error);
+    res.status(500).json({ error: error.message || 'Failed to list shares' });
+  }
+}
+
+async function createDatasetShare(req, res) {
+  try {
+    const check = await assertCanManageDatasetShares(req.user, req.params.id);
+    if (check.error) return res.status(check.status).json({ error: check.error });
+    const dataset = check.dataset;
+
+    const targetTeamId = req.body?.target_team_id == null
+      ? ''
+      : String(req.body.target_team_id).trim();
+    if (!targetTeamId) {
+      return res.status(400).json({ error: 'target_team_id is required' });
+    }
+    if (targetTeamId === dataset.team_id) {
+      return res.status(400).json({ error: 'Cannot share a dataset with its owning team' });
+    }
+
+    const teamRes = await query(
+      `SELECT id::text AS id, name, status FROM w4h.teams WHERE id = $1::uuid`,
+      [targetTeamId]
+    );
+    if (!teamRes.rowCount) {
+      return res.status(400).json({ error: 'Unknown target_team_id' });
+    }
+    if (teamRes.rows[0].status !== 'active') {
+      return res.status(400).json({ error: 'Target team is not active' });
+    }
+
+    let targetProjectId = null;
+    if (req.body?.target_project_id != null && String(req.body.target_project_id).trim() !== '') {
+      targetProjectId = String(req.body.target_project_id).trim();
+      const proj = await query(
+        `SELECT id::text AS id, team_id::text AS team_id, name
+         FROM w4h.projects WHERE id = $1::uuid`,
+        [targetProjectId]
+      );
+      if (!proj.rowCount) {
+        return res.status(400).json({ error: 'Unknown target_project_id' });
+      }
+      if (proj.rows[0].team_id !== targetTeamId) {
+        return res.status(400).json({ error: 'Target project must belong to the target team' });
+      }
+    }
+
+    const accessType = req.body?.access_type === 'read_write' ? 'read_write' : 'read';
+
+    const dup = await query(
+      `SELECT id FROM w4h.dataset_shares
+       WHERE dataset_id = $1
+         AND target_team_id = $2::uuid
+         AND (
+           ($3::uuid IS NULL AND target_project_id IS NULL)
+           OR target_project_id = $3::uuid
+         )
+       LIMIT 1`,
+      [dataset.id, targetTeamId, targetProjectId]
+    );
+    if (dup.rowCount) {
+      return res.status(409).json({ error: 'Share already exists for this team/project' });
+    }
+
+    const inserted = await query(
+      `INSERT INTO w4h.dataset_shares
+         (dataset_id, target_team_id, target_project_id, access_type, shared_by)
+       VALUES ($1, $2::uuid, $3::uuid, $4, $5)
+       RETURNING id::text AS id`,
+      [dataset.id, targetTeamId, targetProjectId, accessType, req.user.id]
+    );
+
+    writeAuditLogSafe(req, {
+      action: 'sharing.create',
+      resourceType: 'dataset_share',
+      resourceId: inserted.rows[0].id,
+      details: {
+        dataset_id: dataset.id,
+        target_team_id: targetTeamId,
+        target_project_id: targetProjectId,
+        access_type: accessType,
+      },
+    });
+
+    const row = await query(
+      `${SHARE_SELECT} WHERE ds.id = $1::uuid`,
+      [inserted.rows[0].id]
+    );
+    res.status(201).json({ ...row.rows[0], direction: 'outbound' });
+  } catch (error) {
+    console.error('createDatasetShare error:', error);
+    res.status(500).json({ error: error.message || 'Failed to create share' });
+  }
+}
+
+async function revokeDatasetShare(req, res) {
+  try {
+    const shareId = req.params.shareId;
+    const shareRes = await query(
+      `SELECT ds.id::text AS id,
+              ds.dataset_id,
+              d.team_id::text AS owner_team_id,
+              ds.target_team_id::text AS target_team_id
+       FROM w4h.dataset_shares ds
+       JOIN w4h.datasets d ON d.id = ds.dataset_id
+       WHERE ds.id = $1::uuid`,
+      [shareId]
+    );
+    if (!shareRes.rowCount) {
+      return res.status(404).json({ error: 'Share not found' });
+    }
+    const share = shareRes.rows[0];
+
+    const canOwner = share.owner_team_id
+      && await isTeamAdminOnTeam(req.user.id, share.owner_team_id, req.user.role);
+    const canRecipient = await isTeamAdminOnTeam(req.user.id, share.target_team_id, req.user.role);
+    if (!canOwner && !canRecipient && !isSuperAdmin(req.user.role)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    await query(`DELETE FROM w4h.dataset_shares WHERE id = $1::uuid`, [shareId]);
+
+    writeAuditLogSafe(req, {
+      action: 'sharing.revoke',
+      resourceType: 'dataset_share',
+      resourceId: shareId,
+      details: {
+        dataset_id: share.dataset_id,
+        target_team_id: share.target_team_id,
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('revokeDatasetShare error:', error);
+    res.status(500).json({ error: error.message || 'Failed to revoke share' });
+  }
 }
 
 export default router;
