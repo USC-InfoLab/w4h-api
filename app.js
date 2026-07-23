@@ -34,6 +34,22 @@ app.use(attachApiKeyUsageLogger);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Docs repo media (screenshots, GIFs for What's New, etc.): DOCS_REPO_PATH/media → /docs-media
+{
+  const docsRepo = process.env.DOCS_REPO_PATH
+    ? path.resolve(__dirname, process.env.DOCS_REPO_PATH)
+    : null;
+  if (docsRepo) {
+    app.use(
+      '/docs-media',
+      express.static(path.join(docsRepo, 'media'), {
+        fallthrough: true,
+        maxAge: process.env.NODE_ENV === 'production' ? '1d' : 0,
+      })
+    );
+  }
+}
+
 app.on('uncaughtException', err => {
   console.log('uncaught exception: ', err);
   process.send({ finish: false });
