@@ -103,6 +103,24 @@ async function ensureUniqueDatasetId(base) {
   }
 }
 
+const CONTACT_EMAILS_SQL = `
+         COALESCE((
+           SELECT STRING_AGG(u.email, ', ' ORDER BY u.email)
+           FROM w4h.team_members tm
+           JOIN w4h.users u ON u.id = tm.user_id
+           WHERE tm.team_id = d.team_id
+             AND tm.role = 'team_admin'
+             AND COALESCE(u.status, 'active') = 'active'
+         ), '') AS contact_emails,
+         COALESCE((
+           SELECT STRING_AGG(COALESCE(NULLIF(TRIM(u.name), ''), u.email), ', ' ORDER BY u.email)
+           FROM w4h.team_members tm
+           JOIN w4h.users u ON u.id = tm.user_id
+           WHERE tm.team_id = d.team_id
+             AND tm.role = 'team_admin'
+             AND COALESCE(u.status, 'active') = 'active'
+         ), '') AS contact_names`;
+
 const CATALOG_SELECT = `
   SELECT d.id, d.name, d.description, d.team_id, d.project_id,
          d.device_type, d.sampling_rate, d.subject_count,
@@ -110,6 +128,7 @@ const CATALOG_SELECT = `
          d.discoverable,
          d.created_by, d.created_at, d.updated_at,
          t.name AS team_name, t.slug AS team_slug,
+         ${CONTACT_EMAILS_SQL},
          COALESCE((
            SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
            FROM w4h.project_datasets pd
@@ -181,6 +200,7 @@ async function listDatasetsCatalog(req, res) {
       `
       SELECT ${CATALOG_COLS},
              t.name AS team_name, t.slug AS team_slug,
+             ${CONTACT_EMAILS_SQL},
              COALESCE((
                SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
                FROM w4h.project_datasets pd
@@ -211,6 +231,7 @@ async function listDatasetsCatalog(req, res) {
       SELECT DISTINCT ON (d.id)
              ${CATALOG_COLS},
              ot.name AS team_name, ot.slug AS team_slug,
+             ${CONTACT_EMAILS_SQL},
              COALESCE((
                SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
                FROM w4h.project_datasets pd
@@ -245,6 +266,7 @@ async function listDatasetsCatalog(req, res) {
       `
       SELECT ${CATALOG_COLS},
              ot.name AS team_name, ot.slug AS team_slug,
+             ${CONTACT_EMAILS_SQL},
              ''::text AS project_names,
              '[]'::json AS projects,
              'listed'::text AS source_kind,

@@ -10,6 +10,19 @@ import { writeAuditLogSafe } from '../lib/utils/audit.js';
 
 const router = express.Router();
 
+function auditProjectAction(req, action, projectId, extra = {}) {
+  if (!projectId) return;
+  writeAuditLogSafe(req, {
+    action,
+    resourceType: extra.resourceType || 'project',
+    resourceId: extra.resourceId != null ? extra.resourceId : projectId,
+    details: {
+      project_id: String(projectId),
+      ...(extra.details || {}),
+    },
+  });
+}
+
 router.get('/', authenticateJwtOrApiKey, listProjects);
 router.post('/', authenticateJwtOrApiKey, requireTeamAdmin, createProject);
 
@@ -92,12 +105,16 @@ async function canReadProject(projectId, user) {
 async function canManageProject(projectId, user) {
   if (!user) return false;
   if (isSuperAdmin(user.role)) return true;
-  if (isTeamAdmin(user.role)) {
-    const teamId = await getProjectTeamId(projectId);
-    if (teamId && (await isUserOnTeam(user.id, teamId))) return true;
+  const teamId = await getProjectTeamId(projectId);
+  if (teamId) {
+    const teamRole = await query(
+      `SELECT role FROM w4h.team_members WHERE team_id = $1::uuid AND user_id = $2`,
+      [teamId, user.id]
+    );
+    if (teamRole.rowCount && teamRole.rows[0].role === 'team_admin') return true;
   }
   const member = await getMembership(projectId, user.id);
-  return !!member && ['owner', 'editor'].includes(member.role);
+  return !!member && member.role === 'owner';
 }
 
 /** Team ids where the user is an effective Team admin (null = Super admin → all teams). */
@@ -282,7 +299,8 @@ async function ensureInboundShareForLink(req, datasetMeta, projectTeamId) {
 async function listEligibleTeamMembers(teamId) {
   if (!teamId) return [];
   const res = await query(
-    `SELECT u.id AS user_id, u.name, u.email, u.role AS user_role
+    `SELECT u.id AS user_id, u.name, u.email, u.role AS user_role,
+            tm.role AS team_role
      FROM w4h.team_members tm
      JOIN w4h.users u ON u.id = tm.user_id
      WHERE tm.team_id = $1::uuid
@@ -336,19 +354,25 @@ async function ensureUniqueSlug(base) {
 
 async function listProjects(req, res) {
   try {
+    const userId = req.user.id;
     let sql = `
       SELECT p.id, p.slug, p.name, p.description, p.status, p.visibility,
              p.irb_protocol_id, p.irb_expiry_date, p.team_id,
              t.name AS team_name, t.slug AS team_slug,
-             p.created_at, p.updated_at
+             p.created_at, p.updated_at,
+             (
+               SELECT pm.role
+               FROM w4h.project_members pm
+               WHERE pm.project_id = p.id AND pm.user_id = $1
+               LIMIT 1
+             ) AS my_role
       FROM w4h.projects p
       LEFT JOIN w4h.teams t ON t.id = p.team_id
     `;
-    const params = [];
+    const params = [userId];
 
     if (!isSuperAdmin(req.user.role)) {
-      const teamIds = await getTeamIdsForUser(req.user.id);
-      params.push(req.user.id);
+      const teamIds = await getTeamIdsForUser(userId);
       if (teamIds.length) {
         params.push(teamIds);
         sql += `
@@ -419,6 +443,7 @@ async function getProjectOverview(req, res) {
 
     const project = projectRes.rows[0];
     const pc = await resolveDatasetProjectLinkColumn();
+    const canManage = !req.authViaProjectDbToken && (await canManageProject(projectId, req.user));
 
     const [membersRes, datasetsRes, notebooksRes, docsRes, orgsRes, derivedOrgsRes, aclRes, linkableDatasets, eligibleMembers] =
       await Promise.all([
@@ -471,11 +496,24 @@ async function getProjectOverview(req, res) {
            ORDER BY created_at ASC`,
           [projectId]
         ),
-        fetchLinkableDatasets(projectId, project.team_id, req.user),
+        canManage ? fetchLinkableDatasets(projectId, project.team_id, req.user) : Promise.resolve([]),
         listEligibleTeamMembers(project.team_id)
       ]);
 
-    const canManage = !req.authViaProjectDbToken && (await canManageProject(projectId, req.user));
+    // A project with no roster still has its Project admins on the owning team.
+    if (!membersRes.rows.length && project.team_id) {
+      for (const m of eligibleMembers) {
+        if (m.team_role !== 'team_admin') continue;
+        await query(
+          `INSERT INTO w4h.project_members (project_id, user_id, role, invited_by)
+           VALUES ($1::uuid, $2, 'owner', $2)
+           ON CONFLICT (project_id, user_id) DO NOTHING`,
+          [projectId, m.user_id]
+        );
+      }
+      membersRes.rows = await listMembers(projectId);
+    }
+
     const canIssueDbToken = !req.authViaProjectDbToken && (await canReadProject(projectId, req.user));
     const manualOrgRows = Array.isArray(orgsRes.rows) ? orgsRes.rows : [];
     const organizations =
@@ -504,8 +542,8 @@ async function getProjectOverview(req, res) {
       project,
       members: membersRes.rows,
       datasets,
-      linkable_datasets: linkableDatasets,
-      eligible_members: eligibleMembers,
+      linkable_datasets: canManage ? linkableDatasets : [],
+      eligible_members: canManage ? eligibleMembers : [],
       notebooks: notebooksRes.rows,
       docs: docsRes.rows,
       organizations,
@@ -582,6 +620,29 @@ async function createProject(req, res) {
          ON CONFLICT (project_id, user_id) DO NOTHING`,
         [project.id, req.user.id]
       );
+    }
+
+    const seedFrom = String(req.body?.seed_from_project_id || '').trim();
+    if (seedFrom) {
+      const seed = await query(
+        `SELECT id, team_id FROM w4h.projects WHERE id::text = $1 OR slug = $1`,
+        [seedFrom]
+      );
+      if (seed.rowCount && (await canAccessTeam(req.user, seed.rows[0].team_id))) {
+        const seedMembers = await query(
+          `SELECT user_id, role FROM w4h.project_members WHERE project_id = $1::uuid`,
+          [seed.rows[0].id]
+        );
+        for (const m of seedMembers.rows) {
+          if (!(await isUserOnTeam(m.user_id, teamId))) continue;
+          await query(
+            `INSERT INTO w4h.project_members (project_id, user_id, role, invited_by)
+             VALUES ($1::uuid, $2, $3, $4)
+             ON CONFLICT (project_id, user_id) DO NOTHING`,
+            [project.id, m.user_id, m.role, req.user.id]
+          );
+        }
+      }
     }
 
     res.status(201).json(project);
@@ -697,6 +758,7 @@ async function updateProject(req, res) {
     } else {
       res.json(projectRow);
     }
+    auditProjectAction(req, 'project.update', projectId);
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to update project' });
   }
@@ -777,6 +839,11 @@ async function addProjectMember(req, res) {
       [projectId, userId, role, req.user.id]
     );
 
+    auditProjectAction(req, 'project.member.add', projectId, {
+      resourceType: 'project_member',
+      resourceId: userId,
+      details: { user_id: userId, role },
+    });
     res.json(await listMembers(projectId));
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to add project member' });
@@ -807,7 +874,7 @@ async function updateProjectMemberRole(req, res) {
       return res.status(404).json({ error: 'Member not found' });
     }
     if (current.rows[0].role === 'owner' && role !== 'owner' && (await ownerCount(projectId)) <= 1) {
-      return res.status(400).json({ error: 'Project must have at least one owner' });
+      return res.status(400).json({ error: 'Project must have at least one Project admin' });
     }
 
     await query(
@@ -816,6 +883,11 @@ async function updateProjectMemberRole(req, res) {
        WHERE project_id = $2::uuid AND user_id = $3`,
       [role, projectId, userId]
     );
+    auditProjectAction(req, 'project.member.role', projectId, {
+      resourceType: 'project_member',
+      resourceId: userId,
+      details: { user_id: userId, role },
+    });
     res.json(await listMembers(projectId));
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to update member role' });
@@ -841,8 +913,13 @@ async function removeProjectMember(req, res) {
     if (!current.rowCount) {
       return res.status(404).json({ error: 'Member not found' });
     }
+    if (Number(userId) === Number(req.user.id)) {
+      return res.status(400).json({
+        error: 'You cannot remove yourself from the project. Ask another Project admin, or a Super admin, to remove you.'
+      });
+    }
     if (current.rows[0].role === 'owner' && (await ownerCount(projectId)) <= 1) {
-      return res.status(400).json({ error: 'Project must have at least one owner' });
+      return res.status(400).json({ error: 'Project must have at least one Project admin' });
     }
 
     await query(
@@ -850,6 +927,11 @@ async function removeProjectMember(req, res) {
        WHERE project_id = $1::uuid AND user_id = $2`,
       [projectId, userId]
     );
+    auditProjectAction(req, 'project.member.remove', projectId, {
+      resourceType: 'project_member',
+      resourceId: userId,
+      details: { user_id: userId },
+    });
     res.json(await listMembers(projectId));
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to remove member' });
@@ -984,6 +1066,9 @@ async function replaceProjectDatasets(req, res) {
        ORDER BY d.name ASC NULLS LAST, d.id ASC`,
       [projectId]
     );
+    auditProjectAction(req, 'project.datasets.update', projectId, {
+      details: { dataset_ids: datasets.map((d) => d?.dataset_id).filter(Boolean) },
+    });
     res.json(fresh.rows);
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to update project datasets' });

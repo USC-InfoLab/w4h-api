@@ -15,7 +15,7 @@ const SCHEMA = 'w4h';
 
 router.get('/', authenticate, requireTeamAdmin, listTeams);
 router.post('/', authenticate, requireTeamAdmin, createTeam);
-router.get('/:id', authenticate, requireTeamAdmin, getTeam);
+router.get('/:id', authenticate, getTeam);
 router.patch('/:id', authenticate, requireTeamAdmin, updateTeam);
 router.post('/:id/members', authenticate, requireTeamAdmin, addTeamMember);
 router.patch('/:id/members/:userId', authenticate, requireTeamAdmin, updateTeamMember);
@@ -154,13 +154,20 @@ async function createTeam(req, res) {
   }
 }
 
+async function userIsOnTeam(userId, teamId) {
+  if (userId == null || !teamId) return false;
+  const res = await query(
+    `SELECT 1 FROM ${SCHEMA}.team_members WHERE team_id = $1::uuid AND user_id = $2`,
+    [teamId, userId]
+  );
+  return res.rowCount > 0;
+}
+
 async function getTeam(req, res) {
-  if (!(await canManageTeamAsync(req.user))) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
   try {
     const teamId = req.params.id;
-    if (!(await assertCanAccessTeam(req, teamId))) {
+    const allowed = isSuperAdmin(req.user.role) || (await userIsOnTeam(req.user.id, teamId));
+    if (!allowed) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 

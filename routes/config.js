@@ -12,7 +12,7 @@ import * as auth from '../auth.js';
 import { initializeDatabase, createInitialAdmin, hasAnyUsers } from '../lib/db-init.js';
 import { getMailerConfig, isMailerConfigured, sendMail } from '../lib/mailer.js';
 import { normalizeClientUsageEvent, recordUsageEventSafe } from '../lib/utils/usage.js';
-import { writeAuditLogSafe } from '../lib/utils/audit.js';
+import { writeAuditLog, writeAuditLogSafe } from '../lib/utils/audit.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -110,7 +110,7 @@ router.get('/usage', auth.authenticate, auth.requirePlatformAdmin, getUsage);
 router.get('/api-usage', auth.authenticate, auth.requirePlatformAdmin, getUsage); // legacy alias
 router.post('/client-usage', auth.authenticate, postClientUsage);
 router.post('/report-issue', auth.authenticate, postReportIssue);
-router.get('/audit-log', auth.authenticate, auth.requirePlatformAdmin, getAuditLog);
+router.get('/audit-log', auth.authenticate, getAuditLog);
 router.get('/database-settings', auth.authenticate, auth.requirePlatformAdmin, getDatabaseSettings);
 router.get('/mailer-settings', auth.authenticate, auth.requirePlatformAdmin, getMailerSettings);
 router.post('/mailer-settings', auth.authenticate, auth.requirePlatformAdmin, postMailerSettings);
@@ -978,13 +978,50 @@ async function getUsage(req, res) {
 }
 
 /**
- * GET /config/audit-log — Super admin HIPAA audit ledger (H-11 / ADR-011).
- * Query: days|from&to, action, resource_type, user_id, q, page, limit, format=json|csv
- * Viewing/exporting is itself audited (audit.view / audit.export).
+ * GET /config/audit-log — HIPAA audit ledger (H-11 / ADR-011).
+ * Super admin: unscoped. Project admin: pass project_id (own study only).
+ * Query: days|from&to, action, resource_type, user_id, q, project_id, page, limit, format=json|csv
  */
+async function canReadProjectAudit(user, projectRef) {
+  if (!user || !projectRef) return null;
+  const found = await query(
+    `SELECT id::text AS id, slug, team_id::text AS team_id
+     FROM w4h.projects
+     WHERE id::text = $1 OR slug = $1`,
+    [String(projectRef)]
+  );
+  if (!found.rowCount) return null;
+  const row = found.rows[0];
+  if (isSuperAdmin(user.role)) return row;
+  if (row.team_id) {
+    const tm = await query(
+      `SELECT role FROM w4h.team_members WHERE team_id = $1::uuid AND user_id = $2`,
+      [row.team_id, user.id]
+    );
+    if (tm.rows[0]?.role === 'team_admin') return row;
+  }
+  const mem = await query(
+    `SELECT role FROM w4h.project_members WHERE project_id = $1::uuid AND user_id = $2`,
+    [row.id, user.id]
+  );
+  if (mem.rows[0]?.role === 'owner') return row;
+  return null;
+}
+
 async function getAuditLog(req, res) {
-  if (!isAdmin(req.user)) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  const projectRef = String(req.query.project_id || '').trim();
+  let scopedProject = null;
+
+  if (isAdmin(req.user)) {
+    if (projectRef) scopedProject = await canReadProjectAudit(req.user, projectRef);
+  } else {
+    if (!projectRef) {
+      return res.status(403).json({ error: 'project_id is required' });
+    }
+    scopedProject = await canReadProjectAudit(req.user, projectRef);
+    if (!scopedProject) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
   }
 
   try {
@@ -1042,7 +1079,66 @@ async function getAuditLog(req, res) {
       )`);
     }
 
+    let scopedPidSql = null;
+    if (scopedProject) {
+      params.push(scopedProject.id);
+      const pid = `$${params.length}`;
+      scopedPidSql = pid;
+      params.push(scopedProject.slug || scopedProject.id);
+      const pslug = `$${params.length}`;
+      let extra = '';
+      if (scopedProject.team_id) {
+        params.push(scopedProject.team_id);
+        const tid = `$${params.length}`;
+        extra = `
+          OR COALESCE(a.details->>'team_id', '') = ${tid}::text
+        `;
+      }
+      params.push(req.user.id);
+      const actor = `$${params.length}`;
+      where.push(`(
+        a.resource_id IN (${pid}::text, ${pslug}::text)
+        OR COALESCE(a.details->>'project_id', '') IN (${pid}::text, ${pslug}::text)
+        OR COALESCE(a.details->>'project_slug', '') = ${pslug}::text
+        OR (
+          a.resource_type IN ('dataset', 'project', 'project_member', 'audit_log')
+          AND (
+            a.resource_id IN (${pid}::text, ${pslug}::text)
+            OR a.resource_id IN (
+              SELECT pd.dataset_id::text
+              FROM w4h.project_datasets pd
+              WHERE pd.project_id = ${pid}::uuid
+            )
+          )
+        )
+        OR (
+          a.resource_type = 'audit_log'
+          AND (
+            a.user_id = ${actor}
+            OR a.user_id IN (
+              SELECT pm.user_id FROM w4h.project_members pm
+              WHERE pm.project_id = ${pid}::uuid
+            )
+          )
+        )
+        ${extra}
+      )`);
+    }
+
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const projectJoin = scopedPidSql
+      ? `LEFT JOIN w4h.project_members pm
+           ON pm.user_id = a.user_id AND pm.project_id = ${scopedPidSql}::uuid`
+      : '';
+    const actorRoleSelect = scopedProject
+      ? `CASE
+           WHEN pm.role = 'owner' THEN 'Project admin'
+           WHEN pm.role IN ('editor', 'viewer', 'admin') THEN 'User'
+           WHEN u.role IN ('super_admin', 'admin') THEN 'Super admin'
+           ELSE NULL
+         END AS actor_role_label,
+         u.role AS user_role`
+      : `u.role AS user_role, NULL::text AS actor_role_label`;
 
     const listSql = `
       SELECT
@@ -1051,7 +1147,7 @@ async function getAuditLog(req, res) {
         a.user_id,
         u.name AS user_name,
         u.email AS user_email,
-        u.role AS user_role,
+        ${actorRoleSelect},
         a.action,
         a.resource_type,
         a.resource_id,
@@ -1060,6 +1156,7 @@ async function getAuditLog(req, res) {
         a.details
       FROM w4h.audit_log a
       LEFT JOIN w4h.users u ON u.id = a.user_id
+      ${projectJoin}
       ${whereSql}
       ORDER BY a.timestamp DESC, a.id DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}
@@ -1130,16 +1227,20 @@ async function getAuditLog(req, res) {
       `;
       const exportRes = await query(exportSql, [...params, exportLimit]);
 
-      writeAuditLogSafe(req, {
+      await writeAuditLog(req, {
         userId: req.user.id,
         action: 'audit.export',
         resourceType: 'audit_log',
+        resourceId: scopedProject?.id || null,
         details: {
           format: 'csv',
           row_count: exportRes.rowCount,
+          project_id: scopedProject?.id || null,
+          project_slug: scopedProject?.slug || null,
+          team_id: scopedProject?.team_id || null,
           filters: { action, resource_type: resourceType, user_id: userIdRaw || null, q: q || null, days, from: fromRaw || null, to: toRaw || null },
         },
-      });
+      }).catch((err) => console.warn('Audit log write failed:', err.message));
 
       const header = [
         'id', 'timestamp', 'user_id', 'user_name', 'user_email', 'action',
@@ -1167,6 +1268,21 @@ async function getAuditLog(req, res) {
       return res.send(lines.join('\n'));
     }
 
+    await writeAuditLog(req, {
+      userId: req.user.id,
+      action: 'audit.view',
+      resourceType: 'audit_log',
+      resourceId: scopedProject?.id || null,
+      details: {
+        page,
+        limit,
+        project_id: scopedProject?.id || null,
+        project_slug: scopedProject?.slug || null,
+        team_id: scopedProject?.team_id || null,
+        filters: { action: action || null, resource_type: resourceType || null, user_id: userIdRaw || null, q: q || null, days, from: fromRaw || null, to: toRaw || null },
+      },
+    }).catch((err) => console.warn('Audit log write failed:', err.message));
+
     const listParams = [...params, limit, offset];
     const [listRes, countRes, summaryRes, actionsRes, resourceTypesRes] = await Promise.all([
       query(listSql, listParams),
@@ -1177,18 +1293,6 @@ async function getAuditLog(req, res) {
     ]);
 
     const total = countRes.rows[0]?.n ?? 0;
-
-    writeAuditLogSafe(req, {
-      userId: req.user.id,
-      action: 'audit.view',
-      resourceType: 'audit_log',
-      details: {
-        page,
-        limit,
-        total,
-        filters: { action: action || null, resource_type: resourceType || null, user_id: userIdRaw || null, q: q || null, days, from: fromRaw || null, to: toRaw || null },
-      },
-    });
 
     res.json({
       period_days: fromRaw && toRaw ? null : days,
@@ -1213,6 +1317,7 @@ async function getAuditLog(req, res) {
         user_name: r.user_name,
         user_email: r.user_email,
         user_role: r.user_role,
+        actor_role_label: r.actor_role_label || null,
         action: r.action,
         resource_type: r.resource_type,
         resource_id: r.resource_id,
