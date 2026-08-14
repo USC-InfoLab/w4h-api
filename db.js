@@ -52,6 +52,7 @@ function createPool() {
     database: process.env.DB_DATABASE,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
+    ...(process.env.DB_POOL_MAX ? { max: Number(process.env.DB_POOL_MAX) } : {}),
   };
 
   if (process.env.W4H_DEBUG) {
@@ -129,6 +130,73 @@ export async function query(sql, params) {
   }
 }
 
+export class DatasetUnavailableError extends Error {
+  constructor(message, code = 'DATASET_UNAVAILABLE') {
+    super(message);
+    this.name = 'DatasetUnavailableError';
+    this.code = code;
+  }
+}
+
+export async function withTransaction(callback) {
+  const currentPool = getPool();
+  if (!currentPool) {
+    throw new Error('Database not configured. Please configure database credentials first.');
+  }
+
+  const client = await currentPool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await callback(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Database rollback failed:', rollbackError.message || rollbackError);
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function withDatasetTransaction(catalogId, callback) {
+  if (!catalogId) {
+    throw new DatasetUnavailableError('A dataset is required for dataset data access', 'DATASET_REQUIRED');
+  }
+
+  return withTransaction(async (client) => {
+    const registry = await client.query(
+      `SELECT schema_name, status, team_id::text AS team_id
+       FROM w4h.dataset_registry
+       WHERE dataset_id = $1`,
+      [catalogId]
+    );
+    if (!registry.rowCount) {
+      throw new DatasetUnavailableError('Dataset schema has not been provisioned', 'DATASET_NOT_PROVISIONED');
+    }
+
+    const { schema_name: schemaName, status, team_id: teamId } = registry.rows[0];
+    if (status !== 'active') {
+      throw new DatasetUnavailableError(
+        `Dataset schema is not active (status: ${status})`,
+        'DATASET_NOT_ACTIVE'
+      );
+    }
+    if (!/^ds_[a-f0-9]{32}$/.test(schemaName)) {
+      throw new DatasetUnavailableError('Dataset registry contains an invalid schema name', 'DATASET_INVALID_SCHEMA');
+    }
+
+    await client.query(
+      `SELECT set_config('search_path', $1, true)`,
+      [`${schemaName},w4h`]
+    );
+    return callback(client, { schemaName, teamId });
+  });
+}
+
 function parseTable(table) {
   const dot = table.indexOf('.');
   return dot >= 0
@@ -175,4 +243,11 @@ export async function getUserTablesInSchema(schema) {
   return result.rows.map(row => row.table_name);
 }
 
-export default { query, resetPool, isConfigured, getPool };
+export default {
+  query,
+  resetPool,
+  isConfigured,
+  getPool,
+  withTransaction,
+  withDatasetTransaction,
+};

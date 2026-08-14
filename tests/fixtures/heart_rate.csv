@@ -1,0 +1,4 @@
+id,date,timestamp,value
+subject-a,2024-01-01,00:00:00,72
+subject-a,2024-01-01,00:01:00,73
+subject-b,2024-01-02,12:30:00,81

@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { authenticateJwtOrApiKey, requireTeamAdmin } from '../auth.js';
 import { authenticateJwtApiKeyOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
 import { query } from '../db.js';
+import { provisionProjectRole, syncProjectDatasetGrants } from '../lib/project-provision.js';
 import { isSuperAdmin, isTeamAdmin, isTeamAdminOnTeam } from '../lib/utils/user.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
@@ -612,6 +613,12 @@ async function createProject(req, res) {
 
     const project = inserted.rows[0];
 
+    try {
+      project.pg_role = await provisionProjectRole(project.id);
+    } catch (provisioningError) {
+      console.error('createProject role provisioning:', provisioningError);
+    }
+
     // Team admins (and other non–super-admin creators on the team) become project owner
     if (!(await isPlatformAdminUserId(req.user.id))) {
       await query(
@@ -1026,8 +1033,15 @@ async function replaceProjectDatasets(req, res) {
     const linkable = await fetchLinkableDatasets(projectId, teamId, req.user);
     const linkableById = new Map(linkable.map((d) => [String(d.id), d]));
 
+    const previousLinks = await query(
+      `SELECT dataset_id FROM w4h.project_datasets WHERE project_id = $1::uuid`,
+      [projectId]
+    );
+    const previousDatasetIds = previousLinks.rows.map((row) => row.dataset_id);
+
     await query(`DELETE FROM w4h.project_datasets WHERE project_id = $1::uuid`, [projectId]);
 
+    const linkedDatasets = [];
     for (const row of datasets) {
       const datasetId = String(row?.dataset_id || '').trim();
       if (!datasetId) continue;
@@ -1055,6 +1069,16 @@ async function replaceProjectDatasets(req, res) {
          DO UPDATE SET access_type = EXCLUDED.access_type, approved_by = EXCLUDED.approved_by, approved_at = NOW()`,
         [projectId, datasetId, accessType, req.user.id]
       );
+      linkedDatasets.push({ dataset_id: datasetId, access_type: accessType });
+    }
+
+    try {
+      await syncProjectDatasetGrants(projectId, previousDatasetIds, linkedDatasets);
+    } catch (grantError) {
+      console.error('replaceProjectDatasets grants:', grantError);
+      return res.status(503).json({
+        error: 'Project datasets were saved, but schema grants could not be updated',
+      });
     }
 
     const pc = await resolveDatasetProjectLinkColumn();
@@ -1396,4 +1420,5 @@ async function issueProjectDbToken(req, res) {
   }
 }
 
+export { createProject, replaceProjectDatasets };
 export default router;

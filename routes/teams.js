@@ -59,18 +59,6 @@ function slugify(input) {
     .replace(/(^-|-$)/g, '');
 }
 
-async function ensureUniqueSlug(base) {
-  const baseSlug = slugify(base) || `team-${Date.now()}`;
-  let slug = baseSlug;
-  let i = 1;
-  while (true) {
-    const check = await query(`SELECT id FROM ${SCHEMA}.teams WHERE slug = $1`, [slug]);
-    if (!check.rowCount) return slug;
-    slug = `${baseSlug}-${i}`;
-    i += 1;
-  }
-}
-
 async function listTeams(req, res) {
   if (!(await canManageTeamAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -120,7 +108,20 @@ async function createTeam(req, res) {
     if (!name) {
       return res.status(400).json({ error: 'name is required' });
     }
-    const slug = await ensureUniqueSlug(req.body?.slug || name);
+    const slug = slugify(req.body?.slug || name);
+    if (!slug) {
+      return res.status(400).json({ error: 'A valid team slug is required' });
+    }
+    const duplicate = await query(
+      `SELECT id
+       FROM ${SCHEMA}.teams
+       WHERE slug = $1 OR lower(name) = lower($2)
+       LIMIT 1`,
+      [slug, name]
+    );
+    if (duplicate.rowCount) {
+      return res.status(409).json({ error: 'A team with this name or slug already exists' });
+    }
 
     const result = await query(
       `INSERT INTO ${SCHEMA}.teams (slug, name)
@@ -131,7 +132,7 @@ async function createTeam(req, res) {
 
     const team = result.rows[0];
 
-    // Creator membership: Team admin owns new trial teams; Super admin is listed as member for visibility only.
+    // Creator membership: Team admin owns new teams; Super admin is listed as member for visibility only.
     if (req.user?.id != null) {
       const membershipRole = isSuperAdmin(req.user.role)
         ? TEAM_MEMBER_ROLES.MEMBER
@@ -147,7 +148,7 @@ async function createTeam(req, res) {
     res.status(201).json(team);
   } catch (error) {
     if (error.code === '23505') {
-      return res.status(409).json({ error: 'Team slug already exists' });
+      return res.status(409).json({ error: 'A team with this name or slug already exists' });
     }
     console.error('createTeam:', error);
     res.status(500).json({ error: error.message });
@@ -444,6 +445,9 @@ async function updateTeam(req, res) {
     }
     res.json(result.rows[0]);
   } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'A team with this name already exists' });
+    }
     console.error('updateTeam:', error);
     res.status(500).json({ error: error.message });
   }

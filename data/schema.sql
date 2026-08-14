@@ -334,6 +334,7 @@ CREATE TABLE IF NOT EXISTS w4h.teams (
 );
 
 CREATE INDEX IF NOT EXISTS idx_teams_slug ON w4h.teams(slug);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_teams_name_lower ON w4h.teams(lower(name));
 CREATE INDEX IF NOT EXISTS idx_teams_status ON w4h.teams(status);
 
 CREATE TABLE IF NOT EXISTS w4h.team_members (
@@ -345,6 +346,25 @@ CREATE TABLE IF NOT EXISTS w4h.team_members (
 );
 
 CREATE INDEX IF NOT EXISTS idx_team_members_user_id ON w4h.team_members(user_id);
+
+-- ---------------------------------------------------------------------------
+-- Dataset Registry — immutable mapping from a catalog dataset to its schema
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.dataset_registry (
+  dataset_id text PRIMARY KEY REFERENCES w4h.datasets(id) ON DELETE RESTRICT,
+  team_id uuid NOT NULL REFERENCES w4h.teams(id) ON DELETE RESTRICT,
+  schema_name text NOT NULL UNIQUE,
+  status text NOT NULL DEFAULT 'provisioning'
+    CHECK (status IN ('provisioning', 'active', 'failed', 'archived')),
+  schema_version integer NOT NULL DEFAULT 0 CHECK (schema_version >= 0),
+  provisioned_at timestamptz,
+  last_error text,
+  created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_dataset_registry_team_id ON w4h.dataset_registry(team_id);
+CREATE INDEX IF NOT EXISTS idx_dataset_registry_status ON w4h.dataset_registry(status);
 
 -- Per-team roles (ADR-004 / MVP v0.11): backfill + widen existing installs
 ALTER TABLE w4h.team_members ADD COLUMN IF NOT EXISTS role text;
@@ -367,9 +387,21 @@ ALTER TABLE w4h.team_members ADD CONSTRAINT team_members_role_check
 ALTER TABLE w4h.projects ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE RESTRICT;
 CREATE INDEX IF NOT EXISTS idx_projects_team_id ON w4h.projects(team_id);
 
+-- NOLOGIN PostgreSQL role granted on linked dataset schemas
+ALTER TABLE w4h.projects ADD COLUMN IF NOT EXISTS pg_role text;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_pg_role
+  ON w4h.projects(pg_role) WHERE pg_role IS NOT NULL;
+
 -- Datasets belong to an owning team (nullable for legacy catalog rows)
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_datasets_team_id ON w4h.datasets(team_id);
+
+-- Ingest metadata lives on the catalog row (no per-team trial schema)
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS schema_def jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS ingest_status text NOT NULL DEFAULT 'created';
+ALTER TABLE w4h.datasets DROP CONSTRAINT IF EXISTS datasets_ingest_status_check;
+ALTER TABLE w4h.datasets ADD CONSTRAINT datasets_ingest_status_check
+  CHECK (ingest_status IN ('created', 'ingesting', 'ready', 'failed', 'archived'));
 
 -- Dataset catalog metadata (D-02)
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS device_type text;

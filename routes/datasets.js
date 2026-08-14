@@ -1,4 +1,5 @@
 import express from 'express';
+import multer from 'multer';
 const router = express.Router();
 
 import { authenticateJwtOrApiKey, requireTeamAdmin, requirePlatformAdmin } from '../auth.js';
@@ -9,9 +10,12 @@ import {
   canManageTeamAsync,
   isTeamAdminOnTeam,
 } from '../lib/utils/user.js';
-import { query } from '../db.js';
+import { query, withDatasetTransaction, DatasetUnavailableError } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
-import { writeAuditLogSafe } from '../lib/utils/audit.js';
+import { writeAuditLog, writeAuditLogSafe } from '../lib/utils/audit.js';
+import { recordUsageEventSafe } from '../lib/utils/usage.js';
+import { ingestDatasetFromCsv, IngestionError } from '../lib/dataset-ingest.js';
+import { provisionDatasetSchema } from '../lib/dataset-provision.js';
 
 router.get('/projects', authenticateJwtOrApiKey, listProjects);
 // Legacy projects-admin CRUD is platform-wide — Super admin only
@@ -26,6 +30,13 @@ router.post('/', authenticateJwtOrApiKey, requireTeamAdmin, createDataset);
 router.get('/shares', authenticateJwtOrApiKey, requireTeamAdmin, listDatasetShares);
 router.get('/share-targets', authenticateJwtOrApiKey, requireTeamAdmin, listShareTargets);
 router.delete('/shares/:shareId', authenticateJwtOrApiKey, requireTeamAdmin, revokeDatasetShare);
+router.post(
+  '/:id/ingest',
+  authenticateJwtOrApiKey,
+  requireTeamAdmin,
+  handleIngestUpload,
+  ingestDatasetCsv
+);
 router.get('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, listSharesForDataset);
 router.post('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, createDatasetShare);
 router.patch('/:id', authenticateJwtOrApiKey, requireTeamAdmin, updateDataset);
@@ -35,6 +46,29 @@ const STATUS_TABLE_NAME = 'w4h.status_log';
 const DATASET_ALLOWED_ROLES = new Set([
   'admin', 'super_admin', 'team_admin', 'project_user', 'researcher', 'clinician'
 ]);
+const ingestUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+    files: 2,
+    fields: 5,
+  },
+}).fields([
+  { name: 'subjects_csv', maxCount: 1 },
+  { name: 'signal_csv', maxCount: 1 },
+]);
+
+function handleIngestUpload(req, res, next) {
+  ingestUpload(req, res, (error) => {
+    if (!error) return next();
+    const status = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+    return res.status(status).json({
+      error: error.code === 'LIMIT_FILE_SIZE'
+        ? 'Each CSV file must be 10 MB or smaller'
+        : error.message || 'Invalid multipart upload',
+    });
+  });
+}
 
 function canAccessDatasets(user) {
   return !!user && DATASET_ALLOWED_ROLES.has(user.role);
@@ -127,8 +161,12 @@ const CATALOG_SELECT = `
          d.date_start, d.date_end, d.irb_reference,
          d.discoverable,
          d.created_by, d.created_at, d.updated_at,
+         d.schema_def,
+         d.ingest_status AS dataset_status,
          t.name AS team_name, t.slug AS team_slug,
          ${CONTACT_EMAILS_SQL},
+         dr.schema_name,
+         dr.status AS dataset_schema_status,
          COALESCE((
            SELECT STRING_AGG(p.name, ', ' ORDER BY p.name)
            FROM w4h.project_datasets pd
@@ -148,6 +186,7 @@ const CATALOG_SELECT = `
          'Local'::text AS source_label
   FROM w4h.datasets d
   LEFT JOIN w4h.teams t ON t.id = d.team_id
+  LEFT JOIN w4h.dataset_registry dr ON dr.dataset_id = d.id
 `;
 
 /** Shared catalog column list (owned / shared / listed variants differ in source_kind + projects). */
@@ -159,21 +198,61 @@ const CATALOG_COLS = `
              d.created_by, d.created_at, d.updated_at
 `;
 
-/** Signal-table count for catalog list/detail (0 when w4h.tables is not provisioned). */
+async function getDatasetTables(catalogId) {
+  if (!catalogId) return [];
+  try {
+    return await withDatasetTransaction(catalogId, async (client) => {
+      const result = await client.query(
+        `SELECT table_name AS name,
+                table_name,
+                signal_type,
+                columns_def
+         FROM dataset_tables
+         ORDER BY table_name`
+      );
+      return result.rows;
+    });
+  } catch (error) {
+    if (error instanceof DatasetUnavailableError) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+const getDatasetFiles = getDatasetTables;
+
+/** Table counts come from each dataset schema's dataset_tables manifest. */
 async function attachTableCounts(rows) {
   if (!rows?.length) return rows || [];
-  let tableMap = {};
-  try {
-    const tablesRes = await query(
-      `SELECT dataset_id, COUNT(*)::int AS n
-       FROM w4h.tables
-       WHERE dataset_id = ANY($1::text[])
-       GROUP BY dataset_id`,
-      [rows.map((r) => r.id)]
+  const tableMap = {};
+  const ids = [...new Set(rows.map((row) => row.id).filter(Boolean))];
+  if (ids.length) {
+    const registry = await query(
+      `SELECT dataset_id, schema_name, status
+       FROM w4h.dataset_registry
+       WHERE dataset_id = ANY($1::text[])`,
+      [ids]
     );
-    tableMap = Object.fromEntries((tablesRes.rows || []).map((r) => [r.dataset_id, r.n]));
-  } catch {
-    // Signal-table catalog not provisioned yet.
+    for (const row of registry.rows) {
+      if (row.status !== 'active') {
+        tableMap[row.dataset_id] = 0;
+        continue;
+      }
+      try {
+        const counts = await withDatasetTransaction(row.dataset_id, async (client) => {
+          return client.query(`SELECT COUNT(*)::int AS n FROM dataset_tables`);
+        });
+        tableMap[row.dataset_id] = counts.rows[0].n;
+      } catch (error) {
+        if (
+          !(error instanceof DatasetUnavailableError)
+        ) {
+          throw error;
+        }
+        tableMap[row.dataset_id] = 0;
+      }
+    }
   }
   return rows.map((r) => ({
     ...r,
@@ -181,6 +260,120 @@ async function attachTableCounts(rows) {
     projects: Array.isArray(r.projects) ? r.projects : [],
     table_count: tableMap[r.id] ?? 0,
   }));
+}
+
+async function ingestDatasetCsv(req, res) {
+  const started = Date.now();
+  const datasetId = String(req.params.id || '').trim();
+  let teamId = null;
+  let signalType = null;
+  try {
+    const subjectsFile = req.files?.subjects_csv?.[0];
+    const signalFile = req.files?.signal_csv?.[0];
+    if (!subjectsFile || !signalFile) {
+      throw new IngestionError('subjects_csv and signal_csv are required');
+    }
+
+    let mapping;
+    try {
+      mapping = JSON.parse(String(req.body?.mapping || ''));
+    } catch {
+      throw new IngestionError('mapping must be valid JSON');
+    }
+    signalType = mapping?.signal?.signal_type || null;
+
+    const catalog = await query(
+      `SELECT id, team_id
+       FROM w4h.datasets
+       WHERE id = $1`,
+      [datasetId]
+    );
+    if (!catalog.rowCount) {
+      return res.status(404).json({ error: 'Dataset not found' });
+    }
+    teamId = catalog.rows[0].team_id;
+    if (!teamId) {
+      return res.status(409).json({ error: 'Dataset is not assigned to a team' });
+    }
+    if (!(await isTeamAdminOnTeam(req.user.id, teamId, req.user.role))) {
+      return res.status(403).json({ error: 'Unauthorized for this dataset team' });
+    }
+
+    const result = await ingestDatasetFromCsv({
+      teamId,
+      catalogId: datasetId,
+      subjectsBuffer: subjectsFile.buffer,
+      signalBuffer: signalFile.buffer,
+      mapping,
+    });
+    const durationMs = Math.max(0, Date.now() - started);
+    await writeAuditLog(req, {
+      action: 'dataset.ingest',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: {
+        team_id: String(teamId),
+        signal_type: signalType,
+        table: result.table?.name || result.table?.table_name,
+        subjects_loaded: result.subjects_loaded,
+        signal_rows_loaded: result.signal_rows_loaded,
+        status: result.status,
+        duration_ms: durationMs,
+      },
+    }).catch((error) => {
+      console.warn('Dataset ingest audit write failed:', error.message);
+    });
+    recordUsageEventSafe({
+      userId: req.user.id ?? null,
+      eventType: 'dataset.import',
+      durationMs,
+      metadata: {
+        dataset_id: datasetId,
+        team_id: String(teamId),
+        signal_type: signalType,
+        subjects_loaded: result.subjects_loaded,
+        row_count: result.signal_rows_loaded,
+        status: result.status,
+      },
+    });
+    return res.json(result);
+  } catch (error) {
+    const durationMs = Math.max(0, Date.now() - started);
+    console.error('ingestDatasetCsv:', error);
+    await writeAuditLog(req, {
+      action: 'dataset.ingest_failed',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: {
+        team_id: teamId == null ? null : String(teamId),
+        signal_type: signalType,
+        status: 'failed',
+        error_code: error.code || 'INGESTION_FAILED',
+        duration_ms: durationMs,
+      },
+    }).catch((auditError) => {
+      console.warn('Dataset ingest failure audit write failed:', auditError.message);
+    });
+    recordUsageEventSafe({
+      userId: req.user?.id ?? null,
+      eventType: 'dataset.import',
+      durationMs,
+      metadata: {
+        dataset_id: datasetId,
+        team_id: teamId == null ? null : String(teamId),
+        signal_type: signalType,
+        status: 'failed',
+        error_code: error.code || 'INGESTION_FAILED',
+      },
+    });
+    if (error instanceof IngestionError) {
+      return res.status(error.statusCode).json({ error: error.message, code: error.code });
+    }
+    if (String(error.code || '').startsWith('DATASET_')) {
+      return res.status(409).json({ error: error.message, code: error.code });
+    }
+    return res.status(500).json({ error: 'Dataset ingestion failed' });
+  }
 }
 
 async function listDatasetsCatalog(req, res) {
@@ -339,6 +532,17 @@ async function createDataset(req, res) {
     const dateStart = req.body?.date_start || null;
     const dateEnd = req.body?.date_end || null;
     const irbReference = req.body?.irb_reference == null ? null : String(req.body.irb_reference).trim();
+    let schemaDef = req.body?.schema_def ?? {};
+    if (typeof schemaDef === 'string') {
+      try {
+        schemaDef = JSON.parse(schemaDef);
+      } catch {
+        return res.status(400).json({ error: 'schema_def must be valid JSON' });
+      }
+    }
+    if (!schemaDef || typeof schemaDef !== 'object' || Array.isArray(schemaDef)) {
+      return res.status(400).json({ error: 'schema_def must be a JSON object' });
+    }
     const discoverable = req.body?.discoverable === false || req.body?.discoverable === 'false'
       ? false
       : true;
@@ -350,8 +554,8 @@ async function createDataset(req, res) {
     const inserted = await query(
       `INSERT INTO w4h.datasets
          (id, name, description, team_id, device_type, sampling_rate, subject_count,
-          date_start, date_end, irb_reference, created_by, discoverable)
-       VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, $10, $11, $12)
+          date_start, date_end, irb_reference, created_by, discoverable, schema_def, ingest_status)
+       VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, 'created')
        RETURNING id`,
       [
         id,
@@ -366,14 +570,37 @@ async function createDataset(req, res) {
         irbReference || null,
         req.user.id ?? null,
         discoverable,
+        JSON.stringify(schemaDef),
       ]
     );
+    const fresh = inserted.rows[0].id;
 
-    const fresh = await query(
-      `${CATALOG_SELECT} WHERE d.id = $1`,
-      [inserted.rows[0].id]
-    );
-    res.status(201).json(fresh.rows[0]);
+    let datasetSchema;
+    try {
+      datasetSchema = await provisionDatasetSchema(fresh, teamId);
+    } catch (provisioningError) {
+      console.error('createDataset schema provisioning:', provisioningError);
+      const created = await query(`${CATALOG_SELECT} WHERE d.id = $1`, [fresh]);
+      return res.status(503).json({
+        error: 'Dataset created, but its schema could not be provisioned',
+        ...(created.rows[0] || { id: fresh }),
+        schema_def: schemaDef,
+        dataset_status: 'created',
+        table_count: 0,
+        tables: [],
+        dataset_schema: { status: 'failed' },
+      });
+    }
+
+    const created = await query(`${CATALOG_SELECT} WHERE d.id = $1`, [fresh]);
+    res.status(201).json({
+      ...created.rows[0],
+      schema_def: schemaDef,
+      dataset_status: 'created',
+      table_count: 0,
+      tables: [],
+      schema_name: datasetSchema.schemaName,
+    });
   } catch (error) {
     if (error.code === '23505') {
       return res.status(409).json({ error: 'Dataset id already exists' });
@@ -931,16 +1158,9 @@ async function getDataset(req, res) {
       }
       let tables = [];
       try {
-        const tablesRes = await query(
-          `SELECT name, metabase_url, source_name, source_url
-           FROM w4h.tables
-           WHERE dataset_id = $1
-           ORDER BY name ASC`,
-          [id]
-        );
-        tables = tablesRes.rows;
-      } catch {
-        tables = [];
+        tables = await getDatasetTables(id);
+      } catch (error) {
+        if (!(error instanceof DatasetUnavailableError)) throw error;
       }
       const [enriched] = await attachTableCounts([{ ...row, tables }]);
       return res.json(enriched);
@@ -1243,4 +1463,5 @@ async function revokeDatasetShare(req, res) {
   }
 }
 
+export { attachTableCounts, createDataset, getDatasetFiles, getDatasetTables, ingestDatasetCsv };
 export default router;
