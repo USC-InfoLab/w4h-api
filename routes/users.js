@@ -8,6 +8,8 @@ import jwt from 'jsonwebtoken';
 import { validatePassword } from '../lib/utils/password-validator.js';
 import { isMailerConfigured, sendMail } from '../lib/mailer.js';
 import { recordUsageEventSafe } from '../lib/utils/usage.js';
+import { writeAuditLogSafe } from '../lib/utils/audit.js';
+import { encryptUserApiKey, decryptUserApiKey } from '../lib/utils/apiKeyCrypto.js';
 import {
   USER_ROLES,
   USER_ROLES_NAMES,
@@ -33,6 +35,7 @@ router.post('/invite/accept', acceptInvite);
 router.post('/invite/resend', auth.authenticate, auth.requireTeamAdmin, resendInvite);
 router.post('/invite/revoke', auth.authenticate, auth.requireTeamAdmin, revokeInvite);
 router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
+router.post('/me/api-key/reveal', auth.authenticate, revealMyApiKey);
 router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
 router.delete('/me/api-key', auth.authenticate, revokeMyApiKey);
 router.delete('/user/:email/api-key', auth.authenticate, auth.requirePlatformAdmin, revokeUserApiKeyByEmail);
@@ -387,6 +390,7 @@ async function discontinueUser(req, res) {
        SET status = 'discontinued',
            api_key_hash = NULL,
            api_key_prefix = NULL,
+           api_key_encrypted = NULL,
            api_key_created_at = NULL,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`,
@@ -462,7 +466,9 @@ async function resumeUser(req, res) {
 async function getMyApiKeyMeta(req, res) {
   try {
     const result = await query(
-      `SELECT api_key_prefix, api_key_created_at, api_key_last_used_at, (api_key_hash IS NOT NULL) AS api_key_active
+      `SELECT api_key_prefix, api_key_created_at, api_key_last_used_at,
+              (api_key_hash IS NOT NULL) AS api_key_active,
+              (api_key_encrypted IS NOT NULL AND api_key_encrypted <> '') AS revealable
        FROM ${SCHEMA}.${TABLE} WHERE id = $1`,
       [req.user.id]
     );
@@ -472,6 +478,7 @@ async function getMyApiKeyMeta(req, res) {
     const row = result.rows[0];
     res.json({
       active: row.api_key_active,
+      revealable: !!row.revealable,
       api_key_prefix: row.api_key_prefix,
       api_key_created_at: row.api_key_created_at,
       api_key_last_used_at: row.api_key_last_used_at
@@ -482,21 +489,118 @@ async function getMyApiKeyMeta(req, res) {
   }
 }
 
-async function rotateMyApiKey(req, res) {
+async function verifyCurrentUserPassword(userId, password) {
+  if (!password || typeof password !== 'string') {
+    return { ok: false, status: 400, error: 'Password is required' };
+  }
+  const result = await query(
+    `SELECT password FROM ${SCHEMA}.${TABLE} WHERE id = $1`,
+    [userId]
+  );
+  if (!result.rowCount) {
+    return { ok: false, status: 404, error: 'User not found' };
+  }
+  const hash = result.rows[0].password;
+  if (!hash || !bcrypt.compareSync(password, hash)) {
+    return { ok: false, status: 401, error: 'Incorrect password' };
+  }
+  return { ok: true };
+}
+
+async function revealMyApiKey(req, res) {
   try {
-    const raw = `${auth.USER_API_KEY_PREFIX}${crypto.randomBytes(32).toString('base64url')}`;
-    const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
-    const prefix = raw.slice(0, 24);
+    const verified = await verifyCurrentUserPassword(req.user.id, req.body?.password);
+    if (!verified.ok) {
+      writeAuditLogSafe(req, {
+        action: 'user.api_key.reveal_denied',
+        resourceType: 'user',
+        resourceId: req.user.id,
+        details: { reason: verified.error }
+      });
+      return res.status(verified.status).json({ error: verified.error });
+    }
+
     const result = await query(
-      `UPDATE ${SCHEMA}.${TABLE}
-       SET api_key_hash = $1, api_key_prefix = $2, api_key_created_at = NOW()
-       WHERE id = $3
-       RETURNING api_key_created_at`,
-      [tokenHash, prefix, req.user.id]
+      `SELECT api_key_encrypted, api_key_prefix, api_key_created_at,
+              (api_key_hash IS NOT NULL) AS api_key_active
+       FROM ${SCHEMA}.${TABLE} WHERE id = $1`,
+      [req.user.id]
     );
     if (!result.rowCount) {
       return res.status(404).json({ error: 'User not found' });
     }
+    const row = result.rows[0];
+    if (!row.api_key_active) {
+      return res.status(404).json({ error: 'No API credential on file. Generate one first.' });
+    }
+
+    const plaintext = decryptUserApiKey(row.api_key_encrypted);
+    if (!plaintext) {
+      writeAuditLogSafe(req, {
+        action: 'user.api_key.reveal_unavailable',
+        resourceType: 'user',
+        resourceId: req.user.id,
+        details: { reason: 'not_encrypted' }
+      });
+      return res.status(409).json({
+        error:
+          'This credential was created before password-protected reveal was enabled. Rotate it to create a new revealable credential.'
+      });
+    }
+
+    writeAuditLogSafe(req, {
+      action: 'user.api_key.reveal',
+      resourceType: 'user',
+      resourceId: req.user.id,
+      details: { api_key_prefix: row.api_key_prefix || null }
+    });
+
+    res.json({
+      api_key: plaintext,
+      api_key_prefix: row.api_key_prefix,
+      api_key_created_at: row.api_key_created_at
+    });
+  } catch (error) {
+    console.error('revealMyApiKey:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+async function rotateMyApiKey(req, res) {
+  try {
+    const verified = await verifyCurrentUserPassword(req.user.id, req.body?.password);
+    if (!verified.ok) {
+      writeAuditLogSafe(req, {
+        action: 'user.api_key.rotate_denied',
+        resourceType: 'user',
+        resourceId: req.user.id,
+        details: { reason: verified.error }
+      });
+      return res.status(verified.status).json({ error: verified.error });
+    }
+
+    const raw = `${auth.USER_API_KEY_PREFIX}${crypto.randomBytes(32).toString('base64url')}`;
+    const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
+    const prefix = raw.slice(0, 24);
+    const wrapped = encryptUserApiKey(raw);
+    const result = await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+       SET api_key_hash = $1, api_key_prefix = $2, api_key_encrypted = $3, api_key_created_at = NOW()
+       WHERE id = $4
+       RETURNING api_key_created_at`,
+      [tokenHash, prefix, wrapped, req.user.id]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    writeAuditLogSafe(req, {
+      action: 'user.api_key.rotate',
+      resourceType: 'user',
+      resourceId: req.user.id,
+      details: { api_key_prefix: prefix }
+    });
+
     res.status(201).json({
       api_key: raw,
       api_key_prefix: prefix,
@@ -512,10 +616,15 @@ async function revokeMyApiKey(req, res) {
   try {
     await query(
       `UPDATE ${SCHEMA}.${TABLE}
-       SET api_key_hash = NULL, api_key_prefix = NULL, api_key_created_at = NULL
+       SET api_key_hash = NULL, api_key_prefix = NULL, api_key_encrypted = NULL, api_key_created_at = NULL
        WHERE id = $1`,
       [req.user.id]
     );
+    writeAuditLogSafe(req, {
+      action: 'user.api_key.revoke',
+      resourceType: 'user',
+      resourceId: req.user.id
+    });
     res.json({ success: true });
   } catch (error) {
     console.error('revokeMyApiKey:', error);
@@ -535,7 +644,7 @@ async function revokeUserApiKeyByEmail(req, res) {
     }
     const result = await query(
       `UPDATE ${SCHEMA}.${TABLE}
-       SET api_key_hash = NULL, api_key_prefix = NULL, api_key_created_at = NULL
+       SET api_key_hash = NULL, api_key_prefix = NULL, api_key_encrypted = NULL, api_key_created_at = NULL
        WHERE email = $1
        RETURNING id`,
       [email]

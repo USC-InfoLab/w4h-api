@@ -10,7 +10,8 @@
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
-    "test": "echo \"Error: no test specified\" && exit 0"
+    "test": "echo \"Error: no test specified\" && exit 0",
+    "index:api": "node scripts/generate-api-index.mjs"
   },
   "license": "© USC IMSC 2026-",
   "dependencies": {

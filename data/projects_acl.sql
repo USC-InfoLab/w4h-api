@@ -65,6 +65,26 @@ CREATE TABLE IF NOT EXISTS w4h.project_notebooks (
 
 CREATE INDEX IF NOT EXISTS idx_project_notebooks_project_id ON w4h.project_notebooks(project_id);
 
+CREATE TABLE IF NOT EXISTS w4h.project_pages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  slug text NOT NULL,
+  title text NOT NULL,
+  doc_type text NOT NULL DEFAULT 'guide',
+  sort_order integer NOT NULL DEFAULT 0,
+  md text NOT NULL DEFAULT '',
+  html text NOT NULL DEFAULT '',
+  toc jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  updated_by text,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (project_id, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_pages_project_id
+  ON w4h.project_pages(project_id, sort_order, title);
+
 CREATE TABLE IF NOT EXISTS w4h.project_docs (
   project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
   doc_slug text NOT NULL REFERENCES w4h.docs(slug) ON DELETE CASCADE,
@@ -138,6 +158,21 @@ ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_hash text;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_prefix text;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_created_at timestamp with time zone;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_last_used_at timestamp with time zone;
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_encrypted text;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key_hash ON w4h.users(api_key_hash) WHERE api_key_hash IS NOT NULL;
+
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS summary jsonb;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS summary_updated_at timestamp with time zone;
+
+CREATE TABLE IF NOT EXISTS w4h.tables (
+  dataset_id text NOT NULL REFERENCES w4h.datasets(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  metabase_url text,
+  source_name text,
+  source_url text,
+  PRIMARY KEY (dataset_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tables_dataset_id ON w4h.tables(dataset_id);
 
 COMMIT;

@@ -979,7 +979,7 @@ async function getUsage(req, res) {
 
 /**
  * GET /config/audit-log — HIPAA audit ledger (H-11 / ADR-011).
- * Super admin: unscoped. Project admin: pass project_id (own study only).
+ * Super admin: unscoped. Admin: pass project_id (own study only).
  * Query: days|from&to, action, resource_type, user_id, q, project_id, page, limit, format=json|csv
  */
 async function canReadProjectAudit(user, projectRef) {
@@ -1132,7 +1132,7 @@ async function getAuditLog(req, res) {
       : '';
     const actorRoleSelect = scopedProject
       ? `CASE
-           WHEN pm.role = 'owner' THEN 'Project admin'
+           WHEN pm.role = 'owner' THEN 'Admin'
            WHEN pm.role IN ('editor', 'viewer', 'admin') THEN 'User'
            WHEN u.role IN ('super_admin', 'admin') THEN 'Super admin'
            ELSE NULL

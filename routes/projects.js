@@ -7,6 +7,7 @@ import { query } from '../db.js';
 import { isSuperAdmin, isTeamAdmin, isTeamAdminOnTeam } from '../lib/utils/user.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
+import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
 
 const router = express.Router();
 
@@ -44,6 +45,11 @@ router.put('/:id/organizations', authenticateJwtOrApiKey, replaceProjectOrganiza
 router.put('/:id/datasets', authenticateJwtOrApiKey, replaceProjectDatasets);
 router.put('/:id/notebooks', authenticateJwtOrApiKey, replaceProjectNotebooks);
 router.put('/:id/docs', authenticateJwtOrApiKey, replaceProjectDocs);
+router.get('/:id/pages', authenticateJwtOrApiKey, listProjectPages);
+router.post('/:id/pages', authenticateJwtOrApiKey, createProjectPage);
+router.get('/:id/pages/:slug', authenticateJwtOrApiKey, getProjectPage);
+router.put('/:id/pages/:slug', authenticateJwtOrApiKey, updateProjectPage);
+router.delete('/:id/pages/:slug', authenticateJwtOrApiKey, deleteProjectPage);
 router.post('/:id/db-token', authenticateJwtOrApiKey, issueProjectDbToken);
 
 const PROJECT_MEMBER_ROLES = new Set(['owner', 'editor', 'viewer']);
@@ -115,6 +121,180 @@ async function canManageProject(projectId, user) {
   }
   const member = await getMembership(projectId, user.id);
   return !!member && member.role === 'owner';
+}
+
+/** Doc-11 (product): anyone with access to the project can create/edit/delete its pages. */
+async function canEditProjectPages(projectId, user) {
+  return canReadProject(projectId, user);
+}
+
+function slugifyPageTitle(input) {
+  return String(input || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    .slice(0, 80);
+}
+
+async function uniquePageSlug(projectId, title, excludeSlug = null) {
+  const base = slugifyPageTitle(title) || `page-${Date.now()}`;
+  let n = 0;
+  while (n < 50) {
+    const trySlug = n === 0 ? base : `${base}-${n}`;
+    const exists = await query(
+      `SELECT 1 FROM w4h.project_pages
+       WHERE project_id = $1::uuid AND slug = $2
+         AND ($3::text IS NULL OR slug <> $3)`,
+      [projectId, trySlug, excludeSlug]
+    );
+    if (!exists.rowCount) return trySlug;
+    n += 1;
+  }
+  return `${base}-${crypto.randomBytes(3).toString('hex')}`;
+}
+
+function normalizePageDocType(value) {
+  const t = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/s$/, '');
+  if (['guide', 'workflow', 'reference'].includes(t)) return t;
+  return 'guide';
+}
+
+function mapPageRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    project_id: row.project_id,
+    slug: row.slug,
+    title: row.title,
+    doc_type: row.doc_type,
+    sort_order: row.sort_order,
+    md: row.md,
+    html: row.html,
+    toc: row.toc,
+    created_by: row.created_by,
+    updated_by: row.updated_by,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+/**
+ * Attach cheap dataset-table metadata and populate a missing cached summary.
+ *
+ * Uses PostgreSQL catalog estimates (not COUNT(*)) so opening a project never scans
+ * large wearable tables. A zero-observation summary is retried on later loads so a
+ * dataset registered before ingestion can update automatically after data arrives.
+ */
+async function hydrateDatasetSummaries(rows) {
+  if (!Array.isArray(rows) || !rows.length) return rows || [];
+
+  const ids = rows.map((r) => String(r.dataset_id || r.id || '')).filter(Boolean);
+  if (!ids.length) return rows;
+
+  let metadata = [];
+  try {
+    const result = await query(
+      `SELECT t.dataset_id,
+              COUNT(*)::int AS table_count,
+              COUNT(c.oid)::int AS physical_table_count,
+              COALESCE(
+                ROUND(SUM(GREATEST(COALESCE(s.n_live_tup, c.reltuples, 0), 0)))::bigint,
+                0
+              ) AS estimated_observations
+       FROM w4h.tables t
+       LEFT JOIN pg_class c
+         ON c.oid = to_regclass(
+              CASE
+                WHEN position('.' IN t.name) > 0 THEN t.name
+                ELSE 'public.' || t.name
+              END
+            )
+       LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
+       WHERE t.dataset_id = ANY($1::text[])
+       GROUP BY t.dataset_id`,
+      [ids]
+    );
+    metadata = result.rows || [];
+  } catch {
+    // Older installations may not have the registered-table catalog yet.
+  }
+
+  const byDataset = new Map(metadata.map((m) => [String(m.dataset_id), m]));
+
+  return Promise.all(
+    rows.map(async (row) => {
+      const datasetId = String(row.dataset_id || row.id || '');
+      const meta = byDataset.get(datasetId);
+      const tableCount = Number(meta?.table_count || 0);
+      const physicalTableCount = Number(meta?.physical_table_count || 0);
+      const estimatedObservations = Number(meta?.estimated_observations || 0);
+      const currentSummary =
+        row.summary && typeof row.summary === 'object' && !Array.isArray(row.summary)
+          ? row.summary
+          : {};
+
+      const statsMissing =
+        !row.summary ||
+        Object.keys(currentSummary).length === 0 ||
+        currentSummary.observations == null ||
+        Number(currentSummary.observations) === 0;
+
+      const generatedSummary = {
+        ...currentSummary,
+        table_count: tableCount,
+        physical_table_count: physicalTableCount,
+        ...(row.device_type && !currentSummary.modality
+          ? { modality: row.device_type }
+          : {}),
+        ...(row.subject_count != null && currentSummary.participants == null
+          ? { participants: Number(row.subject_count) }
+          : {}),
+        ...(row.date_start && !currentSummary.date_start
+          ? { date_start: row.date_start }
+          : {}),
+        ...(row.date_end && !currentSummary.date_end
+          ? { date_end: row.date_end }
+          : {}),
+        ...(tableCount > 0 && statsMissing
+          ? {
+              observations: estimatedObservations,
+              observations_approx: true,
+              observations_source: 'postgres_catalog_estimate'
+            }
+          : {})
+      };
+
+      let updatedAt = row.summary_updated_at || null;
+      if (tableCount > 0 && statsMissing) {
+        const updated = await query(
+          `UPDATE w4h.datasets
+           SET summary = $2::jsonb, summary_updated_at = NOW()
+           WHERE id = $1
+             AND (
+               summary IS NULL
+               OR summary = '{}'::jsonb
+               OR (summary->>'observations') IS NULL
+               OR NULLIF(summary->>'observations', '')::numeric = 0
+             )
+           RETURNING summary_updated_at`,
+          [datasetId, JSON.stringify(generatedSummary)]
+        );
+        updatedAt = updated.rows[0]?.summary_updated_at || updatedAt;
+      }
+
+      return {
+        ...row,
+        summary: generatedSummary,
+        summary_updated_at: updatedAt,
+        table_count: tableCount,
+        physical_table_count: physicalTableCount
+      };
+    })
+  );
 }
 
 /** Team ids where the user is an effective Team admin (null = Super admin → all teams). */
@@ -444,13 +624,17 @@ async function getProjectOverview(req, res) {
     const project = projectRes.rows[0];
     const pc = await resolveDatasetProjectLinkColumn();
     const canManage = !req.authViaProjectDbToken && (await canManageProject(projectId, req.user));
+    const canEditPages =
+      !req.authViaProjectDbToken && (await canEditProjectPages(projectId, req.user));
 
-    const [membersRes, datasetsRes, notebooksRes, docsRes, orgsRes, derivedOrgsRes, aclRes, linkableDatasets, eligibleMembers] =
+    const [membersRes, datasetsRes, notebooksRes, pagesRes, orgsRes, derivedOrgsRes, aclRes, linkableDatasets, eligibleMembers] =
       await Promise.all([
         Promise.resolve({ rows: await listMembers(projectId) }),
         query(
           `SELECT pd.dataset_id, pd.access_type, pd.approved_at,
-                  d.name, d.description, d.${pc} AS dataset_project_id, d.team_id AS dataset_team_id
+                  d.name, d.description, d.${pc} AS dataset_project_id, d.team_id AS dataset_team_id,
+                  d.device_type, d.subject_count, d.date_start, d.date_end,
+                  d.summary, d.summary_updated_at
            FROM w4h.project_datasets pd
            JOIN w4h.datasets d ON d.id = pd.dataset_id
            WHERE pd.project_id = $1::uuid
@@ -466,11 +650,10 @@ async function getProjectOverview(req, res) {
           [projectId]
         ),
         query(
-          `SELECT d.slug, d.title, d.updated_at, pd.linked_at
-           FROM w4h.project_docs pd
-           JOIN w4h.docs d ON d.slug = pd.doc_slug
-           WHERE pd.project_id = $1::uuid
-           ORDER BY d.updated_at DESC, pd.linked_at DESC`,
+          `SELECT id, project_id, slug, title, doc_type, sort_order, updated_by, created_at, updated_at
+           FROM w4h.project_pages
+           WHERE project_id = $1::uuid
+           ORDER BY sort_order ASC, title ASC`,
           [projectId]
         ),
         query(
@@ -500,7 +683,7 @@ async function getProjectOverview(req, res) {
         listEligibleTeamMembers(project.team_id)
       ]);
 
-    // A project with no roster still has its Project admins on the owning team.
+    // A project with no roster still has its Admins on the owning team.
     if (!membersRes.rows.length && project.team_id) {
       for (const m of eligibleMembers) {
         if (m.team_role !== 'team_admin') continue;
@@ -527,8 +710,9 @@ async function getProjectOverview(req, res) {
             sort_order: idx
           }));
 
+    const hydratedDatasetRows = await hydrateDatasetSummaries(datasetsRes.rows);
     const linkableById = new Map(linkableDatasets.map((d) => [String(d.id), d]));
-    const datasets = datasetsRes.rows.map((row) => {
+    const datasets = hydratedDatasetRows.map((row) => {
       const meta = linkableById.get(String(row.dataset_id));
       return {
         ...row,
@@ -545,11 +729,13 @@ async function getProjectOverview(req, res) {
       linkable_datasets: canManage ? linkableDatasets : [],
       eligible_members: canManage ? eligibleMembers : [],
       notebooks: notebooksRes.rows,
-      docs: docsRes.rows,
+      pages: pagesRes.rows,
+      docs: [],
       organizations,
       acl_rules: aclRes.rows,
       capabilities: {
         can_manage: canManage,
+        can_edit_pages: canEditPages,
         can_issue_db_token: canIssueDbToken,
         auth_via_project_token: Boolean(req.authViaProjectDbToken)
       }
@@ -874,7 +1060,7 @@ async function updateProjectMemberRole(req, res) {
       return res.status(404).json({ error: 'Member not found' });
     }
     if (current.rows[0].role === 'owner' && role !== 'owner' && (await ownerCount(projectId)) <= 1) {
-      return res.status(400).json({ error: 'Project must have at least one Project admin' });
+      return res.status(400).json({ error: 'Project must have at least one Admin' });
     }
 
     await query(
@@ -915,11 +1101,11 @@ async function removeProjectMember(req, res) {
     }
     if (Number(userId) === Number(req.user.id)) {
       return res.status(400).json({
-        error: 'You cannot remove yourself from the project. Ask another Project admin, or a Super admin, to remove you.'
+        error: 'You cannot remove yourself from the project. Ask another Admin, or a Super admin, to remove you.'
       });
     }
     if (current.rows[0].role === 'owner' && (await ownerCount(projectId)) <= 1) {
-      return res.status(400).json({ error: 'Project must have at least one Project admin' });
+      return res.status(400).json({ error: 'Project must have at least one Admin' });
     }
 
     await query(
@@ -1154,6 +1340,200 @@ async function replaceProjectNotebooks(req, res) {
     res.json(fresh.rows);
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to update project notebooks' });
+  }
+}
+
+async function listProjectPages(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canReadProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const result = await query(
+      `SELECT id, project_id, slug, title, doc_type, sort_order, updated_by, created_at, updated_at
+       FROM w4h.project_pages
+       WHERE project_id = $1::uuid
+       ORDER BY sort_order ASC, title ASC`,
+      [projectId]
+    );
+    res.json(result.rows.map(mapPageRow));
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to list project pages' });
+  }
+}
+
+async function getProjectPage(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canReadProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const slug = String(req.params.slug || '').trim();
+    const result = await query(
+      `SELECT *
+       FROM w4h.project_pages
+       WHERE project_id = $1::uuid AND slug = $2`,
+      [projectId, slug]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: 'Page not found' });
+    res.json(mapPageRow(result.rows[0]));
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load project page' });
+  }
+}
+
+async function createProjectPage(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canEditProjectPages(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const title = String(req.body?.title || '').trim() || 'Untitled document';
+    const docType = normalizePageDocType(req.body?.doc_type);
+    const slug = await uniquePageSlug(projectId, req.body?.slug || title);
+    const mdRaw = req.body?.md != null ? String(req.body.md) : `# ${title}\n\n`;
+    const md = stripLeadingTitleHeading(mdRaw, title);
+    const { html, toc } = renderDoc(md);
+    const sortOrder = Number.isFinite(Number(req.body?.sort_order))
+      ? Number(req.body.sort_order)
+      : 0;
+
+    const inserted = await query(
+      `INSERT INTO w4h.project_pages (
+         project_id, slug, title, doc_type, sort_order, md, html, toc, created_by, updated_by
+       )
+       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)
+       RETURNING *`,
+      [
+        projectId,
+        slug,
+        title,
+        docType,
+        sortOrder,
+        md,
+        html,
+        JSON.stringify(toc || []),
+        req.user.id,
+        req.user.email || null
+      ]
+    );
+
+    auditProjectAction(req, 'project.page.create', projectId, {
+      resourceType: 'doc',
+      resourceId: slug,
+      details: { slug, title, doc_type: docType }
+    });
+
+    res.status(201).json(mapPageRow(inserted.rows[0]));
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to create project page' });
+  }
+}
+
+async function updateProjectPage(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canEditProjectPages(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const currentSlug = String(req.params.slug || '').trim();
+    const existing = await query(
+      `SELECT * FROM w4h.project_pages WHERE project_id = $1::uuid AND slug = $2`,
+      [projectId, currentSlug]
+    );
+    if (!existing.rowCount) return res.status(404).json({ error: 'Page not found' });
+
+    const row = existing.rows[0];
+    const title =
+      req.body?.title != null ? String(req.body.title).trim() || row.title : row.title;
+    const docType =
+      req.body?.doc_type != null ? normalizePageDocType(req.body.doc_type) : row.doc_type;
+    const sortOrder =
+      req.body?.sort_order != null && Number.isFinite(Number(req.body.sort_order))
+        ? Number(req.body.sort_order)
+        : row.sort_order;
+    const mdRaw = req.body?.md != null ? String(req.body.md) : row.md;
+    const md = stripLeadingTitleHeading(mdRaw, title);
+    const { html, toc } = renderDoc(md);
+
+    let nextSlug = currentSlug;
+    if (req.body?.slug != null && String(req.body.slug).trim()) {
+      nextSlug = await uniquePageSlug(projectId, String(req.body.slug).trim(), currentSlug);
+    }
+
+    const updated = await query(
+      `UPDATE w4h.project_pages
+       SET slug = $3,
+           title = $4,
+           doc_type = $5,
+           sort_order = $6,
+           md = $7,
+           html = $8,
+           toc = $9::jsonb,
+           updated_by = $10,
+           updated_at = NOW()
+       WHERE project_id = $1::uuid AND slug = $2
+       RETURNING *`,
+      [
+        projectId,
+        currentSlug,
+        nextSlug,
+        title,
+        docType,
+        sortOrder,
+        md,
+        html,
+        JSON.stringify(toc || []),
+        req.user.email || null
+      ]
+    );
+
+    auditProjectAction(req, 'project.page.update', projectId, {
+      resourceType: 'doc',
+      resourceId: nextSlug,
+      details: { slug: nextSlug, title, doc_type: docType }
+    });
+
+    res.json(mapPageRow(updated.rows[0]));
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to update project page' });
+  }
+}
+
+async function deleteProjectPage(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canEditProjectPages(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const slug = String(req.params.slug || '').trim();
+    const deleted = await query(
+      `DELETE FROM w4h.project_pages
+       WHERE project_id = $1::uuid AND slug = $2
+       RETURNING slug, title`,
+      [projectId, slug]
+    );
+    if (!deleted.rowCount) return res.status(404).json({ error: 'Page not found' });
+
+    auditProjectAction(req, 'project.page.delete', projectId, {
+      resourceType: 'doc',
+      resourceId: slug,
+      details: { slug, title: deleted.rows[0].title }
+    });
+
+    res.json({ success: true, slug });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to delete project page' });
   }
 }
 

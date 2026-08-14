@@ -26,6 +26,8 @@ ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_hash text;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_prefix text;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_created_at timestamp with time zone;
 ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_last_used_at timestamp with time zone;
+-- Encrypted copy for password step-up reveal (hash remains auth source of truth).
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS api_key_encrypted text;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key_hash ON w4h.users(api_key_hash) WHERE api_key_hash IS NOT NULL;
 
 -- User lifecycle: invited → active → discontinued (ADR-010)
@@ -89,6 +91,18 @@ CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON w4h.datasets(project_id);
 
 ALTER TABLE IF EXISTS w4h.datasets ADD COLUMN IF NOT EXISTS project_id text COLLATE pg_catalog."default";
 ALTER TABLE IF EXISTS w4h.datasets DROP COLUMN IF EXISTS hidden;
+
+-- Registered signal tables for a catalog dataset (current API registry; ADR-003 target is per-trial dataset_tables)
+CREATE TABLE IF NOT EXISTS w4h.tables (
+  dataset_id text NOT NULL REFERENCES w4h.datasets(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  metabase_url text,
+  source_name text,
+  source_url text,
+  PRIMARY KEY (dataset_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tables_dataset_id ON w4h.tables(dataset_id);
 
 -- ---------------------------------------------------------------------------
 -- User Projects (Legacy compatibility mapping)
@@ -209,7 +223,30 @@ CREATE TABLE IF NOT EXISTS w4h.project_notebooks (
 CREATE INDEX IF NOT EXISTS idx_project_notebooks_project_id ON w4h.project_notebooks(project_id);
 
 -- ---------------------------------------------------------------------------
--- Project Docs — link documentation pages to specific projects
+-- Project Pages — private project documentation (MVP Doc-08). Not platform Help.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.project_pages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  slug text NOT NULL,
+  title text NOT NULL,
+  doc_type text NOT NULL DEFAULT 'guide',
+  sort_order integer NOT NULL DEFAULT 0,
+  md text NOT NULL DEFAULT '',
+  html text NOT NULL DEFAULT '',
+  toc jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  updated_by text,
+  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (project_id, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_pages_project_id
+  ON w4h.project_pages(project_id, sort_order, title);
+
+-- ---------------------------------------------------------------------------
+-- Project Docs — LEGACY link of platform Help slugs to projects (Doc-16: retire)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.project_docs (
   project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
@@ -370,6 +407,10 @@ CREATE INDEX IF NOT EXISTS idx_projects_team_id ON w4h.projects(team_id);
 -- Datasets belong to an owning team (nullable for legacy catalog rows)
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_datasets_team_id ON w4h.datasets(team_id);
+
+-- Cached analytical summary for project overview (MVP A-01). Updated after ingest / periodically — not live COUNT(*).
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS summary jsonb;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS summary_updated_at timestamp with time zone;
 
 -- Dataset catalog metadata (D-02)
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS device_type text;
