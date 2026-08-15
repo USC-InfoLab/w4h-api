@@ -10,6 +10,7 @@
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
+    "start:sample": "DB_DATABASE=w4h-sample node app.js",
     "test": "echo \"Error: no test specified\" && exit 0",
     "index:api": "node scripts/generate-api-index.mjs"
   },

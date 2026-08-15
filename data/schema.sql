@@ -92,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON w4h.datasets(project_id);
 ALTER TABLE IF EXISTS w4h.datasets ADD COLUMN IF NOT EXISTS project_id text COLLATE pg_catalog."default";
 ALTER TABLE IF EXISTS w4h.datasets DROP COLUMN IF EXISTS hidden;
 
--- Registered signal tables for a catalog dataset (current API registry; ADR-003 target is per-trial dataset_tables)
+-- Registered signal tables for a catalog dataset (platform SoT for table metadata + GeoMTS role mapping; see ADR-003 / ADR-008)
 CREATE TABLE IF NOT EXISTS w4h.tables (
   dataset_id text NOT NULL REFERENCES w4h.datasets(id) ON DELETE CASCADE,
   name text NOT NULL,

@@ -20,7 +20,8 @@ Open these together via `w4h-repos.code-workspace` when changing cross-cutting b
 - Requirements: sibling `w4h-docs/dev/mvp.md`
 - Roles / ACL: `w4h-docs/dev/ADR-004-acl-roles.md`
 - Dataset linking: `w4h-docs/dev/ADR-012-project-dataset-linking.md`
-- Target table model: `w4h-docs/dev/ADR-003-dataset-table-model.md` (may ahead of current schema)
+- Target table model: `w4h-docs/dev/ADR-003-dataset-table-model.md` — physical tables + **`w4h.tables` mapping** (GeoMTS roles); do not treat in-schema `dataset_tables` as SoT
+- GeoMTS roles: `w4h-docs/dev/ADR-008-geomts-data-model.md` (mapping, not forced `subject_id`/`ts`/`lat`/`lon`)
 
 ## Product model (locked)
 
@@ -35,9 +36,9 @@ Open these together via `w4h-repos.code-workspace` when changing cross-cutting b
 - Stack: Node (ESM), Express, `pg`. Entry: `app.js`. Routes: `routes/`. Helpers: `lib/`, `db.js`.
 - Schema: `data/schema.sql` (and ACL-related SQL under `data/`). Boot/`ensureSchema` should match what routes assume — add DDL when introducing tables (e.g. `w4h.tables`).
 - Env: `.env.example` → `.env`. Unset `DB_DATABASE` to re-run initial setup.
-- Scripts: `npm start`; CLI via `bin/w4h`; `npm run index:api` regenerates [`API_INDEX.md`](./API_INDEX.md).
+- Scripts: `npm start`; CLI via `bin/w4h`; `node bin/w4h seed-docs` creates a separate **`w4h-sample`** database (does not write `DB_DATABASE`). Serve it with `npm run start:sample`. See sibling `w4h-docs/dev/docs-fixtures.md`. `npm run index:api` regenerates [`API_INDEX.md`](./API_INDEX.md).
 - Structural API map: [`API_INDEX.md`](./API_INDEX.md) (generated; mounts, endpoints, lib, schema tables — not feature docs). Re-run when routes or schema DDL change. Do not regenerate on every start.
-- Prefer catalog/`w4h.tables` + `information_schema` over legacy `getQueryMap` paths when adding dataset features.
+- Prefer catalog/`w4h.tables` (mapping SoT) + `information_schema` over legacy `getQueryMap` paths when adding dataset features.
 - Dataset `summary` / `summary_updated_at`: cache estimates; do not block list endpoints with live full-table `COUNT(*)` scans.
 
 ## Cross-repo changes

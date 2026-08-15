@@ -180,4 +180,39 @@ program
 
 ////////////////////////////////////////////////////////////////////////////////////
 
+program
+  .command('seed-docs')
+  .description('Create/refresh the w4h-sample database with synthetic screenshot users')
+  .option('--reset', 'Drop and recreate w4h-sample (does not touch DB_DATABASE)')
+  .action(async (opts) => {
+    try {
+      const { seedDocsFixtures } = await import('../lib/seed-docs-fixtures.js');
+      const result = await seedDocsFixtures({ reset: opts.reset });
+      console.log(success(`Docs sample database ready: ${result.database}`));
+      if (result.workingDatabase && result.workingDatabase !== result.database) {
+        console.log(info(`  Left untouched ${result.workingDatabase} (DB_DATABASE in .env)`));
+      } else if (result.workingDatabase === result.database) {
+        console.log(warning('  Note: .env DB_DATABASE already is the sample DB. Prefer w4h-db in .env and npm run start:sample for captures.'));
+      }
+      console.log(info(`  Super admin  ${result.users.superadmin.email}`));
+      console.log(info(`  Admin        ${result.users.admin.email}`));
+      console.log(info(`  User         ${result.users.user.email}`));
+      console.log(info(`  Team         ${result.team.name} (${result.team.slug})`));
+      console.log(info(`  Project      ${result.project.name} (${result.project.slug})`));
+      if (result.passwordWasDefault) {
+        console.log(warning('  Password     documented default in w4h-docs/dev/docs-fixtures.md'));
+      } else {
+        console.log(warning('  Password     W4H_DOCS_PASSWORD (not printed)'));
+      }
+      console.log(important('\nServe the sample without changing .env:'));
+      console.log(important('  npm run start:sample'));
+      process.exit(0);
+    } catch (err) {
+      console.error(danger(err.message || err));
+      process.exit(1);
+    }
+  });
+
+////////////////////////////////////////////////////////////////////////////////////
+
 program.parse(process.argv);
