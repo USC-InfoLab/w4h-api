@@ -4,7 +4,8 @@ import { join } from 'path';
 const __dirname = url.fileURLToPath(new URL('.', import.meta.url));
 
 import dotenv from 'dotenv'
-dotenv.config({ path: join(__dirname, '.env') });
+import { envFilePath } from './lib/env-path.js';
+dotenv.config({ path: envFilePath() });
 
 if (process.env.W4H_DEBUG) {
   console.log('DB_HOST:', process.env.DB_HOST);
@@ -76,6 +77,14 @@ app.use('/projects', projects);
 app.use('/teams', teams);
 
 app.get('/', async function (req, res) {
-  const { stdout } = await execa`git rev-parse --short HEAD`;
-  res.send(`W4H API ${stdout.trim()}`);
+  const baked = String(process.env.GIT_COMMIT || '').trim();
+  if (baked) {
+    return res.send(`W4H API ${baked}`);
+  }
+  try {
+    const { stdout } = await execa('git', ['rev-parse', '--short', 'HEAD']);
+    res.send(`W4H API ${stdout.trim()}`);
+  } catch {
+    res.send('W4H API unknown');
+  }
 });

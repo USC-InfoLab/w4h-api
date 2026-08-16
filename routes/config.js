@@ -13,6 +13,7 @@ import { initializeDatabase, createInitialAdmin, hasAnyUsers } from '../lib/db-i
 import { getMailerConfig, isMailerConfigured, sendMail } from '../lib/mailer.js';
 import { normalizeClientUsageEvent, recordUsageEventSafe } from '../lib/utils/usage.js';
 import { writeAuditLog, writeAuditLogSafe } from '../lib/utils/audit.js';
+import { envFilePath, envExamplePath } from '../lib/env-path.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,8 +26,8 @@ const isAdmin = user => !!user && isSuperAdmin(user.role);
 
 // Keep `.env` formatting consistent with `.env.example` by rewriting `.env`
 // from the template (preserves ordering + comments).
-const ENV_PATH = path.join(__dirname, '..', '.env');
-const ENV_EXAMPLE_PATH = path.join(__dirname, '..', '.env.example');
+const ENV_PATH = envFilePath();
+const ENV_EXAMPLE_PATH = envExamplePath();
 
 function parseEnvValues(envContent = '') {
   const values = {};
@@ -146,18 +147,19 @@ async function getStatus(req, res) {
   };
 
   if (!envConfigured) {
-    return res.json({ configured: false, details });
+    return res.json({ configured: false, requiresAdminSetup: false, details });
   }
 
   // Env vars are set — verify the DB is actually reachable and schema is initialized
   try {
     const initialized = await tableExists(USERS_TABLE_NAME);
     if (!initialized) {
-      return res.json({ configured: false, details });
+      return res.json({ configured: false, requiresAdminSetup: false, details });
     }
-    return res.json({ configured: true, details });
+    const requiresAdminSetup = !(await hasAnyUsers());
+    return res.json({ configured: true, requiresAdminSetup, details });
   } catch {
-    return res.json({ configured: false, details });
+    return res.json({ configured: false, requiresAdminSetup: false, details });
   }
 }
 
