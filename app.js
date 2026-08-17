@@ -1,7 +1,9 @@
 import path from 'path';
 import * as url from 'url';
 import { join } from 'path';
+import { readFileSync } from 'fs';
 const __dirname = url.fileURLToPath(new URL('.', import.meta.url));
+const pkg = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8'));
 
 import dotenv from 'dotenv'
 import { envFilePath } from './lib/env-path.js';
@@ -59,7 +61,8 @@ app.on('uncaughtException', err => {
 });
 
 app.listen(process.env.PORT, async () => {
-  console.log('App running at: http://localhost:' + process.env.PORT);
+  const releaseLabel = [pkg.releaseName, pkg.version].filter(Boolean).join(' ');
+  console.log(`W4H API ${releaseLabel} running at: http://localhost:${process.env.PORT}`);
   if (isConfigured()) {
     try {
       await ensureSchema();
