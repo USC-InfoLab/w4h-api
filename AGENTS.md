@@ -13,7 +13,8 @@ Agent instructions for the Wearables for Health (W4H) multi-repo workspace.
 | **w4h-datasets** | Sample / synthetic CSV and JSON |
 | **w4h-notebooks** | Index of legacy notebooks; new tools are one repo per contribution |
 | **w4h-sample-fitbit-csv** / **-importer** | ADR-016 Fitbit CSV sample + importer (Contributions catalog) |
-| **w4h-load-json** | First-party JSON ingest notebook (Contributions catalog)
+| **w4h-load-json** | First-party JSON ingest notebook (Contributions catalog) |
+| **w4h-docker** | Docker Compose packaging; `api/Dockerfile` and entrypoint live there |
 
 Open these together via `w4h-repos.code-workspace` when changing cross-cutting behavior.
 
