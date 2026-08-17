@@ -4,7 +4,8 @@ import crypto from 'crypto';
 import { authenticateJwtOrApiKey, requireTeamAdmin } from '../auth.js';
 import { authenticateJwtApiKeyOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
 import { query } from '../db.js';
-import { isSuperAdmin, isTeamAdmin, isTeamAdminOnTeam } from '../lib/utils/user.js';
+import { isSuperAdmin, isTeamAdmin, isTeamAdminOnTeam, USER_ROLES } from '../lib/utils/user.js';
+import { deliverInvitation } from '../lib/invitations.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
@@ -43,7 +44,6 @@ router.delete('/:id/members/:userId', authenticateJwtOrApiKey, removeProjectMemb
 router.put('/:id/members', authenticateJwtOrApiKey, replaceProjectMembers);
 router.put('/:id/organizations', authenticateJwtOrApiKey, replaceProjectOrganizations);
 router.put('/:id/datasets', authenticateJwtOrApiKey, replaceProjectDatasets);
-router.put('/:id/notebooks', authenticateJwtOrApiKey, replaceProjectNotebooks);
 router.put('/:id/docs', authenticateJwtOrApiKey, replaceProjectDocs);
 router.get('/:id/pages', authenticateJwtOrApiKey, listProjectPages);
 router.post('/:id/pages', authenticateJwtOrApiKey, createProjectPage);
@@ -330,6 +330,7 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
 
   const owned = await query(
     `SELECT d.id, d.name, d.description, d.team_id,
+            COALESCE(d.read_only, false) AS read_only, d.origin,
             t.name AS owner_team_name,
             'local'::text AS source_kind,
             NULL::text AS shared_by_team_id,
@@ -345,6 +346,7 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
 
   const shared = await query(
     `SELECT d.id, d.name, d.description, d.team_id,
+            COALESCE(d.read_only, false) AS read_only, d.origin,
             ot.name AS owner_team_name,
             'shared'::text AS source_kind,
             ot.id::text AS shared_by_team_id,
@@ -383,6 +385,7 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
       // Super admin: every other team's datasets
       managed = await query(
         `SELECT d.id, d.name, d.description, d.team_id,
+                COALESCE(d.read_only, false) AS read_only, d.origin,
                 t.name AS owner_team_name,
                 'managed'::text AS source_kind,
                 t.id::text AS shared_by_team_id,
@@ -398,6 +401,7 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
     } else if (adminTeamIds.length) {
       managed = await query(
         `SELECT d.id, d.name, d.description, d.team_id,
+                COALESCE(d.read_only, false) AS read_only, d.origin,
                 t.name AS owner_team_name,
                 'managed'::text AS source_kind,
                 t.id::text AS shared_by_team_id,
@@ -627,26 +631,18 @@ async function getProjectOverview(req, res) {
     const canEditPages =
       !req.authViaProjectDbToken && (await canEditProjectPages(projectId, req.user));
 
-    const [membersRes, datasetsRes, notebooksRes, pagesRes, orgsRes, derivedOrgsRes, aclRes, linkableDatasets, eligibleMembers] =
+    const [membersRes, datasetsRes, pagesRes, orgsRes, derivedOrgsRes, aclRes, linkableDatasets, eligibleMembers] =
       await Promise.all([
         Promise.resolve({ rows: await listMembers(projectId) }),
         query(
           `SELECT pd.dataset_id, pd.access_type, pd.approved_at,
                   d.name, d.description, d.${pc} AS dataset_project_id, d.team_id AS dataset_team_id,
                   d.device_type, d.subject_count, d.date_start, d.date_end,
-                  d.summary, d.summary_updated_at
+                  d.summary, d.summary_updated_at, d.read_only, d.origin
            FROM w4h.project_datasets pd
            JOIN w4h.datasets d ON d.id = pd.dataset_id
            WHERE pd.project_id = $1::uuid
            ORDER BY d.name ASC NULLS LAST, d.id ASC`,
-          [projectId]
-        ),
-        query(
-          `SELECT id, title, description, purpose, repo_url, repo_ref,
-                  notebook_path, runtime_type, launchers, created_by, created_at, updated_at
-           FROM w4h.project_notebooks
-           WHERE project_id = $1::uuid
-           ORDER BY updated_at DESC, created_at DESC`,
           [projectId]
         ),
         query(
@@ -716,8 +712,10 @@ async function getProjectOverview(req, res) {
       const meta = linkableById.get(String(row.dataset_id));
       return {
         ...row,
-        source_kind: meta?.source_kind || 'local',
-        source_label: meta?.source_label || 'Local',
+        source_kind: row.read_only ? 'sample' : (meta?.source_kind || 'local'),
+        source_label: row.read_only
+          ? `${row.origin || 'W4H Samples'} · read-only`
+          : (meta?.source_label || 'Local'),
         shared_by_team_name: meta?.shared_by_team_name || null
       };
     });
@@ -728,7 +726,6 @@ async function getProjectOverview(req, res) {
       datasets,
       linkable_datasets: canManage ? linkableDatasets : [],
       eligible_members: canManage ? eligibleMembers : [],
-      notebooks: notebooksRes.rows,
       pages: pagesRes.rows,
       docs: [],
       organizations,
@@ -787,13 +784,18 @@ async function createProject(req, res) {
       return res.status(403).json({ error: 'Unauthorized for this team' });
     }
 
+    const isDemonstration = Boolean(req.body?.is_demonstration);
+    if (isDemonstration && !isSuperAdmin(req.user.role)) {
+      return res.status(403).json({ error: 'Only Super admin can create a demonstration project' });
+    }
+
     const slug = await ensureUniqueSlug(req.body?.slug || name);
     const inserted = await query(
       `INSERT INTO w4h.projects
-         (slug, name, description, status, visibility, irb_protocol_id, irb_expiry_date, created_by, team_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::uuid)
+         (slug, name, description, status, visibility, irb_protocol_id, irb_expiry_date, created_by, team_id, is_demonstration)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::uuid, $10)
        RETURNING *`,
-      [slug, name, description, status, visibility, irbProtocolId || null, irbExpiryDate, req.user.id, teamId]
+      [slug, name, description, status, visibility, irbProtocolId || null, irbExpiryDate, req.user.id, teamId, isDemonstration]
     );
 
     const project = inserted.rows[0];
@@ -831,9 +833,41 @@ async function createProject(req, res) {
       }
     }
 
+    if (isDemonstration) {
+      await linkSampleDatasetsToProject(project.id, teamId, req.user.id);
+    }
+
     res.status(201).json(project);
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to create project' });
+  }
+}
+
+async function linkSampleDatasetsToProject(projectId, teamId, userId) {
+  let samples = { rows: [] };
+  try {
+    samples = await query(
+      `SELECT id, team_id FROM w4h.datasets WHERE read_only = true ORDER BY name ASC NULLS LAST, id ASC`
+    );
+  } catch {
+    return;
+  }
+  for (const row of samples.rows) {
+    if (row.team_id && teamId && String(row.team_id) !== String(teamId)) {
+      await query(
+        `INSERT INTO w4h.dataset_shares
+           (dataset_id, target_team_id, target_project_id, access_type, shared_by)
+         VALUES ($1, $2::uuid, $3::uuid, 'read', $4)
+         ON CONFLICT DO NOTHING`,
+        [row.id, teamId, projectId, userId ?? null]
+      ).catch(() => {});
+    }
+    await query(
+      `INSERT INTO w4h.project_datasets (project_id, dataset_id, access_type)
+       VALUES ($1::uuid, $2, 'read')
+       ON CONFLICT (project_id, dataset_id) DO NOTHING`,
+      [projectId, row.id]
+    ).catch(() => {});
   }
 }
 
@@ -995,27 +1029,81 @@ async function addProjectMember(req, res) {
   }
 
   try {
-    const role = String(req.body?.role || 'viewer');
+    const role = String(req.body?.role || 'editor');
     if (!PROJECT_MEMBER_ROLES.has(role)) {
       return res.status(400).json({ error: 'Invalid role' });
-    }
-    const userId = await resolveMemberUserId(req.body || {});
-    if (!Number.isInteger(userId)) {
-      const email = String(req.body?.email || '').trim();
-      return res.status(400).json({ error: email ? `Unknown user email: ${email}` : 'Member user_id or email is required' });
-    }
-    if (await isPlatformAdminUserId(userId)) {
-      return res.status(400).json({
-        error: 'Platform admin accounts are not project members. Use Created by for the provisioning admin; add team members here.'
-      });
     }
 
     const teamId = await getProjectTeamId(projectId);
     if (!teamId) {
       return res.status(400).json({ error: 'Project has no owning team; set team_id before adding members' });
     }
+
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const name = String(req.body?.name || '').trim();
+    let userId = await resolveMemberUserId(req.body || {});
+    let invited = false;
+    let inviteUrl = null;
+    let mailWarning = null;
+
+    if (!Number.isInteger(userId) && !email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    if (!Number.isInteger(userId) && email) {
+      const found = await query(
+        `SELECT id, role, status FROM w4h.users WHERE lower(trim(email)) = $1`,
+        [email]
+      );
+      if (found.rowCount) {
+        userId = found.rows[0].id;
+      }
+    }
+
+    if (Number.isInteger(userId) && (await isPlatformAdminUserId(userId))) {
+      return res.status(400).json({
+        error: 'Platform admin accounts are not project members.'
+      });
+    }
+
+    if (Number.isInteger(userId)) {
+      const already = await query(
+        `SELECT 1 FROM w4h.project_members WHERE project_id = $1::uuid AND user_id = $2`,
+        [projectId, userId]
+      );
+      if (already.rowCount) {
+        return res.status(409).json({ error: 'That person is already on this project' });
+      }
+    }
+
+    if (!Number.isInteger(userId)) {
+      const displayName = name || email;
+      const inserted = await query(
+        `INSERT INTO w4h.users (name, email, password, role, status)
+         VALUES ($1, $2, NULL, $3, 'invited')
+         RETURNING id`,
+        [displayName, email, USER_ROLES.PROJECT_USER]
+      );
+      userId = inserted.rows[0].id;
+      invited = true;
+      const delivered = await deliverInvitation({
+        email,
+        name: displayName,
+        roleLabel: role === 'owner' ? 'Admin' : 'User',
+        userId,
+        invitedBy: req.user.id,
+      });
+      inviteUrl = delivered.inviteUrl;
+      mailWarning = delivered.mailWarning;
+    }
+
     if (!(await isUserOnTeam(userId, teamId))) {
-      return res.status(400).json({ error: 'Member must belong to the project owning team' });
+      await query(
+        `INSERT INTO w4h.team_members (team_id, user_id, role)
+         VALUES ($1::uuid, $2, 'member')
+         ON CONFLICT (team_id, user_id) DO NOTHING`,
+        [teamId, userId]
+      );
     }
 
     await query(
@@ -1025,13 +1113,22 @@ async function addProjectMember(req, res) {
       [projectId, userId, role, req.user.id]
     );
 
-    auditProjectAction(req, 'project.member.add', projectId, {
+    auditProjectAction(req, invited ? 'project.member.invite' : 'project.member.add', projectId, {
       resourceType: 'project_member',
       resourceId: userId,
-      details: { user_id: userId, role },
+      details: { user_id: userId, role, email: email || undefined, invited },
     });
-    res.json(await listMembers(projectId));
+
+    res.status(invited ? 201 : 200).json({
+      members: await listMembers(projectId),
+      invited,
+      ...(inviteUrl ? { inviteUrl } : {}),
+      ...(mailWarning ? { mailWarning } : {}),
+    });
   } catch (error) {
+    if (error.code === '23505' || /users_email_key|duplicate key/i.test(error.message || '')) {
+      return res.status(409).json({ error: 'That person is already on this project' });
+    }
     res.status(500).json({ error: error.message || 'Failed to add project member' });
   }
 }
@@ -1280,66 +1377,6 @@ async function replaceProjectOrganizations(req, res) {
     res.json(fresh.rows);
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to update organizations' });
-  }
-}
-
-async function replaceProjectNotebooks(req, res) {
-  const projectId = await resolveProjectId(req.params.id);
-  if (!projectId) return res.status(404).json({ error: 'Project not found' });
-  if (!(await canManageProject(projectId, req.user))) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    const notebooks = Array.isArray(req.body?.notebooks) ? req.body.notebooks : [];
-    await query(`DELETE FROM w4h.project_notebooks WHERE project_id = $1::uuid`, [projectId]);
-
-    for (const row of notebooks) {
-      const title = String(row?.title || '').trim();
-      const notebookPath = String(row?.notebook_path || '').trim();
-      if (!title || !notebookPath) continue;
-      const purpose = ['exploration', 'preprocessing', 'analysis', 'visualization', 'report'].includes(row?.purpose)
-        ? row.purpose
-        : 'analysis';
-      const runtimeType = ['jupyter', 'rstudio', 'vscode', 'quarto', 'other'].includes(row?.runtime_type)
-        ? row.runtime_type
-        : 'jupyter';
-      const launchers = Array.isArray(row?.launchers) ? row.launchers : ['jupyter'];
-      const optionalId =
-        row?.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(row.id))
-          ? String(row.id)
-          : null;
-      await query(
-        `INSERT INTO w4h.project_notebooks
-           (id, project_id, title, description, purpose, repo_url, repo_ref, notebook_path, runtime_type, launchers, created_by, updated_at)
-         VALUES (COALESCE($1::uuid, gen_random_uuid()), $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, NOW())`,
-        [
-          optionalId,
-          projectId,
-          title,
-          row?.description == null ? null : String(row.description),
-          purpose,
-          row?.repo_url == null ? null : String(row.repo_url),
-          row?.repo_ref == null ? null : String(row.repo_ref),
-          notebookPath,
-          runtimeType,
-          JSON.stringify(launchers),
-          req.user.id
-        ]
-      );
-    }
-
-    const fresh = await query(
-      `SELECT id, title, description, purpose, repo_url, repo_ref, notebook_path, runtime_type,
-              launchers, created_at, updated_at
-       FROM w4h.project_notebooks
-       WHERE project_id = $1::uuid
-       ORDER BY updated_at DESC, created_at DESC`,
-      [projectId]
-    );
-    res.json(fresh.rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message || 'Failed to update project notebooks' });
   }
 }
 
@@ -1661,8 +1698,8 @@ async function replaceProjectAclRules(req, res) {
 
   const rules = Array.isArray(req.body?.rules) ? req.body.rules : [];
   const SUBJECT = new Set(['role', 'user']);
-  const RESOURCE = new Set(['project', 'dataset', 'doc', 'derived_table', 'notebook']);
-  const PERM = new Set(['view', 'edit', 'manage_members', 'link_dataset', 'create_derived', 'launch_notebook']);
+  const RESOURCE = new Set(['project', 'dataset', 'doc', 'derived_table']);
+  const PERM = new Set(['view', 'edit', 'manage_members', 'link_dataset', 'create_derived']);
   const EFFECT = new Set(['allow', 'deny']);
 
   const cleaned = [];

@@ -10,8 +10,10 @@ Agent instructions for the Wearables for Health (W4H) multi-repo workspace.
 | **w4h-app** | Vue 3 + Vite web UI |
 | **w4h-api** (this repo) | Express API + PostgreSQL schema / ACL |
 | **w4h-utils** | Scripts, CLI helpers, utility notebooks |
-| **w4h-datasets** | Sample / synthetic CSV datasets |
-| **w4h-notebooks** | Example Jupyter workflows |
+| **w4h-datasets** | Sample / synthetic CSV and JSON |
+| **w4h-notebooks** | Index of legacy notebooks; new tools are one repo per contribution |
+| **w4h-sample-fitbit-csv** / **-importer** | ADR-016 Fitbit CSV sample + importer (Contributions catalog) |
+| **w4h-load-json** | First-party JSON ingest notebook (Contributions catalog)
 
 Open these together via `w4h-repos.code-workspace` when changing cross-cutting behavior.
 
@@ -28,7 +30,8 @@ Open these together via `w4h-repos.code-workspace` when changing cross-cutting b
 - **Team** = tenancy. **Project** = primary access / work unit.
 - Platform role Super admin is account-wide; team/project authority comes from memberships.
 - Project membership: `owner` / `editor` / `viewer` (UI: Admin / User).
-- Users are discontinued, not hard-deleted.
+- W4H does not register project-owned notebooks. Browse **Contributions** (`/contributions`, ADR-018).
+- Catalog schema: `w4h.contributions` (publisher, kind, language, repo). Do not reintroduce `project_notebooks`.
 - Never log or return plaintext API keys except intentional step-up reveal flows; prefer encrypted wrap + audit.
 
 ## This repository

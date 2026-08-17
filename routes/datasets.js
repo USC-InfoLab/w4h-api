@@ -12,6 +12,7 @@ import {
 import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
+import { importCsvBatch } from '../lib/ingest-csv.js';
 
 router.get('/projects', authenticateJwtOrApiKey, listProjects);
 // Legacy projects-admin CRUD is platform-wide — Super admin only
@@ -21,7 +22,7 @@ router.post('/projects-admin', authenticateJwtOrApiKey, requirePlatformAdmin, ad
 router.put('/projects-admin/:id', authenticateJwtOrApiKey, requirePlatformAdmin, setProjectAdmin);
 router.get('/tableinfo', authenticateJwtOrApiKey, tableInfo);
 router.get('/', authenticateJwtOrApiKey, listDatasets);
-router.post('/', authenticateJwtOrApiKey, requireTeamAdmin, createDataset);
+router.post('/', authenticateJwtOrApiKey, createDataset);
 // Share registry (ADR-002 / ADR-012) — register before /:id
 router.get('/shares', authenticateJwtOrApiKey, requireTeamAdmin, listDatasetShares);
 router.get('/share-targets', authenticateJwtOrApiKey, requireTeamAdmin, listShareTargets);
@@ -29,6 +30,7 @@ router.delete('/shares/:shareId', authenticateJwtOrApiKey, requireTeamAdmin, rev
 router.get('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, listSharesForDataset);
 router.post('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, createDatasetShare);
 router.patch('/:id', authenticateJwtOrApiKey, requireTeamAdmin, updateDataset);
+router.post('/:id/import/csv-batch', authenticateJwtOrApiKey, importCsvBatchHandler);
 router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
@@ -68,6 +70,21 @@ async function canAccessTeam(user, teamId) {
   if (!user || !teamId) return false;
   if (isSuperAdmin(user.role)) return true;
   return (await getTeamIdsForUser(user.id)).includes(String(teamId));
+}
+
+async function actorCanManageCatalogOnTeam(user, teamId) {
+  if (!user || !teamId) return false;
+  if (isSuperAdmin(user.role)) return true;
+  if (await isTeamAdminOnTeam(user.id, teamId, user.role)) return true;
+  const owner = await query(
+    `SELECT 1
+     FROM w4h.project_members pm
+     JOIN w4h.projects p ON p.id = pm.project_id
+     WHERE pm.user_id = $1 AND pm.role = 'owner' AND p.team_id = $2::uuid
+     LIMIT 1`,
+    [user.id, teamId]
+  );
+  return owner.rowCount > 0;
 }
 
 /**
@@ -125,7 +142,7 @@ const CATALOG_SELECT = `
   SELECT d.id, d.name, d.description, d.team_id, d.project_id,
          d.device_type, d.sampling_rate, d.subject_count,
          d.date_start, d.date_end, d.irb_reference,
-         d.discoverable,
+         d.discoverable, d.read_only, d.origin,
          d.created_by, d.created_at, d.updated_at,
          t.name AS team_name, t.slug AS team_slug,
          ${CONTACT_EMAILS_SQL},
@@ -155,7 +172,7 @@ const CATALOG_COLS = `
              d.id, d.name, d.description, d.team_id, d.project_id,
              d.device_type, d.sampling_rate, d.subject_count,
              d.date_start, d.date_end, d.irb_reference,
-             d.discoverable,
+             d.discoverable, d.read_only, d.origin,
              d.created_by, d.created_at, d.updated_at
 `;
 
@@ -308,9 +325,6 @@ async function listDatasetsCatalog(req, res) {
 }
 
 async function createDataset(req, res) {
-  if (!canManageDatasets(req.user)) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
   try {
     const name = String(req.body?.name || '').trim();
     if (!name) return res.status(400).json({ error: 'name is required' });
@@ -324,7 +338,7 @@ async function createDataset(req, res) {
 
     const teamCheck = await query(`SELECT id FROM w4h.teams WHERE id = $1::uuid`, [teamId]);
     if (!teamCheck.rowCount) return res.status(400).json({ error: 'Unknown team_id' });
-    if (!(await canAccessTeam(req.user, teamId))) {
+    if (!(await actorCanManageCatalogOnTeam(req.user, teamId))) {
       return res.status(403).json({ error: 'Unauthorized for this team' });
     }
 
@@ -437,6 +451,29 @@ async function updateDataset(req, res) {
       const on = raw === true || raw === 'true' || raw === 1 || raw === '1';
       params.push(!!on);
       fields.push(`discoverable = $${params.length}`);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'read_only')) {
+      if (!isSuperAdmin(req.user.role)) {
+        return res.status(403).json({ error: 'Only Super admin can mark sample / read-only datasets' });
+      }
+      params.push(!!req.body.read_only);
+      fields.push(`read_only = $${params.length}`);
+      if (req.body.read_only && !Object.prototype.hasOwnProperty.call(req.body, 'origin')) {
+        params.push('W4H Samples');
+        fields.push(`origin = $${params.length}`);
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'origin')) {
+      if (!isSuperAdmin(req.user.role)) {
+        return res.status(403).json({ error: 'Only Super admin can set dataset origin' });
+      }
+      const origin = req.body.origin == null || req.body.origin === ''
+        ? null
+        : String(req.body.origin).trim();
+      params.push(origin);
+      fields.push(`origin = $${params.length}`);
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'team_id')) {
@@ -1240,6 +1277,38 @@ async function revokeDatasetShare(req, res) {
   } catch (error) {
     console.error('revokeDatasetShare error:', error);
     res.status(500).json({ error: error.message || 'Failed to revoke share' });
+  }
+}
+
+/** POST /datasets/:id/import/csv-batch — sample importer / team-admin CSV ingest */
+async function importCsvBatchHandler(req, res) {
+  try {
+    const result = await importCsvBatch(req.user, req.params.id, req.body || {});
+    if (!result.ok) {
+      return res.status(result.status || 400).json({ error: result.error || 'Import failed' });
+    }
+    await writeAuditLogSafe({
+      user_id: req.user?.id,
+      action: 'dataset.import.csv',
+      resource_type: 'dataset',
+      resource_id: req.params.id,
+      details: {
+        signal: req.body?.signal,
+        mode: req.body?.mode,
+        inserted: result.inserted,
+        skipped: result.skipped,
+      },
+    });
+    res.json({
+      success: true,
+      inserted: result.inserted,
+      skipped: result.skipped,
+      physical_schema: result.physical_schema,
+      physical_table: result.physical_table,
+    });
+  } catch (error) {
+    console.error('importCsvBatch error:', error);
+    res.status(500).json({ error: error.message || 'Import failed' });
   }
 }
 

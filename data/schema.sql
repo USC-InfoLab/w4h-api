@@ -55,7 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_invitations_user_id ON w4h.invitations(user_id);
 CREATE INDEX IF NOT EXISTS idx_invitations_expires_at ON w4h.invitations(expires_at);
 
 -- ---------------------------------------------------------------------------
--- Projects — research workspaces/projects containing members, datasets, and notebooks
+-- Projects — research workspaces/projects containing members, datasets, and documentation
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.projects (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -103,6 +103,11 @@ CREATE TABLE IF NOT EXISTS w4h.tables (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tables_dataset_id ON w4h.tables(dataset_id);
+
+ALTER TABLE IF EXISTS w4h.tables ADD COLUMN IF NOT EXISTS mapping_json jsonb;
+ALTER TABLE IF EXISTS w4h.tables ADD COLUMN IF NOT EXISTS physical_schema text;
+ALTER TABLE IF EXISTS w4h.tables ADD COLUMN IF NOT EXISTS physical_table text;
+ALTER TABLE IF EXISTS w4h.tables ADD COLUMN IF NOT EXISTS description text;
 
 -- ---------------------------------------------------------------------------
 -- User Projects (Legacy compatibility mapping)
@@ -202,25 +207,110 @@ CREATE TABLE IF NOT EXISTS w4h.project_datasets (
 CREATE INDEX IF NOT EXISTS idx_project_datasets_dataset_id ON w4h.project_datasets(dataset_id);
 
 -- ---------------------------------------------------------------------------
--- Project Notebooks — analytics notebooks (Jupyter, RStudio, VS Code) registered to a project
+-- Project notebooks — removed (ADR-018). Analysis lives in git + project pages.
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS w4h.project_notebooks (
+DROP TABLE IF EXISTS w4h.project_notebooks;
+
+-- ---------------------------------------------------------------------------
+-- Contributions — curated catalog of notebooks, CLI, scripts, postgres extensions
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.contributions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
-  title text NOT NULL, -- Title of the notebook
-  description text, -- Purpose details
-  purpose text NOT NULL DEFAULT 'analysis' CHECK (purpose IN ('exploration', 'preprocessing', 'analysis', 'visualization', 'report')),
-  repo_url text, -- URL to git repo hosting the notebook
-  repo_ref text, -- Branch/commit/tag reference
-  notebook_path text NOT NULL, -- Path to the notebook file inside the repo
-  runtime_type text NOT NULL DEFAULT 'jupyter' CHECK (runtime_type IN ('jupyter', 'rstudio', 'vscode', 'quarto', 'other')), -- Target IDE environment
-  launchers jsonb NOT NULL DEFAULT '["jupyter"]'::jsonb, -- Supported launching options
+  slug text UNIQUE NOT NULL,
+  publisher text NOT NULL,
+  title text NOT NULL,
+  summary text,
+  kind text NOT NULL CHECK (kind IN ('notebook', 'cli', 'script', 'postgres_extension')),
+  kinds text[] NOT NULL DEFAULT ARRAY[]::text[],
+  language text NOT NULL DEFAULT 'other' CHECK (language IN ('python', 'r', 'sql', 'other')),
+  repo_url text NOT NULL,
+  repo_ref text NOT NULL DEFAULT 'main',
+  docs_path text NOT NULL DEFAULT 'README.md',
+  status text NOT NULL DEFAULT 'published' CHECK (status IN ('draft', 'published', 'deprecated')),
   created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
-  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_project_notebooks_project_id ON w4h.project_notebooks(project_id);
+ALTER TABLE w4h.contributions ADD COLUMN IF NOT EXISTS kinds text[];
+UPDATE w4h.contributions
+   SET kinds = ARRAY[kind]::text[]
+ WHERE kinds IS NULL OR cardinality(kinds) = 0;
+ALTER TABLE w4h.contributions ALTER COLUMN kinds SET DEFAULT ARRAY[]::text[];
+ALTER TABLE w4h.contributions ALTER COLUMN kinds SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_contributions_status ON w4h.contributions(status);
+CREATE INDEX IF NOT EXISTS idx_contributions_kind ON w4h.contributions(kind);
+CREATE INDEX IF NOT EXISTS idx_contributions_kinds ON w4h.contributions USING GIN (kinds);
+
+DELETE FROM w4h.contributions WHERE lower(slug) = 'w4h-load-csv';
+
+INSERT INTO w4h.contributions (slug, publisher, title, summary, kind, kinds, language, repo_url, repo_ref, docs_path, status)
+VALUES
+  (
+    'fft-approximate',
+    'usc-infolab',
+    'fft_approximate',
+    'PostgreSQL extension for approximate aggregate range queries on time series (FFT top-k). Install on your database; W4H does not vendor it.',
+    'postgres_extension',
+    ARRAY['postgres_extension']::text[],
+    'sql',
+    'https://github.com/USC-InfoLab/fft_approximate',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-sample-fitbit-csv',
+    'usc-infolab',
+    'Fitbit CSV sample',
+    'Synthetic Fitbit CSV files and vendor manifest (column types, GeoMTS hints). Pair with the Fitbit CSV importer contribution.',
+    'script',
+    ARRAY['script']::text[],
+    'other',
+    'https://github.com/USC-InfoLab/w4h-sample-fitbit-csv',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-sample-fitbit-csv-importer',
+    'usc-infolab',
+    'Fitbit CSV importer',
+    'Adapt the notebook to ingest Fitbit CSV via the API. The same repo includes a CLI (`import` and `sync`) for cron and incremental updates.',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-sample-fitbit-csv-importer',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-load-json',
+    'usc-infolab',
+    'Load sample JSON',
+    'Adapt the notebook to load sample JSON into a W4H dataset via the ingest API (GeoMTS mapping, personal API key).',
+    'notebook',
+    ARRAY['notebook']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-load-json',
+    'main',
+    'README.md',
+    'published'
+  )
+ON CONFLICT (slug) DO UPDATE SET
+  publisher = EXCLUDED.publisher,
+  title = EXCLUDED.title,
+  summary = EXCLUDED.summary,
+  kind = EXCLUDED.kind,
+  kinds = EXCLUDED.kinds,
+  language = EXCLUDED.language,
+  repo_url = EXCLUDED.repo_url,
+  repo_ref = EXCLUDED.repo_ref,
+  docs_path = EXCLUDED.docs_path,
+  status = EXCLUDED.status,
+  updated_at = NOW();
 
 -- ---------------------------------------------------------------------------
 -- Project Pages — private project documentation (MVP Doc-08). Not platform Help.
@@ -264,9 +354,9 @@ CREATE TABLE IF NOT EXISTS w4h.project_acl_rules (
   project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
   subject_type text NOT NULL CHECK (subject_type IN ('role', 'user')), -- Target of rule (role or specific user)
   subject_key text NOT NULL, -- Role name (e.g. 'researcher') or user ID
-  resource_type text NOT NULL CHECK (resource_type IN ('project', 'dataset', 'doc', 'derived_table', 'notebook')), -- Target resource category
+  resource_type text NOT NULL CHECK (resource_type IN ('project', 'dataset', 'doc', 'derived_table')), -- Target resource category
   resource_key text, -- Specific resource ID/slug, or NULL to apply to all of resource_type
-  permission text NOT NULL CHECK (permission IN ('view', 'edit', 'manage_members', 'link_dataset', 'create_derived', 'launch_notebook')), -- Action permitted/denied
+  permission text NOT NULL CHECK (permission IN ('view', 'edit', 'manage_members', 'link_dataset', 'create_derived')), -- Action permitted/denied
   effect text NOT NULL DEFAULT 'allow' CHECK (effect IN ('allow', 'deny')), -- Rule effect (allow or deny)
   created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
   created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -274,6 +364,16 @@ CREATE TABLE IF NOT EXISTS w4h.project_acl_rules (
 
 CREATE INDEX IF NOT EXISTS idx_project_acl_project_id ON w4h.project_acl_rules(project_id);
 CREATE INDEX IF NOT EXISTS idx_project_acl_subject ON w4h.project_acl_rules(subject_type, subject_key);
+
+-- ADR-018: drop notebook ACL (existing DBs keep old CHECK until rewritten)
+DELETE FROM w4h.project_acl_rules
+ WHERE resource_type = 'notebook' OR permission = 'launch_notebook';
+ALTER TABLE w4h.project_acl_rules DROP CONSTRAINT IF EXISTS project_acl_rules_resource_type_check;
+ALTER TABLE w4h.project_acl_rules ADD CONSTRAINT project_acl_rules_resource_type_check
+  CHECK (resource_type IN ('project', 'dataset', 'doc', 'derived_table'));
+ALTER TABLE w4h.project_acl_rules DROP CONSTRAINT IF EXISTS project_acl_rules_permission_check;
+ALTER TABLE w4h.project_acl_rules ADD CONSTRAINT project_acl_rules_permission_check
+  CHECK (permission IN ('view', 'edit', 'manage_members', 'link_dataset', 'create_derived'));
 
 -- ---------------------------------------------------------------------------
 -- Project DB Tokens — tokens for direct programmatic database queries
@@ -404,6 +504,13 @@ ALTER TABLE w4h.team_members ADD CONSTRAINT team_members_role_check
 ALTER TABLE w4h.projects ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE RESTRICT;
 CREATE INDEX IF NOT EXISTS idx_projects_team_id ON w4h.projects(team_id);
 
+-- Demonstration project: Super admin seeds RO sample datasets for walkthroughs (ADR-017)
+ALTER TABLE w4h.projects ADD COLUMN IF NOT EXISTS is_demonstration boolean NOT NULL DEFAULT false;
+
+-- Platform sample catalogs: Super admin seeds; teams may query but must not re-ingest
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS read_only boolean NOT NULL DEFAULT false;
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS origin text;
+
 -- Datasets belong to an owning team (nullable for legacy catalog rows)
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_datasets_team_id ON w4h.datasets(team_id);
@@ -458,3 +565,59 @@ ALTER TABLE w4h.users ADD CONSTRAINT users_role_check
     'super_admin', 'team_admin', 'project_user',
     'admin', 'researcher', 'clinician'
   ));
+
+-- ---------------------------------------------------------------------------
+-- PHI-safe AI chat (ADR-014) — platform + per-team keys, quotas, threads
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.platform_ai_settings (
+  id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  enabled boolean NOT NULL DEFAULT true,
+  anthropic_api_key_encrypted text,
+  anthropic_key_prefix text,
+  model text NOT NULL DEFAULT 'claude-haiku-4-5-20251001',
+  default_monthly_token_quota integer,
+  ai_phi_filter text NOT NULL DEFAULT 'strict'
+    CHECK (ai_phi_filter IN ('strict', 'permissive')),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by integer REFERENCES w4h.users(id) ON DELETE SET NULL
+);
+
+INSERT INTO w4h.platform_ai_settings (id)
+VALUES (1)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS w4h.team_ai_settings (
+  team_id uuid PRIMARY KEY REFERENCES w4h.teams(id) ON DELETE CASCADE,
+  enabled boolean NOT NULL DEFAULT true,
+  anthropic_api_key_encrypted text,
+  anthropic_key_prefix text,
+  monthly_token_quota integer,
+  ai_phi_filter text NOT NULL DEFAULT 'strict'
+    CHECK (ai_phi_filter IN ('strict', 'permissive')),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by integer REFERENCES w4h.users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS w4h.ai_conversations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id integer NOT NULL REFERENCES w4h.users(id) ON DELETE CASCADE,
+  title text NOT NULL DEFAULT 'Chat 1',
+  pinned boolean NOT NULL DEFAULT false,
+  title_locked boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_conversations_user
+  ON w4h.ai_conversations (user_id, pinned DESC, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS w4h.ai_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  conversation_id uuid NOT NULL REFERENCES w4h.ai_conversations(id) ON DELETE CASCADE,
+  role text NOT NULL CHECK (role IN ('user', 'assistant')),
+  content text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_messages_conversation
+  ON w4h.ai_messages (conversation_id, created_at ASC);

@@ -45,25 +45,7 @@ CREATE TABLE IF NOT EXISTS w4h.project_datasets (
 
 CREATE INDEX IF NOT EXISTS idx_project_datasets_dataset_id ON w4h.project_datasets(dataset_id);
 
-CREATE TABLE IF NOT EXISTS w4h.project_notebooks (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
-  title text NOT NULL,
-  description text,
-  purpose text NOT NULL DEFAULT 'analysis'
-    CHECK (purpose IN ('exploration', 'preprocessing', 'analysis', 'visualization', 'report')),
-  repo_url text,
-  repo_ref text,
-  notebook_path text NOT NULL,
-  runtime_type text NOT NULL DEFAULT 'jupyter'
-    CHECK (runtime_type IN ('jupyter', 'rstudio', 'vscode', 'quarto', 'other')),
-  launchers jsonb NOT NULL DEFAULT '["jupyter"]'::jsonb,
-  created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
-  created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_project_notebooks_project_id ON w4h.project_notebooks(project_id);
+DROP TABLE IF EXISTS w4h.project_notebooks;
 
 CREATE TABLE IF NOT EXISTS w4h.project_pages (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -98,10 +80,10 @@ CREATE TABLE IF NOT EXISTS w4h.project_acl_rules (
   project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
   subject_type text NOT NULL CHECK (subject_type IN ('role', 'user')),
   subject_key text NOT NULL,
-  resource_type text NOT NULL CHECK (resource_type IN ('project', 'dataset', 'doc', 'derived_table', 'notebook')),
+  resource_type text NOT NULL CHECK (resource_type IN ('project', 'dataset', 'doc', 'derived_table')),
   resource_key text,
   permission text NOT NULL CHECK (
-    permission IN ('view', 'edit', 'manage_members', 'link_dataset', 'create_derived', 'launch_notebook')
+    permission IN ('view', 'edit', 'manage_members', 'link_dataset', 'create_derived')
   ),
   effect text NOT NULL DEFAULT 'allow' CHECK (effect IN ('allow', 'deny')),
   created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
