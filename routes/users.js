@@ -1536,6 +1536,11 @@ async function login(req, res) {
     }
 
     if (!bcrypt.compareSync(password, user.password)) {
+      await writeAuthAudit(req, {
+        userId: user.id,
+        action: 'user.login_failed',
+        details: { email: user.email, method: 'password', reason: 'invalid_password' }
+      });
       return res.json({ error: { message: 'Invalid Email or Password!' } });
     }
 
@@ -1547,6 +1552,12 @@ async function login(req, res) {
 
     const token = auth.sign(userInfo);
     userInfo.token = token;
+
+    await writeAuthAudit(req, {
+      userId: user.id,
+      action: 'user.login_success',
+      details: { email: user.email, method: 'password' }
+    });
 
     recordUsageEventSafe({
       userId: user.id,
