@@ -12,6 +12,15 @@ npm start
 
 To reset the installation and go through the initial set up, unset `DB_DATABASE` in .env.
 
+### macOS: Postgres.app connection permissions
+
+Postgres.app (2.7+) gates `trust` auth per client binary. If queries start failing with
+`Postgres.app rejected "trust" authentication` (often right after restarting the API), the
+`node` binary has been denied in Postgres.app's permission list. Fix it via the Postgres.app
+menu bar icon → Preferences → permissions list → allow `node`, then restart the Postgres.app
+server. (The denial/allow list lives in `~/Library/Preferences/com.postgresapp.Postgres2.plist`
+under `ClientApplicationPermissions`.)
+
 ## CLI
 
 The CLI will be used to access admin and recurring tasks. Run `bin/w4h` or see launch.json for examples.

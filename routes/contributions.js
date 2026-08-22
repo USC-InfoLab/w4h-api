@@ -8,6 +8,9 @@ import {
   updateContribution,
   deleteContribution,
 } from '../lib/contributions.js';
+import { startContributionRun, getContributionRun } from '../lib/contribution-runner.js';
+import { inspectRepository } from '../lib/contributions-manifest.js';
+import { writeAuditLogSafe } from '../lib/utils/audit.js';
 
 const router = express.Router();
 
@@ -19,8 +22,11 @@ function requireSuperAdmin(req, res, next) {
 }
 
 router.get('/', authenticateJwtOrApiKey, list);
+router.get('/runs/:id', authenticateJwtOrApiKey, getRun);
 router.get('/:slug', authenticateJwtOrApiKey, get);
 router.post('/', authenticate, requireSuperAdmin, create);
+router.post('/inspect', authenticate, requireSuperAdmin, inspect);
+router.post('/:slug/run', authenticateJwtOrApiKey, run);
 router.patch('/:slug', authenticate, requireSuperAdmin, patch);
 router.delete('/:slug', authenticate, requireSuperAdmin, remove);
 
@@ -68,6 +74,16 @@ async function patch(req, res) {
   }
 }
 
+async function inspect(req, res) {
+  try {
+    const result = await inspectRepository(req.body || {});
+    if (result.error) return res.status(400).json({ error: result.error });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed to inspect repository' });
+  }
+}
+
 async function remove(req, res) {
   try {
     const ok = await deleteContribution(req.params.slug);
@@ -75,6 +91,38 @@ async function remove(req, res) {
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to delete contribution' });
+  }
+}
+
+async function run(req, res) {
+  try {
+    const datasetId = String(req.body?.dataset_id || '').trim();
+    if (!datasetId) return res.status(400).json({ error: 'dataset_id is required' });
+    const mode = req.body?.mode === 'full' ? 'full' : 'update';
+    const result = await startContributionRun({ slug: req.params.slug, datasetId, user: req.user, mode });
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    // Durable record independent of contribution_runs (which is mutated as the run
+    // progresses) — 'full' truncates and reloads existing tables, so this is the
+    // append-only trail (ADR-011) of who chose to do that and when.
+    writeAuditLogSafe(req, {
+      action: mode === 'full' ? 'dataset.import.full_reimport' : 'dataset.import.update',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: { contribution_slug: req.params.slug, run_id: result.run.id, mode },
+    });
+    res.status(202).json({ ...result.run, mode });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed to start run' });
+  }
+}
+
+async function getRun(req, res) {
+  try {
+    const row = await getContributionRun(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Run not found' });
+    res.json(row);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed to load run' });
   }
 }
 

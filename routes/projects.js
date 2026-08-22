@@ -209,6 +209,8 @@ async function hydrateDatasetSummaries(rows) {
        LEFT JOIN pg_class c
          ON c.oid = to_regclass(
               CASE
+                WHEN t.physical_schema IS NOT NULL AND t.physical_table IS NOT NULL
+                  THEN t.physical_schema || '.' || t.physical_table
                 WHEN position('.' IN t.name) > 0 THEN t.name
                 ELSE 'public.' || t.name
               END
@@ -554,28 +556,42 @@ async function listProjects(req, res) {
       LEFT JOIN w4h.teams t ON t.id = p.team_id
     `;
     const params = [userId];
+    const conditions = [];
 
     if (!isSuperAdmin(req.user.role)) {
       const teamIds = await getTeamIdsForUser(userId);
       if (teamIds.length) {
         params.push(teamIds);
-        sql += `
-          WHERE (
+        conditions.push(`
+          (
             EXISTS (
               SELECT 1 FROM w4h.project_members pm
               WHERE pm.project_id = p.id AND pm.user_id = $1
             )
-            OR p.team_id = ANY($2::uuid[])
+            OR p.team_id = ANY($${params.length}::uuid[])
           )
-        `;
+        `);
       } else {
-        sql += `
-          WHERE EXISTS (
+        conditions.push(`
+          EXISTS (
             SELECT 1 FROM w4h.project_members pm
             WHERE pm.project_id = p.id AND pm.user_id = $1
           )
-        `;
+        `);
       }
+    }
+
+    // ADR-010: archived projects are hidden by default; ?status=archived or ?status=all opts in.
+    const statusFilter = ['active', 'archived', 'all'].includes(req.query?.status)
+      ? req.query.status
+      : 'active';
+    if (statusFilter !== 'all') {
+      params.push(statusFilter);
+      conditions.push(`p.status = $${params.length}`);
+    }
+
+    if (conditions.length) {
+      sql += ` WHERE ${conditions.join(' AND ')}`;
     }
 
     sql += ` ORDER BY p.updated_at DESC, p.created_at DESC`;

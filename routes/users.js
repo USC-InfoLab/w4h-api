@@ -16,7 +16,8 @@ import {
 } from '../lib/invitations.js';
 import { recordUsageEventSafe } from '../lib/utils/usage.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
-import { encryptUserApiKey, decryptUserApiKey } from '../lib/utils/apiKeyCrypto.js';
+import { decryptUserApiKey } from '../lib/utils/apiKeyCrypto.js';
+import { issueApiKeyForUser } from '../lib/utils/apiKeys.js';
 import {
   USER_ROLES,
   USER_ROLES_NAMES,
@@ -525,33 +526,24 @@ async function rotateMyApiKey(req, res) {
       return res.status(verified.status).json({ error: verified.error });
     }
 
-    const raw = `${auth.USER_API_KEY_PREFIX}${crypto.randomBytes(32).toString('base64url')}`;
-    const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
-    const prefix = raw.slice(0, 24);
-    const wrapped = encryptUserApiKey(raw);
-    const result = await query(
-      `UPDATE ${SCHEMA}.${TABLE}
-       SET api_key_hash = $1, api_key_prefix = $2, api_key_encrypted = $3, api_key_created_at = NOW()
-       WHERE id = $4
-       RETURNING api_key_created_at`,
-      [tokenHash, prefix, wrapped, req.user.id]
-    );
-    if (!result.rowCount) {
-      return res.status(404).json({ error: 'User not found' });
+    let issued;
+    try {
+      issued = await issueApiKeyForUser(req.user.id);
+    } catch (err) {
+      if (err.message === 'User not found') {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      throw err;
     }
 
     writeAuditLogSafe(req, {
       action: 'user.api_key.rotate',
       resourceType: 'user',
       resourceId: req.user.id,
-      details: { api_key_prefix: prefix }
+      details: { api_key_prefix: issued.api_key_prefix }
     });
 
-    res.status(201).json({
-      api_key: raw,
-      api_key_prefix: prefix,
-      api_key_created_at: result.rows[0].api_key_created_at
-    });
+    res.status(201).json(issued);
   } catch (error) {
     console.error('rotateMyApiKey:', error);
     res.status(500).json({ error: error.message });
@@ -933,6 +925,22 @@ async function acceptInvite(req, res) {
       await ensureAdminAssignedToAllProjects(row.user_id);
     }
 
+    // D-16a: auto-issue a personal API key at activation so first-time users
+    // don't hit a manual "Generate new key" step. Best-effort — a failure here
+    // must not block account activation; the user can still generate one later.
+    let issuedApiKey = null;
+    try {
+      issuedApiKey = await issueApiKeyForUser(row.user_id);
+      writeAuditLogSafe(req, {
+        action: 'user.api_key.auto_issued',
+        resourceType: 'user',
+        resourceId: row.user_id,
+        details: { api_key_prefix: issuedApiKey.api_key_prefix, reason: 'invite_accepted' }
+      });
+    } catch (err) {
+      console.error('acceptInvite: auto-issue API key failed:', err.message);
+    }
+
     const userInfo = await buildUserSessionInfo({
       id: row.user_id,
       name: displayName,
@@ -947,7 +955,12 @@ async function acceptInvite(req, res) {
       details: { email: row.email }
     });
 
-    res.json({ success: true, user: { ...userInfo, token }, token });
+    res.json({
+      success: true,
+      user: { ...userInfo, token },
+      token,
+      ...(issuedApiKey ? { api_key: issuedApiKey.api_key, api_key_prefix: issuedApiKey.api_key_prefix } : {})
+    });
   } catch (error) {
     console.error('acceptInvite error:', error);
     res.status(500).json({ error: error.message });

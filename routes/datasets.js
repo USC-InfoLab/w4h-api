@@ -31,6 +31,7 @@ router.get('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, listSharesF
 router.post('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, createDatasetShare);
 router.patch('/:id', authenticateJwtOrApiKey, requireTeamAdmin, updateDataset);
 router.post('/:id/import/csv-batch', authenticateJwtOrApiKey, importCsvBatchHandler);
+router.get('/:id/dependents', authenticateJwtOrApiKey, getDatasetDependents);
 router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
@@ -920,6 +921,50 @@ async function listDatasets(req, res) {
   } catch (error) {
     console.error('listDatasets error:', error);
     res.status(500).json({ error: error.message || 'Failed to list datasets' });
+  }
+}
+
+/**
+ * What a **full** (destructive, truncate + reload) re-import would put at risk —
+ * used by the Run import dialog to decide whether to warn before a full re-import.
+ * Excludes the requesting project (linking one project and running against it is
+ * not a "dependent"). Does not (yet) check derived datasets / model runs — there is
+ * no lineage table for those (MVP D-05, M-02 are still Todo).
+ */
+async function getDatasetDependents(req, res) {
+  if (!canAccessDatasets(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const excludeProjectId = req.query.exclude_project_id
+      ? String(req.query.exclude_project_id)
+      : null;
+
+    const projectsRes = await query(
+      `SELECT p.id::text AS project_id, p.name
+       FROM w4h.project_datasets pd
+       JOIN w4h.projects p ON p.id = pd.project_id
+       WHERE pd.dataset_id = $1
+       ORDER BY p.name ASC`,
+      [datasetId]
+    );
+    const otherProjects = projectsRes.rows.filter((r) => r.project_id !== excludeProjectId);
+
+    const sharesRes = await query(
+      `SELECT COUNT(*)::int AS n FROM w4h.dataset_shares WHERE dataset_id = $1`,
+      [datasetId]
+    );
+    const shareCount = sharesRes.rows[0]?.n || 0;
+
+    res.json({
+      linkedProjectCount: projectsRes.rowCount,
+      otherProjects: otherProjects.map((r) => ({ id: r.project_id, name: r.name })),
+      shareCount,
+      hasDependents: otherProjects.length > 0 || shareCount > 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed to check dataset dependents' });
   }
 }
 

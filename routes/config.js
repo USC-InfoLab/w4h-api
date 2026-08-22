@@ -1763,6 +1763,16 @@ async function postAdminSetup(req, res) {
       }
     }
 
+    if (adminResult.user.api_key) {
+      writeAuditLogSafe(req, {
+        userId: adminResult.user.id,
+        action: 'user.api_key.auto_issued',
+        resourceType: 'user',
+        resourceId: adminResult.user.id,
+        details: { api_key_prefix: adminResult.user.api_key_prefix, reason: 'admin_setup' }
+      });
+    }
+
     res.json({
       success: true,
       message: 'Initial admin account created successfully',
@@ -1774,7 +1784,10 @@ async function postAdminSetup(req, res) {
         name: adminResult.user.name,
         role: 'super_admin',
         firstTimeLogin: true
-      }
+      },
+      ...(adminResult.user.api_key
+        ? { api_key: adminResult.user.api_key, api_key_prefix: adminResult.user.api_key_prefix }
+        : {})
     });
   } catch (error) {
     console.error('Initial admin setup error:', error);

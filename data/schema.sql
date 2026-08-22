@@ -220,9 +220,9 @@ CREATE TABLE IF NOT EXISTS w4h.contributions (
   publisher text NOT NULL,
   title text NOT NULL,
   summary text,
-  kind text NOT NULL CHECK (kind IN ('notebook', 'cli', 'script', 'postgres_extension')),
+  kind text NOT NULL CHECK (kind IN ('notebook', 'cli', 'script', 'postgres_extension', 'dataset')),
   kinds text[] NOT NULL DEFAULT ARRAY[]::text[],
-  language text NOT NULL DEFAULT 'other' CHECK (language IN ('python', 'r', 'sql', 'other')),
+  language text NOT NULL DEFAULT 'other' CHECK (language IN ('python', 'r', 'sql', 'csv', 'json', 'other')),
   repo_url text NOT NULL,
   repo_ref text NOT NULL DEFAULT 'main',
   docs_path text NOT NULL DEFAULT 'README.md',
@@ -231,6 +231,15 @@ CREATE TABLE IF NOT EXISTS w4h.contributions (
   created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Sample data packages (manifest.yaml + CSV/JSON, no code) are their own
+-- kind — not 'script' (see ADR-016 naming: w4h-sample-<vendor>-<format>).
+ALTER TABLE w4h.contributions DROP CONSTRAINT IF EXISTS contributions_kind_check;
+ALTER TABLE w4h.contributions ADD CONSTRAINT contributions_kind_check
+  CHECK (kind IN ('notebook', 'cli', 'script', 'postgres_extension', 'dataset'));
+ALTER TABLE w4h.contributions DROP CONSTRAINT IF EXISTS contributions_language_check;
+ALTER TABLE w4h.contributions ADD CONSTRAINT contributions_language_check
+  CHECK (language IN ('python', 'r', 'sql', 'csv', 'json', 'other'));
 
 ALTER TABLE w4h.contributions ADD COLUMN IF NOT EXISTS kinds text[];
 UPDATE w4h.contributions
@@ -242,6 +251,10 @@ ALTER TABLE w4h.contributions ALTER COLUMN kinds SET NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_contributions_status ON w4h.contributions(status);
 CREATE INDEX IF NOT EXISTS idx_contributions_kind ON w4h.contributions(kind);
 CREATE INDEX IF NOT EXISTS idx_contributions_kinds ON w4h.contributions USING GIN (kinds);
+
+-- Super admin curated: which catalog rows may be triggered via the in-app
+-- "Run" button (ADR-022). Defaults to false — most contributions are docs-only.
+ALTER TABLE w4h.contributions ADD COLUMN IF NOT EXISTS runnable boolean NOT NULL DEFAULT false;
 
 DELETE FROM w4h.contributions WHERE lower(slug) = 'w4h-load-csv';
 
@@ -265,9 +278,9 @@ VALUES
     'usc-infolab',
     'Fitbit CSV sample',
     'Synthetic Fitbit CSV files and vendor manifest (column types, GeoMTS hints). Pair with the Fitbit CSV importer contribution.',
-    'script',
-    ARRAY['script']::text[],
-    'other',
+    'dataset',
+    ARRAY['dataset']::text[],
+    'csv',
     'https://github.com/USC-InfoLab/w4h-sample-fitbit-csv',
     'main',
     'README.md',
@@ -298,6 +311,32 @@ VALUES
     'main',
     'README.md',
     'published'
+  ),
+  (
+    'w4h-sample-icde-demo-csv',
+    'usc-infolab',
+    'ICDE demo CSV sample',
+    'Synthetic multi-signal + GPS CSV export (ICDE 2024 demo) with a raw gps_track signal for exercising the geo branch of GeoMTS mapping. Pair with the ICDE demo CSV importer contribution.',
+    'dataset',
+    ARRAY['dataset']::text[],
+    'csv',
+    'https://github.com/USC-InfoLab/w4h-sample-icde-demo-csv',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-sample-icde-demo-csv-importer',
+    'usc-infolab',
+    'ICDE demo CSV importer',
+    'Adapt the notebook to ingest the ICDE demo CSV sample via the API, including its gps_track geo signal. The same repo includes a CLI (`import` and `sync`) for cron and incremental updates.',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-sample-icde-demo-csv-importer',
+    'main',
+    'README.md',
+    'published'
   )
 ON CONFLICT (slug) DO UPDATE SET
   publisher = EXCLUDED.publisher,
@@ -311,6 +350,35 @@ ON CONFLICT (slug) DO UPDATE SET
   docs_path = EXCLUDED.docs_path,
   status = EXCLUDED.status,
   updated_at = NOW();
+
+-- First-party contribution vetted for in-app execution (ADR-022).
+UPDATE w4h.contributions SET runnable = true WHERE slug = 'w4h-sample-fitbit-csv-importer';
+
+-- ---------------------------------------------------------------------------
+-- Contribution runs — one row per in-app "Run" trigger of a runnable
+-- contribution's standardized run.sh entrypoint (ADR-022). Authorization is
+-- enforced by the dataset-ingest ACL the script's API key call hits, not here.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS w4h.contribution_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  contribution_slug text NOT NULL REFERENCES w4h.contributions(slug) ON DELETE CASCADE,
+  dataset_id text NOT NULL REFERENCES w4h.datasets(id) ON DELETE CASCADE,
+  started_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+  started_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  finished_at timestamptz,
+  exit_code integer,
+  log text NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_contribution_runs_dataset_id ON w4h.contribution_runs(dataset_id);
+
+-- Latest `@@PROGRESS@@ {...}` line parsed from the script's stdout (see
+-- contribution-runner.js), e.g. {signal, signal_index, signal_count, rows_done,
+-- rows_total, inserted, skipped}. Null until the script emits one. Added after
+-- contribution_runs already existed in some dev databases, so this is an ALTER
+-- (CREATE TABLE IF NOT EXISTS above is a no-op against an existing table).
+ALTER TABLE w4h.contribution_runs ADD COLUMN IF NOT EXISTS progress jsonb;
 
 -- ---------------------------------------------------------------------------
 -- Project Pages — private project documentation (MVP Doc-08). Not platform Help.
