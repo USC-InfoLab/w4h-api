@@ -13,6 +13,7 @@ import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { importCsvBatch } from '../lib/ingest-csv.js';
+import { persistBasicStats } from '../lib/dataset-basic-stats.js';
 
 router.get('/projects', authenticateJwtOrApiKey, listProjects);
 // Legacy projects-admin CRUD is platform-wide — Super admin only
@@ -31,6 +32,7 @@ router.get('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, listSharesF
 router.post('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, createDatasetShare);
 router.patch('/:id', authenticateJwtOrApiKey, requireTeamAdmin, updateDataset);
 router.post('/:id/import/csv-batch', authenticateJwtOrApiKey, importCsvBatchHandler);
+router.post('/:id/summary/refresh', authenticateJwtOrApiKey, refreshDatasetSummary);
 router.get('/:id/dependents', authenticateJwtOrApiKey, getDatasetDependents);
 router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
@@ -107,6 +109,11 @@ function sqlDatasetAccessibleToUser(userParam, datasetAlias = 'd') {
       WHERE pd.dataset_id = ${datasetAlias}.id AND us.user_id = ${userParam}
     )
   )`;
+}
+
+/** Legacy mixin map. Not provisioned here; processDataset still fills tables from w4h.tables. */
+async function getQueryMap(_catalogProjectId) {
+  return new Map();
 }
 
 async function ensureUniqueDatasetId(base) {
@@ -1031,38 +1038,42 @@ async function getDataset(req, res) {
     }
   }
 
-  const pc = await resolveDatasetProjectLinkColumn();
-  const result = isSuperAdmin(req.user.role)
-    ? await query(
-      `SELECT id, ${pc} AS dataset_project_id, name, description
-       FROM w4h.datasets
-       WHERE id = $1`,
-      [id]
-    )
-    : await query(
-      `SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
-       FROM w4h.datasets d
-       WHERE d.id = $1 AND ${sqlDatasetAccessibleToUser('$2')}`,
-      [id, req.user.id]
-    );
+  try {
+    const pc = await resolveDatasetProjectLinkColumn();
+    const result = isSuperAdmin(req.user.role)
+      ? await query(
+        `SELECT id, ${pc} AS dataset_project_id, name, description
+         FROM w4h.datasets
+         WHERE id = $1`,
+        [id]
+      )
+      : await query(
+        `SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
+         FROM w4h.datasets d
+         WHERE d.id = $1 AND ${sqlDatasetAccessibleToUser('$2')}`,
+        [id, req.user.id]
+      );
 
-  if (result.rows.length === 0) {
-    return res.status(404).json({ error: 'Dataset not found' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Dataset not found' });
+    }
+
+    const dataset = result.rows[0];
+
+    const tableConfigs = await query(`
+      SELECT dataset_id, name, metabase_url, source_name, source_url
+      FROM w4h.tables
+      WHERE dataset_id = $1
+    `, [dataset.id]);
+
+    const QUERY_MAP = await getQueryMap(dataset.dataset_project_id);
+
+    const processedDataset = await processDataset(dataset, req.user, QUERY_MAP, tableConfigs.rows);
+
+    res.json(processedDataset);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load dataset' });
   }
-
-  const dataset = result.rows[0];
-
-  const tableConfigs = await query(`
-    SELECT dataset_id, name, metabase_url, source_name, source_url
-    FROM w4h.tables
-    WHERE dataset_id = $1
-  `, [dataset.id]);
-
-  const QUERY_MAP = await getQueryMap(dataset.dataset_project_id);
-
-  const processedDataset = await processDataset(dataset, req.user, QUERY_MAP, tableConfigs.rows);
-
-  res.json(processedDataset);
 }
 
 const SHARE_SELECT = `
@@ -1325,6 +1336,42 @@ async function revokeDatasetShare(req, res) {
   }
 }
 
+/** POST /datasets/:id/summary/refresh — recompute ADR-020 basic_stats cache (Team admin / project owner). */
+async function refreshDatasetSummary(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    if (!datasetId) return res.status(400).json({ error: 'dataset id is required' });
+
+    const catalog = await query(
+      `SELECT id, team_id::text AS team_id FROM w4h.datasets WHERE id = $1`,
+      [datasetId]
+    );
+    if (!catalog.rowCount) return res.status(404).json({ error: 'Dataset not found' });
+    if (!(await actorCanManageCatalogOnTeam(req.user, catalog.rows[0].team_id))) {
+      return res.status(403).json({ error: 'Unauthorized for this team' });
+    }
+
+    const result = await persistBasicStats(datasetId);
+    if (!result) return res.status(404).json({ error: 'Dataset not found' });
+
+    writeAuditLogSafe(req, {
+      action: 'dataset.summary.refresh',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: { keys: ['basic_stats'] },
+    });
+
+    res.json({
+      summary: result.summary,
+      summary_updated_at: result.summary_updated_at,
+      basic_stats: result.basic_stats,
+    });
+  } catch (error) {
+    console.error('refreshDatasetSummary:', error);
+    res.status(500).json({ error: error.message || 'Failed to refresh dataset summary' });
+  }
+}
+
 /** POST /datasets/:id/import/csv-batch — sample importer / team-admin CSV ingest */
 async function importCsvBatchHandler(req, res) {
   try {
@@ -1344,6 +1391,11 @@ async function importCsvBatchHandler(req, res) {
         skipped: result.skipped,
       },
     });
+    try {
+      await persistBasicStats(req.params.id);
+    } catch (error) {
+      console.warn('basic_stats cache after csv-batch failed:', error.message);
+    }
     res.json({
       success: true,
       inserted: result.inserted,
