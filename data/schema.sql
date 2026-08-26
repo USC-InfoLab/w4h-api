@@ -96,7 +96,6 @@ ALTER TABLE IF EXISTS w4h.datasets DROP COLUMN IF EXISTS hidden;
 CREATE TABLE IF NOT EXISTS w4h.tables (
   dataset_id text NOT NULL REFERENCES w4h.datasets(id) ON DELETE CASCADE,
   name text NOT NULL,
-  metabase_url text,
   source_name text,
   source_url text,
   PRIMARY KEY (dataset_id, name)
@@ -104,6 +103,7 @@ CREATE TABLE IF NOT EXISTS w4h.tables (
 
 CREATE INDEX IF NOT EXISTS idx_tables_dataset_id ON w4h.tables(dataset_id);
 
+ALTER TABLE IF EXISTS w4h.tables DROP COLUMN IF EXISTS metabase_url;
 ALTER TABLE IF EXISTS w4h.tables ADD COLUMN IF NOT EXISTS mapping_json jsonb;
 ALTER TABLE IF EXISTS w4h.tables ADD COLUMN IF NOT EXISTS physical_schema text;
 ALTER TABLE IF EXISTS w4h.tables ADD COLUMN IF NOT EXISTS physical_table text;
@@ -220,7 +220,7 @@ CREATE TABLE IF NOT EXISTS w4h.contributions (
   publisher text NOT NULL,
   title text NOT NULL,
   summary text,
-  kind text NOT NULL CHECK (kind IN ('notebook', 'cli', 'script', 'postgres_extension', 'dataset')),
+  kind text NOT NULL CHECK (kind IN ('notebook', 'cli', 'script', 'postgres_extension', 'dataset', 'sql')),
   kinds text[] NOT NULL DEFAULT ARRAY[]::text[],
   language text NOT NULL DEFAULT 'other' CHECK (language IN ('python', 'r', 'sql', 'csv', 'json', 'other')),
   repo_url text NOT NULL,
@@ -236,7 +236,7 @@ CREATE TABLE IF NOT EXISTS w4h.contributions (
 -- kind — not 'script' (see ADR-016 naming: w4h-sample-<vendor>-<format>).
 ALTER TABLE w4h.contributions DROP CONSTRAINT IF EXISTS contributions_kind_check;
 ALTER TABLE w4h.contributions ADD CONSTRAINT contributions_kind_check
-  CHECK (kind IN ('notebook', 'cli', 'script', 'postgres_extension', 'dataset'));
+  CHECK (kind IN ('notebook', 'cli', 'script', 'postgres_extension', 'dataset', 'sql'));
 ALTER TABLE w4h.contributions DROP CONSTRAINT IF EXISTS contributions_language_check;
 ALTER TABLE w4h.contributions ADD CONSTRAINT contributions_language_check
   CHECK (language IN ('python', 'r', 'sql', 'csv', 'json', 'other'));
@@ -337,6 +337,32 @@ VALUES
     'main',
     'README.md',
     'published'
+  ),
+  (
+    'w4h-compute-mets',
+    'usc-infolab',
+    'Compute METs',
+    'Derive MET time series from ingested calories + weight (ICDE demo formula, interval-scaled). Notebook + CLI; optional write-back as mets_computed.',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-compute-mets',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-sql-compute-mets',
+    'usc-infolab',
+    'Compute METs (SQL)',
+    'YAML-bound SQL job: derive mets_computed from mapped calories + weight via the API (ADR-023). Notebook + CLI pick one dataset in a project and call the bind/execute + signals APIs. Distinct from the pandas w4h-compute-mets package.',
+    'sql',
+    ARRAY['sql', 'notebook', 'cli']::text[],
+    'sql',
+    'https://github.com/USC-InfoLab/w4h-sql-compute-mets',
+    'main',
+    'README.md',
+    'published'
   )
 ON CONFLICT (slug) DO UPDATE SET
   publisher = EXCLUDED.publisher,
@@ -351,13 +377,17 @@ ON CONFLICT (slug) DO UPDATE SET
   status = EXCLUDED.status,
   updated_at = NOW();
 
--- First-party contribution vetted for in-app execution (ADR-022).
-UPDATE w4h.contributions SET runnable = true WHERE slug = 'w4h-sample-fitbit-csv-importer';
+-- First-party contributions vetted for in-app execution (ADR-022 importers, ADR-023 SQL jobs).
+UPDATE w4h.contributions SET runnable = true
+WHERE slug IN (
+  'w4h-sample-fitbit-csv-importer',
+  'w4h-sample-icde-demo-csv-importer',
+  'w4h-sql-compute-mets'
+);
 
 -- ---------------------------------------------------------------------------
--- Contribution runs — one row per in-app "Run" trigger of a runnable
--- contribution's standardized run.sh entrypoint (ADR-022). Authorization is
--- enforced by the dataset-ingest ACL the script's API key call hits, not here.
+-- Contribution runs — one row per in-app Run trigger (ADR-022 run.sh or ADR-023
+-- SQL in-process). Authorization for writes is enforced by downstream ACL checks.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.contribution_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -601,6 +631,13 @@ ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS updated_at timestamp without t
 -- Discoverable catalog listing (D-23): metadata visible to other teams; share still required to use
 ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS discoverable boolean NOT NULL DEFAULT true;
 CREATE INDEX IF NOT EXISTS idx_datasets_discoverable ON w4h.datasets (discoverable) WHERE discoverable = true;
+
+-- Dataset lifecycle (ADR-010 / D-32): archive hides from default UI; no hard delete
+ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active';
+ALTER TABLE w4h.datasets DROP CONSTRAINT IF EXISTS datasets_status_check;
+ALTER TABLE w4h.datasets ADD CONSTRAINT datasets_status_check
+  CHECK (status IN ('active', 'archived'));
+CREATE INDEX IF NOT EXISTS idx_datasets_status ON w4h.datasets (status);
 
 -- Cross-team dataset shares (ADR-002 / ADR-012) — push-share registry
 CREATE TABLE IF NOT EXISTS w4h.dataset_shares (

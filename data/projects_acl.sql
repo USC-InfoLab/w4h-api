@@ -149,12 +149,13 @@ ALTER TABLE w4h.datasets ADD COLUMN IF NOT EXISTS summary_updated_at timestamp w
 CREATE TABLE IF NOT EXISTS w4h.tables (
   dataset_id text NOT NULL REFERENCES w4h.datasets(id) ON DELETE CASCADE,
   name text NOT NULL,
-  metabase_url text,
   source_name text,
   source_url text,
   PRIMARY KEY (dataset_id, name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tables_dataset_id ON w4h.tables(dataset_id);
+
+ALTER TABLE IF EXISTS w4h.tables DROP COLUMN IF EXISTS metabase_url;
 
 COMMIT;
