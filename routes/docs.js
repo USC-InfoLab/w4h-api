@@ -6,7 +6,7 @@ const router = express.Router();
 import { DOCS_TABLE, DOC_TYPES_TABLE, query } from '../db.js';
 import { authenticate, requirePlatformAdmin } from '../auth.js';
 import { USER_ROLES, isSuperAdmin, isTeamAdmin, canAccessAdminUi } from '../lib/utils/user.js';
-import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter } from '../lib/utils/docs.js';
+import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter, shouldSkipImportBasename } from '../lib/utils/docs.js';
 import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
 
 import crypto from 'crypto';
@@ -214,6 +214,7 @@ async function exportDocs(req, res) {
     archive.pipe(res);
 
     for (const row of result.rows) {
+      if (shouldSkipImportBasename(row.slug)) continue;
       const content = markdownFileForExport(row);
       // Use the name field from the exported YAML frontmatter as the zip entry path,
       // falling back to slug + doc_type if not present.
@@ -275,6 +276,8 @@ async function list(req, res) {
         sort_order ASC`
     );
 
+    result.rows = result.rows.filter((doc) => !shouldSkipImportBasename(doc.slug));
+
     if (isLegacyResearcher(req.user.role)) {
       //filter out docs with slugs starting with a different city and -datasets
       const cityPrefix = req.user.city_id ? `${req.user.city_id}-` : '';
@@ -303,6 +306,10 @@ async function get(req, res) {
        WHERE slug = $1`,
       [slug]
     );
+
+    if (!result.rows[0] || shouldSkipImportBasename(result.rows[0].slug)) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
 
     res.json(result.rows[0]);
   } catch (err) {
@@ -465,7 +472,7 @@ async function search(req, res) {
       [tsQueryTerm] // Using the transformed term for better matching
     );
 
-    res.json(result.rows);
+    res.json(result.rows.filter((doc) => !shouldSkipImportBasename(doc.slug)));
   } catch (err) {
     console.error('Search error:', err);
     res.status(500).json({ error: 'Failed to search documents' });
