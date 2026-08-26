@@ -99,18 +99,33 @@ async function run(req, res) {
     const datasetId = String(req.body?.dataset_id || '').trim();
     if (!datasetId) return res.status(400).json({ error: 'dataset_id is required' });
     const mode = req.body?.mode === 'full' ? 'full' : 'update';
-    const result = await startContributionRun({ slug: req.params.slug, datasetId, user: req.user, mode });
+    const slug = req.params.slug;
+    const result = await startContributionRun({ slug, datasetId, user: req.user, mode });
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
-    // Durable record independent of contribution_runs (which is mutated as the run
-    // progresses) — 'full' truncates and reloads existing tables, so this is the
-    // append-only trail (ADR-011) of who chose to do that and when.
-    writeAuditLogSafe(req, {
-      action: mode === 'full' ? 'dataset.import.full_reimport' : 'dataset.import.update',
-      resourceType: 'dataset',
-      resourceId: datasetId,
-      details: { contribution_slug: req.params.slug, run_id: result.run.id, mode },
-    });
-    res.status(202).json({ ...result.run, mode });
+    if (result.runKind === 'sql') {
+      const sql = result.sqlResult;
+      writeAuditLogSafe(req, {
+        action: sql?.ok && sql.write_back ? 'dataset.derive' : 'dataset.query',
+        resourceType: 'dataset',
+        resourceId: datasetId,
+        details: {
+          contribution_slug: slug,
+          run_id: result.run.id,
+          write_back: sql?.write_back ?? null,
+          physical_table: sql?.physical_table ?? null,
+          inserted: sql?.inserted ?? null,
+          row_count: sql?.row_count ?? null,
+        },
+      });
+    } else {
+      writeAuditLogSafe(req, {
+        action: mode === 'full' ? 'dataset.import.full_reimport' : 'dataset.import.update',
+        resourceType: 'dataset',
+        resourceId: datasetId,
+        details: { contribution_slug: slug, run_id: result.run.id, mode },
+      });
+    }
+    res.status(202).json({ ...result.run, mode: result.runKind === 'import' ? mode : undefined });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to start run' });
   }

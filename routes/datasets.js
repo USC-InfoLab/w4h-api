@@ -12,7 +12,10 @@ import {
 import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
-import { importCsvBatch } from '../lib/ingest-csv.js';
+import { importCsvBatch, assertCanIngestDataset } from '../lib/ingest-csv.js';
+import { computeMetsSummary, mergeMetsSummary } from '../lib/dataset-mets-summary.js';
+import { listDatasetSignals, runSqlContribution, assertCanViewDataset } from '../lib/sql-contribution-engine.js';
+import { getCohortAnalyticsSetup, runCohortComparison } from '../lib/cohort-analytics.js';
 
 router.get('/projects', authenticateJwtOrApiKey, listProjects);
 // Legacy projects-admin CRUD is platform-wide — Super admin only
@@ -31,7 +34,12 @@ router.get('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, listSharesF
 router.post('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, createDatasetShare);
 router.patch('/:id', authenticateJwtOrApiKey, requireTeamAdmin, updateDataset);
 router.post('/:id/import/csv-batch', authenticateJwtOrApiKey, importCsvBatchHandler);
+router.post('/:id/summary/refresh', authenticateJwtOrApiKey, refreshDatasetSummary);
+router.post('/:id/contributions/:slug/sql', authenticateJwtOrApiKey, runDatasetSqlContribution);
 router.get('/:id/dependents', authenticateJwtOrApiKey, getDatasetDependents);
+router.get('/:id/signals', authenticateJwtOrApiKey, getDatasetSignals);
+router.get('/:id/analytics/cohort', authenticateJwtOrApiKey, getDatasetCohortAnalytics);
+router.post('/:id/analytics/cohort', authenticateJwtOrApiKey, postDatasetCohortAnalytics);
 router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
@@ -86,6 +94,24 @@ async function actorCanManageCatalogOnTeam(user, teamId) {
     [user.id, teamId]
   );
   return owner.rowCount > 0;
+}
+
+function parseCatalogStatusFilter(raw) {
+  return ['active', 'archived', 'all'].includes(raw) ? raw : 'active';
+}
+
+/** SQL fragment excluding archived datasets (COALESCE for pre-migration rows). */
+function sqlDatasetActiveOnly(alias = 'd') {
+  return `COALESCE(${alias}.status, 'active') = 'active'`;
+}
+
+function sqlOwnedDatasetStatusFilter(alias, statusFilter, params) {
+  if (statusFilter === 'all') return '';
+  if (statusFilter === 'archived') {
+    params.push('archived');
+    return ` AND COALESCE(${alias}.status, 'active') = $${params.length}`;
+  }
+  return ` AND ${sqlDatasetActiveOnly(alias)}`;
 }
 
 /**
@@ -143,7 +169,7 @@ const CATALOG_SELECT = `
   SELECT d.id, d.name, d.description, d.team_id, d.project_id,
          d.device_type, d.sampling_rate, d.subject_count,
          d.date_start, d.date_end, d.irb_reference,
-         d.discoverable, d.read_only, d.origin,
+         d.discoverable, d.read_only, d.origin, d.status,
          d.created_by, d.created_at, d.updated_at,
          t.name AS team_name, t.slug AS team_slug,
          ${CONTACT_EMAILS_SQL},
@@ -173,7 +199,7 @@ const CATALOG_COLS = `
              d.id, d.name, d.description, d.team_id, d.project_id,
              d.device_type, d.sampling_rate, d.subject_count,
              d.date_start, d.date_end, d.irb_reference,
-             d.discoverable, d.read_only, d.origin,
+             d.discoverable, d.read_only, d.origin, d.status,
              d.created_by, d.created_at, d.updated_at
 `;
 
@@ -203,17 +229,25 @@ async function attachTableCounts(rows) {
 
 async function listDatasetsCatalog(req, res) {
   try {
+    const statusFilter = parseCatalogStatusFilter(req.query?.status);
+
     if (isSuperAdmin(req.user.role)) {
-      const result = await query(`
-        ${CATALOG_SELECT}
-        ORDER BY d.name ASC NULLS LAST, d.id ASC
-      `);
+      const params = [];
+      let sql = `${CATALOG_SELECT}`;
+      const statusSql = sqlOwnedDatasetStatusFilter('d', statusFilter, params);
+      if (statusSql) {
+        sql += ` WHERE 1=1${statusSql}`;
+      }
+      sql += ` ORDER BY d.name ASC NULLS LAST, d.id ASC`;
+      const result = await query(sql, params);
       return res.json(await attachTableCounts(result.rows));
     }
 
     const teamIds = await getTeamIdsForUser(req.user.id);
     if (!teamIds.length) return res.json([]);
 
+    const ownedParams = [teamIds];
+    const ownedStatusSql = sqlOwnedDatasetStatusFilter('d', statusFilter, ownedParams);
     const owned = await query(
       `
       SELECT ${CATALOG_COLS},
@@ -238,13 +272,14 @@ async function listDatasetsCatalog(req, res) {
              'Local'::text AS source_label
       FROM w4h.datasets d
       LEFT JOIN w4h.teams t ON t.id = d.team_id
-      WHERE d.team_id = ANY($1::uuid[])
+      WHERE d.team_id = ANY($1::uuid[])${ownedStatusSql}
       ORDER BY d.name ASC NULLS LAST, d.id ASC
       `,
-      [teamIds]
+      ownedParams
     );
 
-    const shared = await query(
+    // Inbound shares and discoverable listings are active-only (archived datasets revoke shares).
+    const shared = statusFilter === 'archived' ? { rows: [] } : await query(
       `
       SELECT DISTINCT ON (d.id)
              ${CATALOG_COLS},
@@ -275,12 +310,13 @@ async function listDatasetsCatalog(req, res) {
       LEFT JOIN w4h.teams ot ON ot.id = d.team_id
       WHERE ds.target_team_id = ANY($1::uuid[])
         AND (d.team_id IS NULL OR NOT (d.team_id = ANY($1::uuid[])))
+        AND ${sqlDatasetActiveOnly('d')}
       ORDER BY d.id, d.name ASC NULLS LAST
       `,
       [teamIds]
     );
 
-    const listed = await query(
+    const listed = statusFilter === 'archived' ? { rows: [] } : await query(
       `
       SELECT ${CATALOG_COLS},
              ot.name AS team_name, ot.slug AS team_slug,
@@ -295,6 +331,7 @@ async function listDatasetsCatalog(req, res) {
       FROM w4h.datasets d
       LEFT JOIN w4h.teams ot ON ot.id = d.team_id
       WHERE d.discoverable = true
+        AND ${sqlDatasetActiveOnly('d')}
         AND d.team_id IS NOT NULL
         AND NOT (d.team_id = ANY($1::uuid[]))
         AND NOT EXISTS (
@@ -404,12 +441,16 @@ async function updateDataset(req, res) {
   try {
     const datasetId = String(req.params.id || '').trim();
     const existing = await query(
-      `SELECT id, team_id FROM w4h.datasets WHERE id = $1`,
+      `SELECT id, team_id, COALESCE(read_only, false) AS read_only,
+              COALESCE(status, 'active') AS status
+       FROM w4h.datasets WHERE id = $1`,
       [datasetId]
     );
     if (!existing.rowCount) return res.status(404).json({ error: 'Dataset not found' });
 
     const currentTeamId = existing.rows[0].team_id;
+    const priorStatus = existing.rows[0].status || 'active';
+    const isReadOnly = Boolean(existing.rows[0].read_only);
     if (currentTeamId && !(await canAccessTeam(req.user, currentTeamId))) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
@@ -492,6 +533,18 @@ async function updateDataset(req, res) {
       fields.push(`team_id = $${params.length}::uuid`);
     }
 
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) {
+      const nextStatus = req.body.status === 'archived' ? 'archived' : 'active';
+      if (!currentTeamId || !(await actorCanManageCatalogOnTeam(req.user, currentTeamId))) {
+        return res.status(403).json({ error: 'Only the owning team admin can archive or restore this dataset' });
+      }
+      if (nextStatus === 'archived' && isReadOnly && !isSuperAdmin(req.user.role)) {
+        return res.status(403).json({ error: 'Platform sample datasets cannot be archived by team admins' });
+      }
+      params.push(nextStatus);
+      fields.push(`status = $${params.length}`);
+    }
+
     if (!fields.length) {
       return res.status(400).json({ error: 'No updatable fields provided' });
     }
@@ -502,6 +555,14 @@ async function updateDataset(req, res) {
       `UPDATE w4h.datasets SET ${fields.join(', ')} WHERE id = $${params.length}`,
       params
     );
+
+    const nextStatus = Object.prototype.hasOwnProperty.call(req.body || {}, 'status')
+      ? (req.body.status === 'archived' ? 'archived' : 'active')
+      : priorStatus;
+    if (nextStatus === 'archived' && priorStatus !== 'archived') {
+      await query(`DELETE FROM w4h.dataset_shares WHERE dataset_id = $1`, [datasetId]);
+      await query(`DELETE FROM w4h.project_datasets WHERE dataset_id = $1`, [datasetId]);
+    }
 
     const fresh = await query(`${CATALOG_SELECT} WHERE d.id = $1`, [datasetId]);
     res.json(fresh.rows[0]);
@@ -828,7 +889,6 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
       status: statusMap.get(table)
         || statusMap.get(table + '_staging')
         || null,
-      metabase_url: datasetInfo.metabase_urls?.[index] || null,
       source_name: datasetInfo.sources?.[index]?.name || null,
       source_url: datasetInfo.sources?.[index]?.url || null
     })) || [];
@@ -839,7 +899,6 @@ async function processDataset(dataset, user, QUERY_MAP, tableConfigs) {
 
     processedDataset.tables = processedDataset.tables.map(tableInfo => ({
       name: tableInfo.name,
-      metabase_url: tableInfo.metabase_url || null,
       source_name: tableInfo.source_name || null,
       source_url: tableInfo.source_url || null,
       status: statusMap.get(tableInfo.name)
@@ -900,7 +959,7 @@ async function listDatasets(req, res) {
 
     const datasetIds = result.rows.map(d => d.id);
     const tableConfigs = await query(`
-      SELECT dataset_id, name, metabase_url, source_name, source_url
+      SELECT dataset_id, name, source_name, source_url
       FROM w4h.tables
       WHERE dataset_id = ANY($1)
     `, [datasetIds]);
@@ -1014,7 +1073,7 @@ async function getDataset(req, res) {
       let tables = [];
       try {
         const tablesRes = await query(
-          `SELECT name, metabase_url, source_name, source_url
+          `SELECT name, source_name, source_url
            FROM w4h.tables
            WHERE dataset_id = $1
            ORDER BY name ASC`,
@@ -1053,7 +1112,7 @@ async function getDataset(req, res) {
   const dataset = result.rows[0];
 
   const tableConfigs = await query(`
-    SELECT dataset_id, name, metabase_url, source_name, source_url
+    SELECT dataset_id, name, source_name, source_url
     FROM w4h.tables
     WHERE dataset_id = $1
   `, [dataset.id]);
@@ -1322,6 +1381,147 @@ async function revokeDatasetShare(req, res) {
   } catch (error) {
     console.error('revokeDatasetShare error:', error);
     res.status(500).json({ error: error.message || 'Failed to revoke share' });
+  }
+}
+
+/** GET /datasets/:id/analytics/cohort — subject roster + comparable signals (ADR-021). */
+async function getDatasetCohortAnalytics(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const access = await assertCanViewDataset(req.user, datasetId);
+    if (!access.ok) {
+      return res.status(access.status || 403).json({ error: access.error || 'Unauthorized' });
+    }
+    const payload = await getCohortAnalyticsSetup(datasetId);
+    return res.json(payload);
+  } catch (error) {
+    console.error('getDatasetCohortAnalytics error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to load cohort analytics' });
+  }
+}
+
+/** POST /datasets/:id/analytics/cohort — selected vs control aggregates (ADR-021). */
+async function postDatasetCohortAnalytics(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const access = await assertCanViewDataset(req.user, datasetId);
+    if (!access.ok) {
+      return res.status(access.status || 403).json({ error: access.error || 'Unauthorized' });
+    }
+    const result = await runCohortComparison(datasetId, req.body || {});
+    if (!result.ok) {
+      return res.status(result.status || 400).json({ error: result.error || 'Cohort comparison failed' });
+    }
+    writeAuditLogSafe(req, {
+      action: 'dataset.query',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: {
+        analytics: 'cohort',
+        selected_count: result.selected_ids?.length ?? 0,
+        control_count: result.control_ids?.length ?? 0,
+        control_mode: result.control_mode || null,
+        signals: Object.keys(result.signals || {}),
+      },
+    });
+    return res.json(result);
+  } catch (error) {
+    console.error('postDatasetCohortAnalytics error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to run cohort comparison' });
+  }
+}
+
+/** GET /datasets/:id/signals — mapped signals from w4h.tables (ADR-023). */
+async function getDatasetSignals(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const access = await assertCanViewDataset(req.user, datasetId);
+    if (!access.ok) {
+      return res.status(access.status || 403).json({ error: access.error || 'Unauthorized' });
+    }
+    const payload = await listDatasetSignals(datasetId);
+    return res.json(payload);
+  } catch (error) {
+    console.error('getDatasetSignals error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to list signals' });
+  }
+}
+
+/** POST /datasets/:id/contributions/:slug/sql — bind + execute a kind:sql contribution (ADR-023). */
+async function runDatasetSqlContribution(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const slug = String(req.params.slug || '').trim();
+    const result = await runSqlContribution(req.user, datasetId, slug, req.body || {});
+    if (!result.ok) {
+      return res.status(result.status || 400).json({ error: result.error || 'SQL contribution failed' });
+    }
+    writeAuditLogSafe(req, {
+      action: result.write_back ? 'dataset.derive' : 'dataset.query',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: {
+        contribution_slug: slug,
+        write_back: result.write_back,
+        interval_minutes: result.interval_minutes,
+        physical_table: result.physical_table || null,
+        inserted: result.inserted ?? null,
+        row_count: result.row_count ?? null,
+      },
+    });
+    return res.json(result);
+  } catch (error) {
+    console.error('runDatasetSqlContribution error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to run SQL contribution' });
+  }
+}
+
+/** POST /datasets/:id/summary/refresh — recompute cached mets_summary (ADR-019). */
+async function refreshDatasetSummary(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const access = await assertCanIngestDataset(req.user, datasetId);
+    if (!access.ok) {
+      return res.status(access.status || 403).json({ error: access.error || 'Unauthorized' });
+    }
+
+    const currentRes = await query(
+      `SELECT summary FROM w4h.datasets WHERE id = $1`,
+      [datasetId]
+    );
+    if (!currentRes.rowCount) {
+      return res.status(404).json({ error: 'Dataset not found' });
+    }
+
+    const metsSummary = await computeMetsSummary(datasetId);
+    const nextSummary = mergeMetsSummary(currentRes.rows[0].summary, metsSummary);
+    const updated = await query(
+      `UPDATE w4h.datasets
+       SET summary = $2::jsonb, summary_updated_at = NOW()
+       WHERE id = $1
+       RETURNING summary, summary_updated_at`,
+      [datasetId, JSON.stringify(nextSummary)]
+    );
+
+    writeAuditLogSafe(req, {
+      action: 'dataset.summary.refresh',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: {
+        mets_available: Boolean(metsSummary?.available),
+        mets_source: metsSummary?.source || null,
+        subjects_with_data: metsSummary?.subjects_with_data ?? 0,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      summary: updated.rows[0].summary,
+      summary_updated_at: updated.rows[0].summary_updated_at,
+    });
+  } catch (error) {
+    console.error('refreshDatasetSummary error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to refresh dataset summary' });
   }
 }
 

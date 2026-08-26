@@ -340,8 +340,8 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
             'read_write'::text AS max_access_type
      FROM w4h.datasets d
      LEFT JOIN w4h.teams t ON t.id = d.team_id
-     WHERE d.team_id = $1::uuid
-        OR d.team_id IS NULL
+     WHERE (d.team_id = $1::uuid OR d.team_id IS NULL)
+       AND COALESCE(d.status, 'active') = 'active'
      ORDER BY d.name ASC NULLS LAST, d.id ASC`,
     [teamId]
   );
@@ -359,6 +359,7 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
      LEFT JOIN w4h.teams ot ON ot.id = d.team_id
      WHERE ds.target_team_id = $1::uuid
        AND (ds.target_project_id IS NULL OR ds.target_project_id = $2::uuid)
+       AND COALESCE(d.status, 'active') = 'active'
      ORDER BY d.name ASC NULLS LAST, d.id ASC`,
     [teamId, projectId]
   );
@@ -397,6 +398,7 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
          LEFT JOIN w4h.teams t ON t.id = d.team_id
          WHERE d.team_id IS NOT NULL
            AND d.team_id IS DISTINCT FROM $1::uuid
+           AND COALESCE(d.status, 'active') = 'active'
          ORDER BY d.name ASC NULLS LAST, d.id ASC`,
         [teamId]
       );
@@ -413,6 +415,7 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
          LEFT JOIN w4h.teams t ON t.id = d.team_id
          WHERE d.team_id = ANY($1::uuid[])
            AND d.team_id IS DISTINCT FROM $2::uuid
+           AND COALESCE(d.status, 'active') = 'active'
          ORDER BY d.name ASC NULLS LAST, d.id ASC`,
         [adminTeamIds, teamId]
       );
@@ -658,6 +661,7 @@ async function getProjectOverview(req, res) {
            FROM w4h.project_datasets pd
            JOIN w4h.datasets d ON d.id = pd.dataset_id
            WHERE pd.project_id = $1::uuid
+             AND COALESCE(d.status, 'active') = 'active'
            ORDER BY d.name ASC NULLS LAST, d.id ASC`,
           [projectId]
         ),
@@ -723,7 +727,12 @@ async function getProjectOverview(req, res) {
           }));
 
     const hydratedDatasetRows = await hydrateDatasetSummaries(datasetsRes.rows);
-    const linkableById = new Map(linkableDatasets.map((d) => [String(d.id), d]));
+    const hydratedLinkable = canManage
+      ? await hydrateDatasetSummaries(
+          linkableDatasets.map((d) => ({ ...d, dataset_id: d.id }))
+        )
+      : [];
+    const linkableById = new Map(hydratedLinkable.map((d) => [String(d.id), d]));
     const datasets = hydratedDatasetRows.map((row) => {
       const meta = linkableById.get(String(row.dataset_id));
       return {
@@ -740,7 +749,7 @@ async function getProjectOverview(req, res) {
       project,
       members: membersRes.rows,
       datasets,
-      linkable_datasets: canManage ? linkableDatasets : [],
+      linkable_datasets: hydratedLinkable,
       eligible_members: canManage ? eligibleMembers : [],
       pages: pagesRes.rows,
       docs: [],
