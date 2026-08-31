@@ -13,7 +13,7 @@ import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { importCsvBatch, assertCanIngestDataset } from '../lib/ingest-csv.js';
-import { persistBasicStats } from '../lib/dataset-basic-stats.js';
+import { persistBasicStats, fetchTablePreviews } from '../lib/dataset-basic-stats.js';
 import { computeMetsSummary, mergeMetsSummary } from '../lib/dataset-mets-summary.js';
 import { listDatasetSignals, runSqlContribution, assertCanViewDataset } from '../lib/sql-contribution-engine.js';
 import { getCohortAnalyticsSetup, runCohortComparison } from '../lib/cohort-analytics.js';
@@ -39,6 +39,7 @@ router.post('/:id/summary/refresh', authenticateJwtOrApiKey, refreshDatasetSumma
 router.post('/:id/contributions/:slug/sql', authenticateJwtOrApiKey, runDatasetSqlContribution);
 router.get('/:id/dependents', authenticateJwtOrApiKey, getDatasetDependents);
 router.get('/:id/signals', authenticateJwtOrApiKey, getDatasetSignals);
+router.get('/:id/tables/preview', authenticateJwtOrApiKey, getDatasetTablePreview);
 router.get('/:id/analytics/cohort', authenticateJwtOrApiKey, getDatasetCohortAnalytics);
 router.post('/:id/analytics/cohort', authenticateJwtOrApiKey, postDatasetCohortAnalytics);
 router.get('/:id', authenticateJwtOrApiKey, getDataset);
@@ -1438,6 +1439,28 @@ async function postDatasetCohortAnalytics(req, res) {
   } catch (error) {
     console.error('postDatasetCohortAnalytics error:', error);
     return res.status(500).json({ error: error.message || 'Failed to run cohort comparison' });
+  }
+}
+
+/** GET /datasets/:id/tables/preview — column names + first 5 rows (Analytics card). */
+async function getDatasetTablePreview(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const access = await assertCanViewDataset(req.user, datasetId);
+    if (!access.ok) {
+      return res.status(access.status || 403).json({ error: access.error || 'Unauthorized' });
+    }
+    const tables = await fetchTablePreviews(datasetId, { limit: 5 });
+    writeAuditLogSafe(req, {
+      action: 'dataset.preview',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: { limit: 5, table_count: tables.length },
+    });
+    return res.json({ tables });
+  } catch (error) {
+    console.error('getDatasetTablePreview error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to preview tables' });
   }
 }
 
