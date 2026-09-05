@@ -32,6 +32,7 @@ router.get('/share-targets', authenticateJwtOrApiKey, requireTeamAdmin, listShar
 router.delete('/shares/:shareId', authenticateJwtOrApiKey, requireTeamAdmin, revokeDatasetShare);
 router.get('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, listSharesForDataset);
 router.post('/:id/shares', authenticateJwtOrApiKey, requireTeamAdmin, createDatasetShare);
+router.delete('/:id', authenticateJwtOrApiKey, requireTeamAdmin, deleteDataset);
 router.patch('/:id', authenticateJwtOrApiKey, requireTeamAdmin, updateDataset);
 router.post('/:id/import/csv-batch', authenticateJwtOrApiKey, importCsvBatchHandler);
 router.post('/:id/summary/refresh', authenticateJwtOrApiKey, refreshDatasetSummary);
@@ -431,6 +432,61 @@ async function createDataset(req, res) {
       return res.status(409).json({ error: 'Dataset id already exists' });
     }
     res.status(500).json({ error: error.message || 'Failed to create dataset' });
+  }
+}
+
+async function deleteDataset(req, res) {
+  if (!canManageDatasets(req.user)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const existing = await query(
+      `SELECT id, team_id, COALESCE(read_only, false) AS read_only
+       FROM w4h.datasets WHERE id = $1`,
+      [datasetId]
+    );
+    if (!existing.rowCount) {
+      return res.status(404).json({ error: 'Dataset not found' });
+    }
+
+    const currentTeamId = existing.rows[0].team_id;
+    const isReadOnly = Boolean(existing.rows[0].read_only);
+    if (currentTeamId && !(await canAccessTeam(req.user, currentTeamId))) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    if (!currentTeamId && !isSuperAdmin(req.user.role)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    if (!currentTeamId || !(await actorCanManageCatalogOnTeam(req.user, currentTeamId))) {
+      return res.status(403).json({ error: 'Only the owning team admin can delete this dataset' });
+    }
+    if (isReadOnly && !isSuperAdmin(req.user.role)) {
+      return res.status(403).json({ error: 'Platform sample datasets cannot be deleted by team admins' });
+    }
+
+    const tableCountRes = await query(
+      `SELECT COUNT(*)::int AS n FROM w4h.tables WHERE dataset_id = $1`,
+      [datasetId]
+    );
+    if ((tableCountRes.rows[0]?.n || 0) > 0) {
+      return res.status(409).json({ error: 'Only empty datasets can be deleted completely' });
+    }
+
+    await query(`DELETE FROM w4h.dataset_shares WHERE dataset_id = $1`, [datasetId]);
+    await query(`DELETE FROM w4h.project_datasets WHERE dataset_id = $1`, [datasetId]);
+    await query(`DELETE FROM w4h.datasets WHERE id = $1`, [datasetId]);
+    writeAuditLogSafe(req, {
+      action: 'dataset.delete',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: { deleted: true },
+    });
+
+    res.json({ ok: true, deleted: true, dataset_id: datasetId });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to delete dataset' });
   }
 }
 
