@@ -9,6 +9,7 @@ import { deliverInvitation } from '../lib/invitations.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
+import { attachMetadataSummaries } from '../lib/dataset-metadata-summary.js';
 
 const router = express.Router();
 
@@ -656,7 +657,8 @@ async function getProjectOverview(req, res) {
         query(
           `SELECT pd.dataset_id, pd.access_type, pd.approved_at,
                   d.name, d.description, d.${pc} AS dataset_project_id, d.team_id AS dataset_team_id,
-                  d.device_type, d.subject_count, d.date_start, d.date_end,
+                  d.device_type, d.sampling_rate, d.subject_count, d.date_start, d.date_end,
+                  d.irb_reference, d.description,
                   d.summary, d.summary_updated_at, d.read_only, d.origin
            FROM w4h.project_datasets pd
            JOIN w4h.datasets d ON d.id = pd.dataset_id
@@ -726,10 +728,14 @@ async function getProjectOverview(req, res) {
             sort_order: idx
           }));
 
-    const hydratedDatasetRows = await hydrateDatasetSummaries(datasetsRes.rows);
+    const hydratedDatasetRows = await attachMetadataSummaries(
+      await hydrateDatasetSummaries(datasetsRes.rows)
+    );
     const hydratedLinkable = canManage
-      ? await hydrateDatasetSummaries(
-          linkableDatasets.map((d) => ({ ...d, dataset_id: d.id }))
+      ? await attachMetadataSummaries(
+          await hydrateDatasetSummaries(
+            linkableDatasets.map((d) => ({ ...d, dataset_id: d.id }))
+          )
         )
       : [];
     const linkableById = new Map(hydratedLinkable.map((d) => [String(d.id), d]));
