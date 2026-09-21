@@ -16,6 +16,7 @@ import { importCsvBatch, assertCanIngestDataset } from '../lib/ingest-csv.js';
 import { computeMetsSummary, mergeMetsSummary } from '../lib/dataset-mets-summary.js';
 import { listDatasetSignals, runSqlContribution, assertCanViewDataset } from '../lib/sql-contribution-engine.js';
 import { getCohortAnalyticsSetup, runCohortComparison } from '../lib/cohort-analytics.js';
+import { attachMetadataSummaries } from '../lib/dataset-metadata-summary.js';
 
 router.get('/projects', authenticateJwtOrApiKey, listProjects);
 // Legacy projects-admin CRUD is platform-wide — Super admin only
@@ -1113,7 +1114,7 @@ async function getDataset(req, res) {
               return res.status(403).json({ error: 'Unauthorized' });
             }
             // Discoverable listing: metadata only (D-23 / S-10)
-            const [enriched] = await attachTableCounts([{
+            const [enriched] = await attachMetadataSummaries(await attachTableCounts([{
               ...row,
               project_names: '',
               projects: [],
@@ -1121,7 +1122,7 @@ async function getDataset(req, res) {
               source_kind: 'listed',
               source_label: row.team_name ? `Listed · ${row.team_name}` : 'Listed',
               table_count: 0,
-            }]);
+            }]));
             return res.json(enriched);
           }
         }
@@ -1139,7 +1140,7 @@ async function getDataset(req, res) {
       } catch {
         tables = [];
       }
-      const [enriched] = await attachTableCounts([{ ...row, tables }]);
+      const [enriched] = await attachMetadataSummaries(await attachTableCounts([{ ...row, tables }]));
       return res.json(enriched);
     } catch (error) {
       return res.status(500).json({ error: error.message || 'Failed to load dataset' });
@@ -1176,6 +1177,23 @@ async function getDataset(req, res) {
   const QUERY_MAP = await getQueryMap(dataset.dataset_project_id);
 
   const processedDataset = await processDataset(dataset, req.user, QUERY_MAP, tableConfigs.rows);
+
+  const catalogRes = await query(
+    `SELECT device_type, sampling_rate, subject_count, date_start, date_end,
+            irb_reference, origin, description, COALESCE(read_only, false) AS read_only
+     FROM w4h.datasets WHERE id = $1`,
+    [dataset.id]
+  );
+  const catalogRow = catalogRes.rows[0] || {};
+  const [withMeta] = await attachMetadataSummaries([
+    {
+      ...catalogRow,
+      id: dataset.id,
+      name: dataset.name || catalogRow.name,
+      description: dataset.description ?? catalogRow.description,
+    },
+  ]);
+  processedDataset.metadata_summary = withMeta.metadata_summary;
 
   res.json(processedDataset);
 }
