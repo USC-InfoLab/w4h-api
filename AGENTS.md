@@ -33,7 +33,7 @@ Open these together via `w4h-repos.code-workspace` when changing cross-cutting b
 - Platform role Super admin is account-wide; team/project authority comes from memberships.
 - Project membership: `owner` / `editor` / `viewer` (UI: Admin / User).
 - W4H does not register project-owned notebooks. Browse **Contributions** (`/contributions`, ADR-018).
-- Catalog schema: `w4h.contributions` (publisher, kind, language, repo). Do not reintroduce `project_notebooks`.
+- Catalog schema: `w4h.contributions` (publisher, kind, language, repo, **version pin**). Do not reintroduce `project_notebooks`.
 - SQL analytics (sibling `w4h-docs/dev/ADR-023-sql-analytics-contributions.md`): bind Super-admin-vetted YAML templates via `lib/sql-contribution-engine.js`; **never** `POST` arbitrary SQL. In-app: `POST /contributions/:slug/run { dataset_id }` (same entry as importers); notebooks: `POST /datasets/:id/contributions/:slug/sql` (sync). Package lives in sibling `w4h-sql-compute-mets`. `kind: sql` is a job; `postgres_extension` is `CREATE EXTENSION`. Do not add new `lib/dataset-*.js` modules that own a formula.
 - Cohort comparison (ADR-021): `GET`/`POST /datasets/:id/analytics/cohort` in `lib/cohort-analytics.js` aggregates mapped HR/calories/METs. It does **not** own the MET formula. Filter-based subject IDs only — no free SQL, no attribute matching until demographics exist.
 - Never log or return plaintext API keys except intentional step-up reveal flows; prefer encrypted wrap + audit.

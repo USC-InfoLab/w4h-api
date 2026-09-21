@@ -7,9 +7,14 @@ import {
   createContribution,
   updateContribution,
   deleteContribution,
+  presentContribution,
 } from '../lib/contributions.js';
 import { startContributionRun, getContributionRun } from '../lib/contribution-runner.js';
 import { inspectRepository } from '../lib/contributions-manifest.js';
+import {
+  checkContributionUpdates,
+  previewOrPinContributionVersion,
+} from '../lib/contributions-versions.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 
 const router = express.Router();
@@ -21,11 +26,22 @@ function requireSuperAdmin(req, res, next) {
   next();
 }
 
+function presentRows(rows, req) {
+  const includeAdminFields = isSuperAdmin(req.user?.role);
+  return rows.map((row) => presentContribution(row, { includeAdminFields }));
+}
+
+function presentRow(row, req) {
+  return presentContribution(row, { includeAdminFields: isSuperAdmin(req.user?.role) });
+}
+
 router.get('/', authenticateJwtOrApiKey, list);
 router.get('/runs/:id', authenticateJwtOrApiKey, getRun);
+router.post('/inspect', authenticate, requireSuperAdmin, inspect);
+router.post('/check-updates', authenticate, requireSuperAdmin, checkUpdates);
+router.post('/:slug/update-version', authenticate, requireSuperAdmin, updateVersion);
 router.get('/:slug', authenticateJwtOrApiKey, get);
 router.post('/', authenticate, requireSuperAdmin, create);
-router.post('/inspect', authenticate, requireSuperAdmin, inspect);
 router.post('/:slug/run', authenticateJwtOrApiKey, run);
 router.patch('/:slug', authenticate, requireSuperAdmin, patch);
 router.delete('/:slug', authenticate, requireSuperAdmin, remove);
@@ -37,7 +53,7 @@ async function list(req, res) {
     const language = typeof req.query.language === 'string' ? req.query.language : '';
     const includeUnpublished = isSuperAdmin(req.user?.role) && req.query.all === '1';
     const rows = await listContributions({ q, kind, language, includeUnpublished });
-    res.json(rows);
+    res.json(presentRows(rows, req));
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to load contributions' });
   }
@@ -48,7 +64,7 @@ async function get(req, res) {
     const includeUnpublished = isSuperAdmin(req.user?.role);
     const row = await getContribution(req.params.slug, { withDocs: true, includeUnpublished });
     if (!row) return res.status(404).json({ error: 'Contribution not found' });
-    res.json(row);
+    res.json(presentRow(row, req));
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to load contribution' });
   }
@@ -58,7 +74,7 @@ async function create(req, res) {
   try {
     const result = await createContribution(req.body || {}, req.user?.id);
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
-    res.status(201).json(result.row);
+    res.status(201).json(presentRow(result.row, req));
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to create contribution' });
   }
@@ -68,7 +84,7 @@ async function patch(req, res) {
   try {
     const result = await updateContribution(req.params.slug, req.body || {});
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
-    res.json(result.row);
+    res.json(presentRow(result.row, req));
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to update contribution' });
   }
@@ -81,6 +97,37 @@ async function inspect(req, res) {
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to inspect repository' });
+  }
+}
+
+async function checkUpdates(req, res) {
+  try {
+    const slug = typeof req.body?.slug === 'string' ? req.body.slug.trim() : '';
+    const result = await checkContributionUpdates({ slug: slug || undefined });
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    res.json({
+      results: result.results,
+      rows: presentRows(result.rows, req),
+      updates: result.updates,
+      without_releases: result.without_releases,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed to check for updates' });
+  }
+}
+
+async function updateVersion(req, res) {
+  try {
+    const repoRef = req.body?.repo_ref != null ? String(req.body.repo_ref).trim() : '';
+    const confirm = req.body?.confirm === true;
+    const result = await previewOrPinContributionVersion(req.params.slug, repoRef, { confirm });
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    res.json({
+      preview: result.preview,
+      row: presentRow(result.row, req),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed to update contribution version' });
   }
 }
 

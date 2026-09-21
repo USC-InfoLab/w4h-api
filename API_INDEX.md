@@ -3,7 +3,7 @@
 Structural map of `w4h-api` for agents and humans. **Index only** — not API docs.
 
 - Regenerate: `npm run index:api`
-- Generated: 2026-08-26
+- Generated: 2026-09-21
 - Do not hand-edit the lists below; change code, then re-run the script.
 
 ## Orientation
@@ -35,24 +35,24 @@ Structural map of `w4h-api` for agents and humans. **Index only** — not API do
 
 Unmounted route modules: `routes/data.js`, `routes/subjects.js`
 
-## Endpoints (132)
+## Endpoints (137)
 
 - **Root:** GET `/`
 - **`/users`:** POST `/users/login` · POST `/users/send-code` · POST `/users/verify-code` · POST `/users/token-valid` · GET `/users/invite/:token` · POST `/users/invite/accept` · POST `/users/invite/resend` · POST `/users/invite/revoke` · GET `/users/me/api-key` · POST `/users/me/api-key/reveal` · POST `/users/me/api-key` · DELETE `/users/me/api-key` · DELETE `/users/user/:email/api-key` · GET `/users/` · GET `/users/user/:email` · POST `/users/profile` · POST `/users/add` · POST `/users/set` · POST `/users/discontinue` · POST `/users/resume` · DELETE `/users/:email` · GET `/users/roles`
-- **`/datasets`:** GET `/datasets/projects` · GET `/datasets/projects-admin` · GET `/datasets/projects-admin/:id` · POST `/datasets/projects-admin` · PUT `/datasets/projects-admin/:id` · GET `/datasets/tableinfo` · GET `/datasets/` · POST `/datasets/` · GET `/datasets/shares` · GET `/datasets/share-targets` · DELETE `/datasets/shares/:shareId` · GET `/datasets/:id/shares` · POST `/datasets/:id/shares` · PATCH `/datasets/:id` · POST `/datasets/:id/import/csv-batch` · POST `/datasets/:id/summary/refresh` · POST `/datasets/:id/contributions/:slug/sql` · GET `/datasets/:id/dependents` · GET `/datasets/:id/signals` · GET `/datasets/:id/analytics/cohort` · POST `/datasets/:id/analytics/cohort` · GET `/datasets/:id`
+- **`/datasets`:** GET `/datasets/projects` · GET `/datasets/projects-admin` · GET `/datasets/projects-admin/:id` · POST `/datasets/projects-admin` · PUT `/datasets/projects-admin/:id` · GET `/datasets/tableinfo` · GET `/datasets/` · POST `/datasets/` · GET `/datasets/shares` · GET `/datasets/share-targets` · DELETE `/datasets/shares/:shareId` · GET `/datasets/:id/shares` · POST `/datasets/:id/shares` · DELETE `/datasets/:id` · PATCH `/datasets/:id` · POST `/datasets/:id/import/csv-batch` · POST `/datasets/:id/summary/refresh` · POST `/datasets/:id/contributions/:slug/sql` · GET `/datasets/:id/dependents` · GET `/datasets/:id/signals` · GET `/datasets/:id/analytics/cohort` · POST `/datasets/:id/analytics/cohort` · GET `/datasets/:id`
 - **`/docs`:** GET `/docs/` · GET `/docs/search` · GET `/docs/cards/feature` · GET `/docs/export` · GET `/docs/refresh/preview` · POST `/docs/refresh` · GET `/docs/types` · POST `/docs/types` · GET `/docs/:slug` · PUT `/docs/:slug` · DELETE `/docs/:slug`
 - **`/config`:** GET `/config/status` · GET `/config/admin-home` · GET `/config/team-home` · GET `/config/usage` · GET `/config/api-usage` · POST `/config/client-usage` · POST `/config/report-issue` · GET `/config/audit-log` · GET `/config/database-settings` · GET `/config/mailer-settings` · POST `/config/mailer-settings` · POST `/config/mailer-test` · GET `/config/app-settings` · POST `/config/app-settings` · POST `/config/init-database` · POST `/config/admin-setup` · GET `/config/test` · POST `/config/reset`
 - **`/platform`:** GET `/platform/hub-principles`
 - **`/projects`:** GET `/projects/` · POST `/projects/` · GET `/projects/:id/db-tokens` · DELETE `/projects/:id/db-tokens/purge-inactive` · DELETE `/projects/:id/db-tokens/:tokenId` · GET `/projects/:id/acl` · PUT `/projects/:id/acl` · GET `/projects/:id/linkable-datasets` · GET `/projects/:id` · PATCH `/projects/:id` · POST `/projects/:id/members` · PATCH `/projects/:id/members/:userId` · DELETE `/projects/:id/members/:userId` · PUT `/projects/:id/members` · PUT `/projects/:id/organizations` · PUT `/projects/:id/datasets` · PUT `/projects/:id/docs` · GET `/projects/:id/pages` · POST `/projects/:id/pages` · GET `/projects/:id/pages/:slug` · PUT `/projects/:id/pages/:slug` · DELETE `/projects/:id/pages/:slug` · POST `/projects/:id/db-token`
 - **`/teams`:** GET `/teams/` · POST `/teams/` · GET `/teams/:id` · PATCH `/teams/:id` · POST `/teams/:id/members` · PATCH `/teams/:id/members/:userId` · DELETE `/teams/:id/members/:userId`
-- **`/contributions`:** GET `/contributions/` · GET `/contributions/runs/:id` · GET `/contributions/:slug` · POST `/contributions/` · POST `/contributions/inspect` · POST `/contributions/:slug/run` · PATCH `/contributions/:slug` · DELETE `/contributions/:slug`
-- **`/packages`:** GET `/packages/` · GET `/packages/runs/:id` · GET `/packages/:slug` · POST `/packages/` · POST `/packages/inspect` · POST `/packages/:slug/run` · PATCH `/packages/:slug` · DELETE `/packages/:slug`
+- **`/contributions`:** GET `/contributions/` · GET `/contributions/runs/:id` · POST `/contributions/inspect` · POST `/contributions/check-updates` · POST `/contributions/:slug/update-version` · GET `/contributions/:slug` · POST `/contributions/` · POST `/contributions/:slug/run` · PATCH `/contributions/:slug` · DELETE `/contributions/:slug`
+- **`/packages`:** GET `/packages/` · GET `/packages/runs/:id` · POST `/packages/inspect` · POST `/packages/check-updates` · POST `/packages/:slug/update-version` · GET `/packages/:slug` · POST `/packages/` · POST `/packages/:slug/run` · PATCH `/packages/:slug` · DELETE `/packages/:slug`
 - **`/ai`:** GET `/ai/status` · GET `/ai/settings/platform` · PATCH `/ai/settings/platform` · GET `/ai/settings/team/:teamId` · PATCH `/ai/settings/team/:teamId` · GET `/ai/conversations` · POST `/ai/conversations` · GET `/ai/conversations/:id` · PATCH `/ai/conversations/:id` · DELETE `/ai/conversations/:id` · POST `/ai/chat`
 
-## Lib (31)
+## Lib (33)
 
 - `lib/ai/`: `claude.js`, `conversations.js`, `keys.js`, `phi.js`, `prompt.js`
-- `lib/`: `cohort-analytics.js`, `config.js`, `contribution-runner.js`, `contributions-manifest.js`, `contributions.js`, `dataset-mets-summary.js`, `db-init.js`, `docs-mermaid-render.js`, `env-path.js`, `ingest-csv.js`, `invitations.js`, `mailer.js`, `seed-docs-fixtures.js`, `sql-contribution-engine.js`
+- `lib/`: `cohort-analytics.js`, `config.js`, `contribution-runner.js`, `contributions-manifest.js`, `contributions-versions.js`, `contributions.js`, `dataset-metadata-summary.js`, `dataset-mets-summary.js`, `db-init.js`, `docs-mermaid-render.js`, `env-path.js`, `ingest-csv.js`, `invitations.js`, `mailer.js`, `seed-docs-fixtures.js`, `sql-contribution-engine.js`
 - `lib/middleware/`: `projectDbTokenAuth.js`
 - `lib/utils/`: `apiKeyCrypto.js`, `apiKeys.js`, `audit.js`, `datasetProjectLinkColumn.js`, `defs.js`, `docs.js`, `md-paths.js`, `md-render.js`, `password-validator.js`, `usage.js`, `user.js`
 

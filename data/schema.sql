@@ -256,6 +256,14 @@ CREATE INDEX IF NOT EXISTS idx_contributions_kinds ON w4h.contributions USING GI
 -- "Run" button (ADR-022). Defaults to false — most contributions are docs-only.
 ALTER TABLE w4h.contributions ADD COLUMN IF NOT EXISTS runnable boolean NOT NULL DEFAULT false;
 
+-- Catalog pin (ADR-018): display semver plus last-seen GitHub release/tag.
+-- repo_ref remains the git pin the runner checks out. Super admin promotes
+-- latest_* onto repo_ref/version after an explicit Update — never auto-follow main.
+ALTER TABLE w4h.contributions ADD COLUMN IF NOT EXISTS version text;
+ALTER TABLE w4h.contributions ADD COLUMN IF NOT EXISTS latest_version text;
+ALTER TABLE w4h.contributions ADD COLUMN IF NOT EXISTS latest_repo_ref text;
+ALTER TABLE w4h.contributions ADD COLUMN IF NOT EXISTS version_checked_at timestamptz;
+
 DELETE FROM w4h.contributions WHERE lower(slug) = 'w4h-load-csv';
 
 INSERT INTO w4h.contributions (slug, publisher, title, summary, kind, kinds, language, repo_url, repo_ref, docs_path, status)
@@ -339,6 +347,19 @@ VALUES
     'published'
   ),
   (
+    'w4h-fitbit-csv-file-importer',
+    'usc-infolab',
+    'Fitbit CSV file importer',
+    'Import user-supplied Fitbit CSV files. Notebook has a file chooser; in-app Run currently loads the sibling w4h-sample-fitbit-csv files so results can be compared with the catalogued Fitbit sample importer.',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-fitbit-csv-file-importer',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
     'w4h-compute-mets',
     'usc-infolab',
     'Compute METs',
@@ -372,16 +393,18 @@ ON CONFLICT (slug) DO UPDATE SET
   kinds = EXCLUDED.kinds,
   language = EXCLUDED.language,
   repo_url = EXCLUDED.repo_url,
-  repo_ref = EXCLUDED.repo_ref,
   docs_path = EXCLUDED.docs_path,
   status = EXCLUDED.status,
   updated_at = NOW();
+-- repo_ref, version, latest_version, latest_repo_ref, version_checked_at are
+-- Super-admin pins / check cache — do not reset them to seed `main` on boot.
 
 -- First-party contributions vetted for in-app execution (ADR-022 importers, ADR-023 SQL jobs).
 UPDATE w4h.contributions SET runnable = true
 WHERE slug IN (
   'w4h-sample-fitbit-csv-importer',
   'w4h-sample-icde-demo-csv-importer',
+  'w4h-fitbit-csv-file-importer',
   'w4h-sql-compute-mets'
 );
 
@@ -409,6 +432,10 @@ CREATE INDEX IF NOT EXISTS idx_contribution_runs_dataset_id ON w4h.contribution_
 -- contribution_runs already existed in some dev databases, so this is an ALTER
 -- (CREATE TABLE IF NOT EXISTS above is a no-op against an existing table).
 ALTER TABLE w4h.contribution_runs ADD COLUMN IF NOT EXISTS progress jsonb;
+
+-- Pin that was current when the run started (survives a later catalog bump).
+ALTER TABLE w4h.contribution_runs ADD COLUMN IF NOT EXISTS version text;
+ALTER TABLE w4h.contribution_runs ADD COLUMN IF NOT EXISTS repo_ref text;
 
 -- ---------------------------------------------------------------------------
 -- Project Pages — private project documentation (MVP Doc-08). Not platform Help.
