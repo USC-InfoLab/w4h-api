@@ -158,6 +158,7 @@ async function run(req, res) {
     const mode = req.body?.mode === 'full' ? 'full' : 'update';
     const slug = req.params.slug;
     const uploadId = req.body?.upload_id ? String(req.body.upload_id) : null;
+    if (!uploadId && UPLOAD_SLUGS.has(slug)) return res.status(400).json({ error: 'upload_id is required: this importer runs on uploaded files' });
     const result = await startContributionRun({ slug, datasetId, user: req.user, mode, uploadId });
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
     if (result.runKind === 'sql') {
