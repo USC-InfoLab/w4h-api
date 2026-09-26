@@ -10,6 +10,11 @@ import {
   presentContribution,
 } from '../lib/contributions.js';
 import { startContributionRun, getContributionRun } from '../lib/contribution-runner.js';
+import { assertCanIngestDataset } from '../lib/ingest-csv.js';
+import {
+  createUpload, loadUpload, saveUploadFile, deleteUploadFile, listUploadFiles,
+  MAX_FILES, MAX_FILE_SIZE_BYTES, MAX_TOTAL_SIZE_BYTES,
+} from '../lib/contribution-uploads.js';
 import { inspectRepository } from '../lib/contributions-manifest.js';
 import {
   checkContributionUpdates,
@@ -40,6 +45,11 @@ router.get('/runs/:id', authenticateJwtOrApiKey, getRun);
 router.post('/inspect', authenticate, requireSuperAdmin, inspect);
 router.post('/check-updates', authenticate, requireSuperAdmin, checkUpdates);
 router.post('/:slug/update-version', authenticate, requireSuperAdmin, updateVersion);
+// Admin-chosen files for importers that take them: stage, then run with upload_id.
+router.post('/:slug/uploads', authenticateJwtOrApiKey, (req, res) => createUploadRoute(req, res));
+router.get('/uploads/:uploadId', authenticateJwtOrApiKey, (req, res) => getUploadRoute(req, res));
+router.put('/uploads/:uploadId/files/:name', authenticateJwtOrApiKey, (req, res) => putUploadFile(req, res));
+router.delete('/uploads/:uploadId/files/:name', authenticateJwtOrApiKey, (req, res) => deleteUploadFileRoute(req, res));
 router.get('/:slug', authenticateJwtOrApiKey, get);
 router.post('/', authenticate, requireSuperAdmin, create);
 router.post('/:slug/run', authenticateJwtOrApiKey, run);
@@ -147,7 +157,8 @@ async function run(req, res) {
     if (!datasetId) return res.status(400).json({ error: 'dataset_id is required' });
     const mode = req.body?.mode === 'full' ? 'full' : 'update';
     const slug = req.params.slug;
-    const result = await startContributionRun({ slug, datasetId, user: req.user, mode });
+    const uploadId = req.body?.upload_id ? String(req.body.upload_id) : null;
+    const result = await startContributionRun({ slug, datasetId, user: req.user, mode, uploadId });
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
     if (result.runKind === 'sql') {
       const sql = result.sqlResult;
@@ -177,6 +188,56 @@ async function run(req, res) {
     res.status(500).json({ error: e.message || 'Failed to start run' });
   }
 }
+
+// ponytail: hardcoded slug; move to a contribution.yaml `inputs: files` flag when a 2nd module needs uploads
+const UPLOAD_SLUGS = new Set(['w4h-fitbit-csv-file-importer']);
+
+async function createUploadRoute(req, res) {
+  try {
+    const datasetId = String(req.body?.dataset_id || '').trim();
+    if (!datasetId) return res.status(400).json({ error: 'dataset_id is required' });
+    const contribution = await getContribution(req.params.slug, { includeUnpublished: isSuperAdmin(req.user?.role) });
+    if (!contribution?.runnable || !UPLOAD_SLUGS.has(contribution.slug)) {
+      return res.status(404).json({ error: 'This contribution does not accept uploaded files' });
+    }
+    const access = await assertCanIngestDataset(req.user, datasetId);
+    if (!access.ok) return res.status(access.status).json({ error: access.error });
+    const { id } = createUpload({ user: req.user, slug: contribution.slug, datasetId });
+    res.status(201).json({
+      upload_id: id,
+      limits: { max_files: MAX_FILES, max_file_bytes: MAX_FILE_SIZE_BYTES, max_total_bytes: MAX_TOTAL_SIZE_BYTES },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed to create upload' });
+  }
+}
+
+function withUpload(handler) {
+  return async (req, res) => {
+    try {
+      const upload = loadUpload(req.params.uploadId, req.user);
+      if (!upload.ok) return res.status(upload.status).json({ error: upload.error });
+      await handler(req, res, upload);
+    } catch (e) {
+      res.status(500).json({ error: e.message || 'Upload request failed' });
+    }
+  };
+}
+
+const getUploadRoute = withUpload(async (_req, res, upload) => {
+  res.json({ files: listUploadFiles(upload.dir) });
+});
+
+const putUploadFile = withUpload(async (req, res, upload) => {
+  const result = await saveUploadFile(upload.dir, req.params.name, req);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.json({ name: result.name, size: result.size });
+});
+
+const deleteUploadFileRoute = withUpload(async (req, res, upload) => {
+  deleteUploadFile(upload.dir, req.params.name);
+  res.json({ success: true });
+});
 
 async function getRun(req, res) {
   try {
