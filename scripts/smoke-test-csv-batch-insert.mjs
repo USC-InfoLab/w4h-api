@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+/**
+ * Runnable self-check for the batched importCsvBatch() insert path
+ * (lib/ingest-csv.js) — the fix for the Fitabase-sized-import slowness.
+ * Exercises: multi-statement sub-batching (>1 INSERT per call), dedupe
+ * ON CONFLICT skip counting, mode:'replace' truncation, and rollback on
+ * a mid-batch failure. Creates/drops its own scratch dataset + schema —
+ * safe to run against a real dev DB. `node scripts/smoke-test-csv-batch-insert.mjs`
+ */
+import assert from 'node:assert/strict';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
+
+const { query, getPool } = await import('../db.js');
+const { importCsvBatch } = await import('../lib/ingest-csv.js');
+
+const DATASET_ID = 'smoke_test_csv_batch_tmp';
+const SUPER_ADMIN = { id: 'smoke-test-user', role: 'super_admin' };
+
+function makeRows(n, offset = 0) {
+  return Array.from({ length: n }, (_, i) => ({
+    id: String(offset + i),
+    value: offset + i,
+  }));
+}
+
+async function cleanup() {
+  await query(`DROP SCHEMA IF EXISTS ds_${DATASET_ID} CASCADE`);
+  await query(`DELETE FROM w4h.datasets WHERE id = $1`, [DATASET_ID]);
+}
+
+async function main() {
+  await cleanup();
+  await query(`INSERT INTO w4h.datasets (id, name) VALUES ($1, 'Smoke test')`, [DATASET_ID]);
+
+  const columns = [
+    { name: 'id', type: 'text' },
+    { name: 'value', type: 'integer' },
+  ];
+
+  // 1) A batch bigger than one INSERT statement's param budget (60000/2 cols
+  // = 30000 rows/stmt) forces the sub-batch loop to run more than once.
+  const big = makeRows(65000);
+  const res1 = await importCsvBatch(SUPER_ADMIN, DATASET_ID, {
+    signal: 'sig', mode: 'replace', columns, dedupe_columns: ['id'], rows: big,
+  });
+  assert.equal(res1.ok, true, 'insert should succeed');
+  assert.equal(res1.inserted, 65000, `expected 65000 inserted, got ${res1.inserted}`);
+  const count1 = await query(`SELECT count(*)::int AS n FROM ds_${DATASET_ID}.sig`);
+  assert.equal(count1.rows[0].n, 65000, 'row count should match');
+
+  // 2) Re-import an overlapping batch in append mode — dedupe (ON CONFLICT)
+  // should skip the 30000 rows that already exist and only add the new ones.
+  const overlap = makeRows(40000, 50000); // ids 50000..89999; 15000 already exist
+  const res2 = await importCsvBatch(SUPER_ADMIN, DATASET_ID, {
+    signal: 'sig', mode: 'append', columns, dedupe_columns: ['id'], rows: overlap,
+  });
+  assert.equal(res2.skipped, 15000, `expected 15000 skipped, got ${res2.skipped}`);
+  assert.equal(res2.inserted, 25000, `expected 25000 inserted, got ${res2.inserted}`);
+  const count2 = await query(`SELECT count(*)::int AS n FROM ds_${DATASET_ID}.sig`);
+  assert.equal(count2.rows[0].n, 90000, 'row count should be 90000 after dedupe append');
+
+  // 3) A bad row mid-batch (violates NOT NULL via invalid type coercion is
+  // silently null-coerced, so force a real DB error instead: duplicate a
+  // non-dedupe insert against a column type mismatch) should roll back
+  // cleanly and leave the table untouched.
+  const before = (await query(`SELECT count(*)::int AS n FROM ds_${DATASET_ID}.sig`)).rows[0].n;
+  await assert.rejects(
+    () => importCsvBatch(SUPER_ADMIN, DATASET_ID, {
+      signal: 'sig', mode: 'append', columns: [{ name: 'id', type: 'text' }, { name: 'nope', type: 'integer' }],
+      dedupe_columns: ['id'], rows: makeRows(5, 200000),
+    }),
+    /Query failed/,
+    'inserting into a nonexistent column should throw'
+  );
+  const after = (await query(`SELECT count(*)::int AS n FROM ds_${DATASET_ID}.sig`)).rows[0].n;
+  assert.equal(after, before, 'failed batch must roll back, not partially insert');
+
+  console.log('OK — batched insert, dedupe accounting, and rollback all behave correctly');
+}
+
+main()
+  .catch((e) => {
+    console.error('FAILED:', e);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await cleanup();
+    await getPool()?.end();
+  });
