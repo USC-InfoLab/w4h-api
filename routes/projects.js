@@ -111,7 +111,6 @@ async function canReadProject(projectId, user) {
 
 async function canManageProject(projectId, user) {
   if (!user) return false;
-  if (isSuperAdmin(user.role)) return true;
   const teamId = await getProjectTeamId(projectId);
   if (teamId) {
     const teamRole = await query(

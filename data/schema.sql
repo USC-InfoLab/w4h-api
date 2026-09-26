@@ -360,6 +360,32 @@ VALUES
     'published'
   ),
   (
+    'w4h-glucose-monitor-csv-file-importer',
+    'usc-infolab',
+    'Glucose monitor CSV file importer',
+    'Import user-supplied Dexcom Clarity and FreeStyle LibreLink CSV exports via the API. Notebook file chooser; in-app Run uses synthetic fixtures from the repo (Kaggle column layouts cited in README, not bundled).',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-glucose-monitor-csv-file-importer',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-data-recorder-csv-file-importer',
+    'usc-infolab',
+    'Data recorder CSV file importer',
+    'Import user-supplied Empatica E4 data-recorder CSV exports (ACC, EDA, HR, TEMP, merged physiology shapes). Notebook file chooser; in-app Run uses synthetic fixtures (Kaggle references in README).',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-data-recorder-csv-file-importer',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
     'w4h-compute-mets',
     'usc-infolab',
     'Compute METs',
@@ -405,6 +431,8 @@ WHERE slug IN (
   'w4h-sample-fitbit-csv-importer',
   'w4h-sample-icde-demo-csv-importer',
   'w4h-fitbit-csv-file-importer',
+  'w4h-glucose-monitor-csv-file-importer',
+  'w4h-data-recorder-csv-file-importer',
   'w4h-sql-compute-mets'
 );
 
