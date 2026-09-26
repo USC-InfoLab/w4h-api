@@ -43,7 +43,7 @@ function contextFromBody(body = {}) {
     contributionSlug: body.contribution_slug ? String(body.contribution_slug).slice(0, 200) : null,
     mode: normalizeMode(body.mode),
     confirmNoPhi: !!body.confirm_no_phi,
-    stream: body.stream !== false,
+    stream: body.stream === true,
   };
 }
 
