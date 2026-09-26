@@ -208,7 +208,8 @@ async function createUploadRoute(req, res) {
       limits: { max_files: MAX_FILES, max_file_bytes: MAX_FILE_SIZE_BYTES, max_total_bytes: MAX_TOTAL_SIZE_BYTES },
     });
   } catch (e) {
-    res.status(500).json({ error: e.message || 'Failed to create upload' });
+    console.error('contribution upload create:', e);
+    res.status(500).json({ error: 'Failed to create upload' });
   }
 }
 
@@ -219,7 +220,8 @@ function withUpload(handler) {
       if (!upload.ok) return res.status(upload.status).json({ error: upload.error });
       await handler(req, res, upload);
     } catch (e) {
-      res.status(500).json({ error: e.message || 'Upload request failed' });
+      console.error('contribution upload:', e);
+      res.status(500).json({ error: 'Upload request failed' });
     }
   };
 }
@@ -235,7 +237,7 @@ const putUploadFile = withUpload(async (req, res, upload) => {
 });
 
 const deleteUploadFileRoute = withUpload(async (req, res, upload) => {
-  deleteUploadFile(upload.dir, req.params.name);
+  if (!deleteUploadFile(upload.dir, req.params.name)) return res.status(400).json({ error: 'Invalid file name' });
   res.json({ success: true });
 });
 

@@ -338,7 +338,9 @@ router.post('/chat', authenticate, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no'); // disable nginx/proxy response buffering
   res.flushHeaders?.();
 
-  const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+  const send = (event) => {
+    if (!res.writableEnded && !res.destroyed) res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
 
   try {
     const reply = await streamClaudeMessage({
