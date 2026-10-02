@@ -338,6 +338,9 @@ router.post('/chat', authenticate, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no'); // disable nginx/proxy response buffering
   res.flushHeaders?.();
 
+  const abortController = new AbortController();
+  req.on('close', () => abortController.abort());
+
   const send = (event) => {
     if (!res.writableEnded && !res.destroyed) res.write(`data: ${JSON.stringify(event)}\n\n`);
   };
@@ -346,6 +349,7 @@ router.post('/chat', authenticate, async (req, res) => {
     const reply = await streamClaudeMessage({
       ...claudeArgs,
       onDelta: (text) => send({ type: 'delta', text }),
+      signal: abortController.signal,
     });
     const conv = await persistAndRecord(reply);
     send({
