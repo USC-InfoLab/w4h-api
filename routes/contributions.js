@@ -12,7 +12,7 @@ import {
 import { startContributionRun, getContributionRun } from '../lib/contribution-runner.js';
 import { assertCanIngestDataset } from '../lib/ingest-csv.js';
 import {
-  createUpload, loadUpload, saveUploadFile, deleteUploadFile, listUploadFiles,
+  createUpload, loadUpload, saveUploadFile, deleteUploadFile, listUploadFiles, removeUpload,
   MAX_FILES, MAX_FILE_SIZE_BYTES, MAX_TOTAL_SIZE_BYTES,
 } from '../lib/contribution-uploads.js';
 import { inspectRepository } from '../lib/contributions-manifest.js';
@@ -50,6 +50,7 @@ router.post('/:slug/uploads', authenticateJwtOrApiKey, (req, res) => createUploa
 router.get('/uploads/:uploadId', authenticateJwtOrApiKey, (req, res) => getUploadRoute(req, res));
 router.put('/uploads/:uploadId/files/:name', authenticateJwtOrApiKey, (req, res) => putUploadFile(req, res));
 router.delete('/uploads/:uploadId/files/:name', authenticateJwtOrApiKey, (req, res) => deleteUploadFileRoute(req, res));
+router.delete('/uploads/:uploadId', authenticateJwtOrApiKey, (req, res) => deleteUploadRoute(req, res));
 router.get('/:slug', authenticateJwtOrApiKey, get);
 router.post('/', authenticate, requireSuperAdmin, create);
 router.post('/:slug/run', authenticateJwtOrApiKey, run);
@@ -239,6 +240,11 @@ const putUploadFile = withUpload(async (req, res, upload) => {
 
 const deleteUploadFileRoute = withUpload(async (req, res, upload) => {
   if (!deleteUploadFile(upload.dir, req.params.name)) return res.status(400).json({ error: 'Invalid file name' });
+  res.json({ success: true });
+});
+
+const deleteUploadRoute = withUpload(async (req, res) => {
+  removeUpload(req.params.uploadId);
   res.json({ success: true });
 });
 
