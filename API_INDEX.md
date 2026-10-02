@@ -3,7 +3,7 @@
 Structural map of `w4h-api` for agents and humans. **Index only** — not API docs.
 
 - Regenerate: `npm run index:api`
-- Generated: 2026-09-26
+- Generated: 2026-10-02
 - Do not hand-edit the lists below; change code, then re-run the script.
 
 ## Orientation
@@ -35,7 +35,7 @@ Structural map of `w4h-api` for agents and humans. **Index only** — not API do
 
 Unmounted route modules: `routes/data.js`, `routes/subjects.js`
 
-## Endpoints (145)
+## Endpoints (147)
 
 - **Root:** GET `/`
 - **`/users`:** POST `/users/login` · POST `/users/send-code` · POST `/users/verify-code` · POST `/users/token-valid` · GET `/users/invite/:token` · POST `/users/invite/accept` · POST `/users/invite/resend` · POST `/users/invite/revoke` · GET `/users/me/api-key` · POST `/users/me/api-key/reveal` · POST `/users/me/api-key` · DELETE `/users/me/api-key` · DELETE `/users/user/:email/api-key` · GET `/users/` · GET `/users/user/:email` · POST `/users/profile` · POST `/users/add` · POST `/users/set` · POST `/users/discontinue` · POST `/users/resume` · DELETE `/users/:email` · GET `/users/roles`
@@ -45,8 +45,8 @@ Unmounted route modules: `routes/data.js`, `routes/subjects.js`
 - **`/platform`:** GET `/platform/hub-principles`
 - **`/projects`:** GET `/projects/` · POST `/projects/` · GET `/projects/:id/db-tokens` · DELETE `/projects/:id/db-tokens/purge-inactive` · DELETE `/projects/:id/db-tokens/:tokenId` · GET `/projects/:id/acl` · PUT `/projects/:id/acl` · GET `/projects/:id/linkable-datasets` · GET `/projects/:id` · PATCH `/projects/:id` · POST `/projects/:id/members` · PATCH `/projects/:id/members/:userId` · DELETE `/projects/:id/members/:userId` · PUT `/projects/:id/members` · PUT `/projects/:id/organizations` · PUT `/projects/:id/datasets` · PUT `/projects/:id/docs` · GET `/projects/:id/pages` · POST `/projects/:id/pages` · GET `/projects/:id/pages/:slug` · PUT `/projects/:id/pages/:slug` · DELETE `/projects/:id/pages/:slug` · POST `/projects/:id/db-token`
 - **`/teams`:** GET `/teams/` · POST `/teams/` · GET `/teams/:id` · PATCH `/teams/:id` · POST `/teams/:id/members` · PATCH `/teams/:id/members/:userId` · DELETE `/teams/:id/members/:userId`
-- **`/contributions`:** GET `/contributions/` · GET `/contributions/runs/:id` · POST `/contributions/inspect` · POST `/contributions/check-updates` · POST `/contributions/:slug/update-version` · POST `/contributions/:slug/uploads` · GET `/contributions/uploads/:uploadId` · PUT `/contributions/uploads/:uploadId/files/:name` · DELETE `/contributions/uploads/:uploadId/files/:name` · GET `/contributions/:slug` · POST `/contributions/` · POST `/contributions/:slug/run` · PATCH `/contributions/:slug` · DELETE `/contributions/:slug`
-- **`/packages`:** GET `/packages/` · GET `/packages/runs/:id` · POST `/packages/inspect` · POST `/packages/check-updates` · POST `/packages/:slug/update-version` · POST `/packages/:slug/uploads` · GET `/packages/uploads/:uploadId` · PUT `/packages/uploads/:uploadId/files/:name` · DELETE `/packages/uploads/:uploadId/files/:name` · GET `/packages/:slug` · POST `/packages/` · POST `/packages/:slug/run` · PATCH `/packages/:slug` · DELETE `/packages/:slug`
+- **`/contributions`:** GET `/contributions/` · GET `/contributions/runs/:id` · POST `/contributions/inspect` · POST `/contributions/check-updates` · POST `/contributions/:slug/update-version` · POST `/contributions/:slug/uploads` · GET `/contributions/uploads/:uploadId` · PUT `/contributions/uploads/:uploadId/files/:name` · DELETE `/contributions/uploads/:uploadId/files/:name` · DELETE `/contributions/uploads/:uploadId` · GET `/contributions/:slug` · POST `/contributions/` · POST `/contributions/:slug/run` · PATCH `/contributions/:slug` · DELETE `/contributions/:slug`
+- **`/packages`:** GET `/packages/` · GET `/packages/runs/:id` · POST `/packages/inspect` · POST `/packages/check-updates` · POST `/packages/:slug/update-version` · POST `/packages/:slug/uploads` · GET `/packages/uploads/:uploadId` · PUT `/packages/uploads/:uploadId/files/:name` · DELETE `/packages/uploads/:uploadId/files/:name` · DELETE `/packages/uploads/:uploadId` · GET `/packages/:slug` · POST `/packages/` · POST `/packages/:slug/run` · PATCH `/packages/:slug` · DELETE `/packages/:slug`
 - **`/ai`:** GET `/ai/status` · GET `/ai/settings/platform` · PATCH `/ai/settings/platform` · GET `/ai/settings/team/:teamId` · PATCH `/ai/settings/team/:teamId` · GET `/ai/conversations` · POST `/ai/conversations` · GET `/ai/conversations/:id` · PATCH `/ai/conversations/:id` · DELETE `/ai/conversations/:id` · POST `/ai/chat`
 
 ## Lib (34)
