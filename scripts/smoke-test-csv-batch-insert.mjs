@@ -19,7 +19,8 @@ const { query, getPool } = await import('../db.js');
 const { importCsvBatch } = await import('../lib/ingest-csv.js');
 
 const DATASET_ID = 'smoke_test_csv_batch_tmp';
-const SUPER_ADMIN = { id: 'smoke-test-user', role: 'super_admin' };
+const PROJECT_SLUG = 'smoke-test-csv-batch-tmp';
+let TEST_USER;
 
 function makeRows(n, offset = 0) {
   return Array.from({ length: n }, (_, i) => ({
@@ -30,12 +31,34 @@ function makeRows(n, offset = 0) {
 
 async function cleanup() {
   await query(`DROP SCHEMA IF EXISTS ds_${DATASET_ID} CASCADE`);
+  await query(`DELETE FROM w4h.projects WHERE slug = $1`, [PROJECT_SLUG]);
   await query(`DELETE FROM w4h.datasets WHERE id = $1`, [DATASET_ID]);
 }
 
 async function main() {
   await cleanup();
+
+  // assertCanIngestDataset() requires real project-owner membership (no
+  // super-admin bypass since master's security hardening) — set up a scratch
+  // project owned by an existing real user, not a fake id.
+  const owner = await query(`SELECT id FROM w4h.users ORDER BY id LIMIT 1`);
+  if (!owner.rowCount) throw new Error('No users in this database to run the smoke test as');
+  TEST_USER = { id: owner.rows[0].id };
+
   await query(`INSERT INTO w4h.datasets (id, name) VALUES ($1, 'Smoke test')`, [DATASET_ID]);
+  const project = await query(
+    `INSERT INTO w4h.projects (slug, name, created_by) VALUES ($1, 'Smoke test', $2) RETURNING id`,
+    [PROJECT_SLUG, TEST_USER.id]
+  );
+  const projectId = project.rows[0].id;
+  await query(
+    `INSERT INTO w4h.project_members (project_id, user_id, role) VALUES ($1, $2, 'owner')`,
+    [projectId, TEST_USER.id]
+  );
+  await query(
+    `INSERT INTO w4h.project_datasets (project_id, dataset_id) VALUES ($1, $2)`,
+    [projectId, DATASET_ID]
+  );
 
   const columns = [
     { name: 'id', type: 'text' },
@@ -45,7 +68,7 @@ async function main() {
   // 1) A batch bigger than one INSERT statement's param budget (60000/2 cols
   // = 30000 rows/stmt) forces the sub-batch loop to run more than once.
   const big = makeRows(65000);
-  const res1 = await importCsvBatch(SUPER_ADMIN, DATASET_ID, {
+  const res1 = await importCsvBatch(TEST_USER, DATASET_ID, {
     signal: 'sig', mode: 'replace', columns, dedupe_columns: ['id'], rows: big,
   });
   assert.equal(res1.ok, true, 'insert should succeed');
@@ -56,7 +79,7 @@ async function main() {
   // 2) Re-import an overlapping batch in append mode — dedupe (ON CONFLICT)
   // should skip the 30000 rows that already exist and only add the new ones.
   const overlap = makeRows(40000, 50000); // ids 50000..89999; 15000 already exist
-  const res2 = await importCsvBatch(SUPER_ADMIN, DATASET_ID, {
+  const res2 = await importCsvBatch(TEST_USER, DATASET_ID, {
     signal: 'sig', mode: 'append', columns, dedupe_columns: ['id'], rows: overlap,
   });
   assert.equal(res2.skipped, 15000, `expected 15000 skipped, got ${res2.skipped}`);
@@ -70,7 +93,7 @@ async function main() {
   // cleanly and leave the table untouched.
   const before = (await query(`SELECT count(*)::int AS n FROM ds_${DATASET_ID}.sig`)).rows[0].n;
   await assert.rejects(
-    () => importCsvBatch(SUPER_ADMIN, DATASET_ID, {
+    () => importCsvBatch(TEST_USER, DATASET_ID, {
       signal: 'sig', mode: 'append', columns: [{ name: 'id', type: 'text' }, { name: 'nope', type: 'integer' }],
       dedupe_columns: ['id'], rows: makeRows(5, 200000),
     }),
