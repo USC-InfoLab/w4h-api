@@ -23,12 +23,13 @@ import {
   USER_ROLES_NAMES,
   TEAM_MEMBER_ROLES,
   isSuperAdmin,
-  isTeamAdmin,
+  roleImpliesTeamAdmin,
   isAssignablePlatformRole,
   rolesAssignableBy,
   authCapabilities,
   normalizeTeamMemberRole,
   canManageTeamAsync,
+  userHasTeamAdminMembership,
 } from '../lib/utils/user.js';
 
 const SCHEMA = 'w4h';
@@ -42,6 +43,7 @@ router.get('/invite/:token', getInvite);
 router.post('/invite/accept', acceptInvite);
 router.post('/invite/resend', auth.authenticate, auth.requireTeamAdmin, resendInvite);
 router.post('/invite/revoke', auth.authenticate, auth.requireTeamAdmin, revokeInvite);
+router.get('/me/session', auth.authenticate, getMySession);
 router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
 router.post('/me/api-key/reveal', auth.authenticate, revealMyApiKey);
 router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
@@ -173,18 +175,16 @@ async function syncUserTeams(userId, teamsInput = [], defaultRole = TEAM_MEMBER_
   return teams;
 }
 
-/** Keep legacy users.role in sync with whether the user is team_admin on any team. */
+/**
+ * Team admin is membership-scoped (`team_members.role`, R-09). `users.role` for anyone but a
+ * Super admin is plain `project_user`; this clears any legacy global `team_admin`.
+ */
 async function syncPlatformRoleFromMemberships(userId, currentRole) {
   if (isSuperAdmin(currentRole)) return currentRole;
-  const hasAdmin = await query(
-    `SELECT 1 FROM ${SCHEMA}.team_members WHERE user_id = $1 AND role = 'team_admin' LIMIT 1`,
-    [userId]
-  );
-  const nextRole = hasAdmin.rowCount ? USER_ROLES.TEAM_ADMIN : USER_ROLES.PROJECT_USER;
-  if (nextRole !== currentRole) {
-    await query(`UPDATE ${SCHEMA}.${TABLE} SET role = $1 WHERE id = $2`, [nextRole, userId]);
+  if (currentRole !== USER_ROLES.PROJECT_USER) {
+    await query(`UPDATE ${SCHEMA}.${TABLE} SET role = $1 WHERE id = $2`, [USER_ROLES.PROJECT_USER, userId]);
   }
-  return nextRole;
+  return USER_ROLES.PROJECT_USER;
 }
 
 async function syncUserProjects(userId, role, requestedProjectIds = []) {
@@ -214,6 +214,20 @@ async function ensureAdminAssignedToAllProjects(userId) {
      ON CONFLICT (user_id, project_id) DO NOTHING`,
     [userId]
   );
+}
+
+/** Fresh profile (teams + capabilities), e.g. after the user creates their first team. */
+async function getMySession(req, res) {
+  try {
+    const row = await query(
+      `SELECT id, name, email, role FROM ${SCHEMA}.${TABLE} WHERE id = $1`,
+      [req.user.id]
+    );
+    if (!row.rowCount) return res.status(404).json({ error: 'User not found' });
+    res.json(await buildUserSessionInfo(row.rows[0]));
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load session' });
+  }
 }
 
 async function buildUserSessionInfo(user) {
@@ -310,7 +324,7 @@ async function loadManageableUser(req, { email, userId }) {
       return { error: { status: 403, message: 'Unauthorized' } };
     }
     // Team admins may only manage Project users in their team.
-    if (!rolesAssignableBy(req.user.role).includes(target.role) && target.role !== 'researcher' && target.role !== 'clinician') {
+    if (await userHasTeamAdminMembership(target.id)) {
       return { error: { status: 403, message: 'Team admins can only discontinue Project users in their team' } };
     }
   }
@@ -642,7 +656,9 @@ async function setUser(req, res) {
     }
     
     const fields = [`name = $1`, `email = $2`, `role = $3`];
-    const params = [user.name, user.email, effectiveRole];
+    // `team_admin` is an input alias for "Admin on the given teams" — never stored on users.role.
+    const storedRole = roleImpliesTeamAdmin(effectiveRole) ? USER_ROLES.PROJECT_USER : effectiveRole;
+    const params = [user.name, user.email, storedRole];
 
     if (user.password) {
       const hashedPassword = bcrypt.hashSync(user.password, +process.env.BCRYPT_ROUNDS || 12);
@@ -666,7 +682,7 @@ async function setUser(req, res) {
     if (result.rowCount > 0) {
       const userId = result.rows[0].id;
       let role = result.rows[0].role;
-      const defaultMemberRole = isTeamAdmin(role)
+      const defaultMemberRole = roleImpliesTeamAdmin(user.role)
         ? TEAM_MEMBER_ROLES.TEAM_ADMIN
         : TEAM_MEMBER_ROLES.MEMBER;
       const teamsInput = user.teams ?? user.team_memberships ?? user.team_ids ?? user.team_id;
@@ -688,7 +704,17 @@ async function setUser(req, res) {
         || Object.prototype.hasOwnProperty.call(user, 'team_ids')
         || Object.prototype.hasOwnProperty.call(user, 'team_id')) {
         if (!teams.length) {
-          return res.status(400).json({ error: 'At least one team is required for this role' });
+          // An approved Admin who has not created their first team yet (ADR-028) legitimately
+          // has none; anyone else must keep at least one.
+          const waiting = await query(
+            `SELECT u.can_create_teams AS flag,
+                    NOT EXISTS (SELECT 1 FROM ${SCHEMA}.team_members tm WHERE tm.user_id = u.id) AS no_teams
+             FROM ${SCHEMA}.${TABLE} u WHERE u.id = $1`,
+            [userId]
+          );
+          if (!(waiting.rows[0]?.flag && waiting.rows[0]?.no_teams)) {
+            return res.status(400).json({ error: 'At least one team is required for this role' });
+          }
         }
         await syncUserTeams(userId, teams, defaultMemberRole);
         role = await syncPlatformRoleFromMemberships(userId, role);
@@ -714,7 +740,7 @@ async function addUser(req, res) {
     const email = (user.email || '').trim();
     const name = (user.name || email || '').trim();
     const role = user.role;
-    const defaultMemberRole = isTeamAdmin(role)
+    const defaultMemberRole = roleImpliesTeamAdmin(role)
       ? TEAM_MEMBER_ROLES.TEAM_ADMIN
       : TEAM_MEMBER_ROLES.MEMBER;
     const teams = normalizeTeamsWithRoles(
@@ -1162,6 +1188,7 @@ async function getByEmail(req, res) {
          u.email,
          u.role,
          u.status,
+         u.can_create_teams,
          u.created_at,
          u.api_key_prefix,
          u.api_key_created_at,
@@ -1237,6 +1264,7 @@ async function list(req, res) {
          u.email,
          u.role,
          u.status,
+         u.can_create_teams,
          u.created_at,
          u.api_key_prefix,
          u.api_key_created_at,

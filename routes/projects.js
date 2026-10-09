@@ -4,10 +4,11 @@ import crypto from 'crypto';
 import { authenticateJwtOrApiKey, requireTeamAdmin } from '../auth.js';
 import { authenticateJwtApiKeyOrProjectDbToken } from '../lib/middleware/projectDbTokenAuth.js';
 import { query } from '../db.js';
-import { isSuperAdmin, isTeamAdmin, isTeamAdminOnTeam, USER_ROLES } from '../lib/utils/user.js';
+import { isSuperAdmin, canManageTeamAsync, isTeamAdminOnTeam, USER_ROLES } from '../lib/utils/user.js';
 import { deliverInvitation } from '../lib/invitations.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
+import { REPORT_MAX_BYTES, injectReportCsp, looksLikeHtml, sha256 } from '../lib/reports.js';
 import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
 import { attachMetadataSummaries } from '../lib/dataset-metadata-summary.js';
 
@@ -29,6 +30,7 @@ function auditProjectAction(req, action, projectId, extra = {}) {
 router.get('/', authenticateJwtOrApiKey, listProjects);
 router.post('/', authenticateJwtOrApiKey, requireTeamAdmin, createProject);
 
+router.get('/collaboration-invites', authenticateJwtOrApiKey, listCollaborationInvites);
 router.get('/:id/db-tokens', authenticateJwtOrApiKey, listProjectDbTokens);
 router.delete('/:id/db-tokens/purge-inactive', authenticateJwtOrApiKey, purgeInactiveProjectDbTokens);
 router.delete('/:id/db-tokens/:tokenId', authenticateJwtOrApiKey, revokeProjectDbToken);
@@ -45,6 +47,12 @@ router.delete('/:id/members/:userId', authenticateJwtOrApiKey, removeProjectMemb
 router.put('/:id/members', authenticateJwtOrApiKey, replaceProjectMembers);
 router.put('/:id/organizations', authenticateJwtOrApiKey, replaceProjectOrganizations);
 router.put('/:id/datasets', authenticateJwtOrApiKey, replaceProjectDatasets);
+router.post('/:id/datasets/:datasetId/link', authenticateJwtOrApiKey, linkProjectDataset);
+router.delete('/:id/datasets/:datasetId', authenticateJwtOrApiKey, unlinkProjectDataset);
+router.get('/:id/invitable-teams', authenticateJwtOrApiKey, listInvitableTeams);
+router.post('/:id/teams', authenticateJwtOrApiKey, inviteProjectTeam);
+router.post('/:id/teams/:teamId/accept', authenticateJwtOrApiKey, acceptProjectTeam);
+router.delete('/:id/teams/:teamId', authenticateJwtOrApiKey, removeProjectTeam);
 router.put('/:id/docs', authenticateJwtOrApiKey, replaceProjectDocs);
 router.get('/:id/pages', authenticateJwtOrApiKey, listProjectPages);
 router.post('/:id/pages', authenticateJwtOrApiKey, createProjectPage);
@@ -52,11 +60,15 @@ router.get('/:id/pages/:slug', authenticateJwtOrApiKey, getProjectPage);
 router.put('/:id/pages/:slug', authenticateJwtOrApiKey, updateProjectPage);
 router.delete('/:id/pages/:slug', authenticateJwtOrApiKey, deleteProjectPage);
 router.post('/:id/db-token', authenticateJwtOrApiKey, issueProjectDbToken);
+router.get('/:id/reports', authenticateJwtOrApiKey, listProjectReports);
+router.post('/:id/reports', authenticateJwtOrApiKey, publishProjectReport);
+router.get('/:id/reports/:reportId/content', authenticateJwtOrApiKey, getProjectReportContent);
+router.delete('/:id/reports/:reportId', authenticateJwtOrApiKey, deleteProjectReport);
 
 const PROJECT_MEMBER_ROLES = new Set(['owner', 'editor', 'viewer']);
 
-function canCreateProject(user) {
-  return !!user && (isSuperAdmin(user.role) || isTeamAdmin(user.role));
+async function canCreateProject(user) {
+  return canManageTeamAsync(user);
 }
 
 async function getTeamIdsForUser(userId) {
@@ -81,6 +93,71 @@ async function getProjectTeamId(projectId) {
   return res.rowCount ? res.rows[0].team_id : null;
 }
 
+/** Owning team plus active collaborating teams (ADR-027). */
+async function getProjectTeamIds(projectId) {
+  const res = await query(
+    `SELECT p.team_id::text AS team_id FROM w4h.projects p WHERE p.id = $1::uuid AND p.team_id IS NOT NULL
+     UNION
+     SELECT pt.team_id::text FROM w4h.project_teams pt
+     WHERE pt.project_id = $1::uuid AND pt.status = 'active'`,
+    [projectId]
+  );
+  return res.rows.map((r) => r.team_id);
+}
+
+async function isUserOnProjectTeams(userId, projectId) {
+  const teamIds = await getProjectTeamIds(projectId);
+  if (!teamIds.length || userId == null) return false;
+  const res = await query(
+    `SELECT 1 FROM w4h.team_members WHERE user_id = $1 AND team_id = ANY($2::uuid[]) LIMIT 1`,
+    [userId, teamIds]
+  );
+  return res.rowCount > 0;
+}
+
+/** Super admin, or Team admin by per-team membership role (never the legacy global role). */
+async function isTeamAdminOfTeam(user, teamId) {
+  if (!user || !teamId) return false;
+  if (isSuperAdmin(user.role)) return true;
+  const res = await query(
+    `SELECT 1 FROM w4h.team_members WHERE team_id = $1::uuid AND user_id = $2 AND role = 'team_admin'`,
+    [teamId, user.id]
+  );
+  return res.rowCount > 0;
+}
+
+/** Active collaborating teams (not the owning team) of this project that `user` administers. */
+async function adminCollaboratingTeamIds(projectId, user) {
+  if (!user) return [];
+  const res = await query(
+    `SELECT pt.team_id::text AS team_id
+     FROM w4h.project_teams pt
+     JOIN w4h.team_members tm ON tm.team_id = pt.team_id AND tm.user_id = $2 AND tm.role = 'team_admin'
+     WHERE pt.project_id = $1::uuid AND pt.status = 'active'`,
+    [projectId, user.id]
+  );
+  return res.rows.map((r) => r.team_id);
+}
+
+/** True when the user belongs to the project's owning team (collaborators are not). */
+async function isOnOwningTeam(userId, projectId) {
+  const teamId = await getProjectTeamId(projectId);
+  return teamId ? isUserOnTeam(userId, teamId) : false;
+}
+
+async function listProjectTeams(projectId) {
+  const res = await query(
+    `SELECT pt.team_id::text AS team_id, t.name AS team_name, pt.status,
+            pt.created_at, pt.accepted_at
+     FROM w4h.project_teams pt
+     JOIN w4h.teams t ON t.id = pt.team_id
+     WHERE pt.project_id = $1::uuid
+     ORDER BY t.name ASC`,
+    [projectId]
+  );
+  return res.rows;
+}
+
 async function canAccessTeam(user, teamId) {
   if (!user || !teamId) return false;
   if (isSuperAdmin(user.role)) return true;
@@ -97,16 +174,27 @@ async function getMembership(projectId, userId) {
   return res.rowCount ? res.rows[0] : null;
 }
 
+/** Project participant: Super admin, project member, or Admin (membership role) on the owning team. */
 async function canReadProject(projectId, user) {
   if (!user) return false;
   if (isSuperAdmin(user.role)) return true;
   const member = await getMembership(projectId, user.id);
   if (member) return true;
-  if (isTeamAdmin(user.role)) {
-    const teamId = await getProjectTeamId(projectId);
-    if (teamId && (await isUserOnTeam(user.id, teamId))) return true;
-  }
-  return false;
+  const teamId = await getProjectTeamId(projectId);
+  if (!teamId) return false;
+  // Per-team membership role only (ADR-004) — a global users.role = team_admin must not leak across teams.
+  const teamRole = await query(
+    `SELECT role FROM w4h.team_members WHERE team_id = $1::uuid AND user_id = $2`,
+    [teamId, user.id]
+  );
+  return teamRole.rowCount > 0 && teamRole.rows[0].role === 'team_admin';
+}
+
+/** Can see the project workspace (P-06): participant, or any member of the owning team. */
+async function canViewProject(projectId, user) {
+  if (await canReadProject(projectId, user)) return true;
+  if (!user) return false;
+  return isUserOnTeam(user.id, await getProjectTeamId(projectId));
 }
 
 async function canManageProject(projectId, user) {
@@ -309,16 +397,7 @@ async function getAdminTeamIdsForUser(user) {
      WHERE user_id = $1 AND role = 'team_admin'`,
     [user.id]
   );
-  let ids = adminRes.rows.map((r) => r.team_id);
-  // Legacy platform team_admin: treat all memberships as admin-scoped
-  if (!ids.length && isTeamAdmin(user.role)) {
-    const all = await query(
-      `SELECT team_id::text AS team_id FROM w4h.team_members WHERE user_id = $1`,
-      [user.id]
-    );
-    ids = all.rows.map((r) => r.team_id);
-  }
-  return ids;
+  return adminRes.rows.map((r) => r.team_id);
 }
 
 /**
@@ -381,6 +460,31 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
     });
   }
 
+  // ADR-027: datasets already linked (e.g. contributed by a collaborating team) stay in the
+  // set so a full-list save by the project Admin round-trips them.
+  const linked = await query(
+    `SELECT d.id, d.name, d.description, d.team_id,
+            COALESCE(d.read_only, false) AS read_only, d.origin,
+            t.name AS owner_team_name,
+            'linked'::text AS source_kind,
+            t.id::text AS shared_by_team_id,
+            t.name AS shared_by_team_name,
+            pd.access_type AS max_access_type
+     FROM w4h.project_datasets pd
+     JOIN w4h.datasets d ON d.id = pd.dataset_id
+     LEFT JOIN w4h.teams t ON t.id = d.team_id
+     WHERE pd.project_id = $1::uuid
+       AND COALESCE(d.status, 'active') = 'active'`,
+    [projectId]
+  );
+  for (const row of linked.rows) {
+    if (byId.has(row.id)) continue;
+    byId.set(row.id, {
+      ...row,
+      source_label: row.owner_team_name ? `Contributed by ${row.owner_team_name}` : 'Contributed',
+    });
+  }
+
   if (user) {
     const adminTeamIds = await getAdminTeamIdsForUser(user);
     let managed;
@@ -438,51 +542,59 @@ async function fetchLinkableDatasets(projectId, teamId, user = null) {
   );
 }
 
-/** Ensure a team-wide share exists when linking a dataset owned by another team (dual-hat / Super admin). */
-async function ensureInboundShareForLink(req, datasetMeta, projectTeamId) {
+/**
+ * Linking a dataset owned by another team needs that owner's consent (ADR-027). Consent is
+ * (a) a team-wide share to the project's team (ADR-002), (b) an existing project-scoped
+ * share, or (c) the actor being an Admin of the dataset's owning team (or Super admin),
+ * in which case a project-scoped share is recorded.
+ */
+async function ensureInboundShareForLink(req, datasetMeta, projectTeamId, projectId) {
   if (!datasetMeta?.team_id || String(datasetMeta.team_id) === String(projectTeamId)) {
     return;
   }
-  if (datasetMeta.source_kind === 'shared') return;
+  if (datasetMeta.source_kind === 'shared' || datasetMeta.source_kind === 'linked') return;
 
   const existing = await query(
     `SELECT id FROM w4h.dataset_shares
      WHERE dataset_id = $1
        AND target_team_id = $2::uuid
-       AND target_project_id IS NULL
+       AND (target_project_id IS NULL OR target_project_id = $3::uuid)
      LIMIT 1`,
-    [datasetMeta.id, projectTeamId]
+    [datasetMeta.id, projectTeamId, projectId]
   );
   if (existing.rowCount) return;
 
-  const canSource = await isTeamAdminOnTeam(
-    req.user.id,
-    datasetMeta.team_id,
-    req.user.role
-  );
-  if (!canSource && !isSuperAdmin(req.user.role)) {
-    const err = new Error('Unauthorized to share this dataset into the project team');
+  if (!(await isTeamAdminOfTeam(req.user, datasetMeta.team_id))) {
+    const err = new Error('Only an Admin of the dataset\'s owning team can link it into this project');
     err.status = 403;
     throw err;
   }
 
+  await recordProjectShare(req, datasetMeta.id, projectTeamId, projectId, 'auto_share_on_project_link');
+}
+
+async function recordProjectShare(req, datasetId, projectTeamId, projectId, reason) {
   const inserted = await query(
     `INSERT INTO w4h.dataset_shares
        (dataset_id, target_team_id, target_project_id, access_type, shared_by)
-     VALUES ($1, $2::uuid, NULL, 'read', $3)
+     VALUES ($1, $2::uuid, $3::uuid, 'read', $4)
+     ON CONFLICT (dataset_id, target_team_id, target_project_id) DO NOTHING
      RETURNING id::text AS id`,
-    [datasetMeta.id, projectTeamId, req.user.id]
+    [datasetId, projectTeamId, projectId, req.user.id]
   );
-  writeAuditLogSafe(req, {
-    action: 'sharing.create',
-    resourceType: 'dataset_share',
-    resourceId: inserted.rows[0]?.id,
-    details: {
-      dataset_id: datasetMeta.id,
-      target_team_id: projectTeamId,
-      reason: 'auto_share_on_project_link',
-    },
-  });
+  if (inserted.rowCount) {
+    writeAuditLogSafe(req, {
+      action: 'sharing.create',
+      resourceType: 'dataset_share',
+      resourceId: inserted.rows[0].id,
+      details: {
+        dataset_id: datasetId,
+        target_team_id: projectTeamId,
+        target_project_id: projectId,
+        reason,
+      },
+    });
+  }
 }
 
 async function listEligibleTeamMembers(teamId) {
@@ -624,9 +736,10 @@ async function getProjectOverview(req, res) {
   const projectId = await resolveProjectId(req.params.id);
   if (!projectId) return res.status(404).json({ error: 'Project not found' });
   try {
-    if (!(await canReadProject(projectId, req.user))) {
+    if (!(await canViewProject(projectId, req.user))) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
+    const isParticipant = await canReadProject(projectId, req.user);
 
     const projectRes = await query(
       `SELECT p.*,
@@ -650,6 +763,7 @@ async function getProjectOverview(req, res) {
     const canEditPages =
       !req.authViaProjectDbToken && (await canEditProjectPages(projectId, req.user));
 
+    const collaboratingTeams = await listProjectTeams(projectId);
     const [membersRes, datasetsRes, pagesRes, orgsRes, derivedOrgsRes, aclRes, linkableDatasets, eligibleMembers] =
       await Promise.all([
         Promise.resolve({ rows: await listMembers(projectId) }),
@@ -714,7 +828,7 @@ async function getProjectOverview(req, res) {
       membersRes.rows = await listMembers(projectId);
     }
 
-    const canIssueDbToken = !req.authViaProjectDbToken && (await canReadProject(projectId, req.user));
+    const canIssueDbToken = !req.authViaProjectDbToken && isParticipant;
     const manualOrgRows = Array.isArray(orgsRes.rows) ? orgsRes.rows : [];
     const organizations =
       manualOrgRows.length > 0
@@ -753,16 +867,20 @@ async function getProjectOverview(req, res) {
     res.json({
       project,
       members: membersRes.rows,
+      collaborating_teams: collaboratingTeams,
       datasets,
       linkable_datasets: hydratedLinkable,
       eligible_members: canManage ? eligibleMembers : [],
-      pages: pagesRes.rows,
+      // Project pages are project-private: team-only viewers see the project, not its pages.
+      pages: isParticipant ? pagesRes.rows : [],
       docs: [],
       organizations,
-      acl_rules: aclRes.rows,
+      acl_rules: isParticipant ? aclRes.rows : [],
       capabilities: {
         can_manage: canManage,
         can_edit_pages: canEditPages,
+        // Project member (or owning-team Admin) vs. a team member who can only see the overview.
+        is_participant: isParticipant,
         can_issue_db_token: canIssueDbToken,
         auth_via_project_token: Boolean(req.authViaProjectDbToken)
       }
@@ -773,7 +891,7 @@ async function getProjectOverview(req, res) {
 }
 
 async function createProject(req, res) {
-  if (!canCreateProject(req.user)) {
+  if (!(await canCreateProject(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -796,9 +914,9 @@ async function createProject(req, res) {
 
     if (!name) return res.status(400).json({ error: 'name is required' });
 
-    if (!teamId && isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
-      const myTeams = await getTeamIdsForUser(req.user.id);
-      if (myTeams.length === 1) teamId = myTeams[0];
+    if (!teamId && !isSuperAdmin(req.user.role)) {
+      const adminTeams = await getAdminTeamIdsForUser(req.user);
+      if (adminTeams.length === 1) teamId = adminTeams[0];
     }
 
     if (!teamId) {
@@ -810,7 +928,8 @@ async function createProject(req, res) {
       return res.status(400).json({ error: 'Unknown team_id' });
     }
 
-    if (!(await canAccessTeam(req.user, teamId))) {
+    // Creating a project needs Team admin on *that* team (R-08 dual-hat), not just membership.
+    if (!(await isTeamAdminOfTeam(req.user, teamId))) {
       return res.status(403).json({ error: 'Unauthorized for this team' });
     }
 
@@ -1030,8 +1149,22 @@ async function isPlatformAdminUserId(userId) {
 
 async function listMembers(projectId) {
   const fresh = await query(
-    `SELECT pm.user_id, pm.role, pm.joined_at, u.name, u.email, u.role AS user_role
+    `SELECT pm.user_id, pm.role, pm.joined_at, u.name, u.email, u.role AS user_role,
+            COALESCE((
+              SELECT json_agg(json_build_object('id', t.id::text, 'name', t.name) ORDER BY t.name)
+              FROM w4h.team_members tm
+              JOIN w4h.teams t ON t.id = tm.team_id
+              WHERE tm.user_id = pm.user_id
+                AND (t.id = p.team_id
+                  OR t.id IN (SELECT pt.team_id FROM w4h.project_teams pt
+                              WHERE pt.project_id = pm.project_id AND pt.status = 'active'))
+            ), '[]'::json) AS home_teams,
+            NOT EXISTS (
+              SELECT 1 FROM w4h.team_members tm2
+              WHERE tm2.user_id = pm.user_id AND tm2.team_id = p.team_id
+            ) AS is_collaborator
      FROM w4h.project_members pm
+     JOIN w4h.projects p ON p.id = pm.project_id
      JOIN w4h.users u ON u.id = pm.user_id
      WHERE pm.project_id = $1::uuid
        AND u.role NOT IN ('admin', 'super_admin')
@@ -1054,7 +1187,11 @@ async function ownerCount(projectId) {
 async function addProjectMember(req, res) {
   const projectId = await resolveProjectId(req.params.id);
   if (!projectId) return res.status(404).json({ error: 'Project not found' });
-  if (!(await canManageProject(projectId, req.user))) {
+  // Project Admin/owning-team Admin, or (ADR-027) a Team admin of an active collaborating
+  // team adding people from their own team.
+  const isManager = await canManageProject(projectId, req.user);
+  const collabAdminTeamIds = isManager ? [] : await adminCollaboratingTeamIds(projectId, req.user);
+  if (!isManager && !collabAdminTeamIds.length) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -1106,6 +1243,32 @@ async function addProjectMember(req, res) {
       }
     }
 
+    if (!isManager && !Number.isInteger(userId)) {
+      return res.status(403).json({
+        error: 'Collaborating-team Admins can only add people who already have an account on their team'
+      });
+    }
+
+    if (Number.isInteger(userId) && !invited) {
+      const onProjectTeam = await isUserOnProjectTeams(userId, projectId);
+      if (!onProjectTeam) {
+        return res.status(400).json({
+          error: 'That person is not on the owning team or an active collaborating team. Invite their team to the project first.'
+        });
+      }
+      if (!isManager) {
+        const theirTeams = await getTeamIdsForUser(userId);
+        if (!theirTeams.some((t) => collabAdminTeamIds.includes(t))) {
+          return res.status(403).json({ error: 'You can only add people from the team you administer' });
+        }
+      }
+      if (role === 'owner' && !(await isOnOwningTeam(userId, projectId))) {
+        return res.status(400).json({
+          error: 'Only owning-team members can be project Admins; collaborators join as Users'
+        });
+      }
+    }
+
     if (!Number.isInteger(userId)) {
       const displayName = name || email;
       const inserted = await query(
@@ -1127,7 +1290,7 @@ async function addProjectMember(req, res) {
       mailWarning = delivered.mailWarning;
     }
 
-    if (!(await isUserOnTeam(userId, teamId))) {
+    if (invited && !(await isUserOnTeam(userId, teamId))) {
       await query(
         `INSERT INTO w4h.team_members (team_id, user_id, role)
          VALUES ($1::uuid, $2, 'member')
@@ -1189,6 +1352,11 @@ async function updateProjectMemberRole(req, res) {
     if (current.rows[0].role === 'owner' && role !== 'owner' && (await ownerCount(projectId)) <= 1) {
       return res.status(400).json({ error: 'Project must have at least one Admin' });
     }
+    if (role === 'owner' && !(await isOnOwningTeam(userId, projectId))) {
+      return res.status(400).json({
+        error: 'Only owning-team members can be project Admins; collaborators stay Users'
+      });
+    }
 
     await query(
       `UPDATE w4h.project_members
@@ -1211,11 +1379,16 @@ async function removeProjectMember(req, res) {
   const projectId = await resolveProjectId(req.params.id);
   if (!projectId) return res.status(404).json({ error: 'Project not found' });
   const userId = Number(req.params.userId);
-  if (!(await canManageProject(projectId, req.user))) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
   if (!Number.isInteger(userId)) {
     return res.status(400).json({ error: 'Invalid user id' });
+  }
+  if (!(await canManageProject(projectId, req.user))) {
+    // ADR-027: a collaborating team's Admin may remove their own team's people.
+    const collabTeams = await adminCollaboratingTeamIds(projectId, req.user);
+    const theirTeams = collabTeams.length ? await getTeamIdsForUser(userId) : [];
+    if (!theirTeams.some((t) => collabTeams.includes(t))) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
   }
 
   try {
@@ -1277,9 +1450,14 @@ async function replaceProjectMembers(req, res) {
         continue;
       }
       if (await isPlatformAdminUserId(userId)) continue;
-      if (!(await isUserOnTeam(userId, teamId))) {
+      if (!(await isUserOnProjectTeams(userId, projectId))) {
         return res.status(400).json({
-          error: `User must belong to the project owning team (user_id ${userId})`
+          error: `User must belong to the project's owning team or an active collaborating team (user_id ${userId})`
+        });
+      }
+      if (role === 'owner' && !(await isUserOnTeam(userId, teamId))) {
+        return res.status(400).json({
+          error: `Only owning-team members can be project Admins (user_id ${userId})`
         });
       }
       resolved.push({ userId, role });
@@ -1339,7 +1517,22 @@ async function replaceProjectDatasets(req, res) {
     const linkable = await fetchLinkableDatasets(projectId, teamId, req.user);
     const linkableById = new Map(linkable.map((d) => [String(d.id), d]));
 
-    await query(`DELETE FROM w4h.project_datasets WHERE project_id = $1::uuid`, [projectId]);
+    // Remove links that are no longer listed — but a collaborator's dataset is only the
+    // owner's to unlink (ADR-027), so keep those unless the actor administers that team.
+    const submittedIds = new Set(datasets.map((d) => String(d?.dataset_id || '').trim()).filter(Boolean));
+    const existingLinks = await query(
+      `SELECT pd.dataset_id, d.team_id::text AS team_id
+       FROM w4h.project_datasets pd
+       JOIN w4h.datasets d ON d.id = pd.dataset_id
+       WHERE pd.project_id = $1::uuid`,
+      [projectId]
+    );
+    for (const link of existingLinks.rows) {
+      if (submittedIds.has(String(link.dataset_id))) continue;
+      const foreign = link.team_id && String(link.team_id) !== String(teamId);
+      if (foreign && !(await isTeamAdminOfTeam(req.user, link.team_id))) continue;
+      await removeProjectDatasetLink(projectId, link.dataset_id);
+    }
 
     for (const row of datasets) {
       const datasetId = String(row?.dataset_id || '').trim();
@@ -1351,7 +1544,7 @@ async function replaceProjectDatasets(req, res) {
         });
       }
       try {
-        await ensureInboundShareForLink(req, meta, teamId);
+        await ensureInboundShareForLink(req, meta, teamId, projectId);
       } catch (shareErr) {
         return res.status(shareErr.status || 400).json({
           error: shareErr.message || 'Failed to share dataset into project team'
@@ -1387,6 +1580,457 @@ async function replaceProjectDatasets(req, res) {
     res.status(500).json({ error: error.message || 'Failed to update project datasets' });
   }
 }
+
+/** Drop a dataset link and withdraw any project-scoped share that granted it (ADR-027). */
+async function removeProjectDatasetLink(projectId, datasetId) {
+  await query(
+    `DELETE FROM w4h.project_datasets WHERE project_id = $1::uuid AND dataset_id = $2`,
+    [projectId, datasetId]
+  );
+  await query(
+    `DELETE FROM w4h.dataset_shares WHERE dataset_id = $1 AND target_project_id = $2::uuid`,
+    [datasetId, projectId]
+  );
+  // Reports embed the data they plot (ADR-029): revoking a dataset revokes reports built from it.
+  await query(
+    `DELETE FROM w4h.project_reports WHERE project_id = $1::uuid AND $2 = ANY(dataset_ids)`,
+    [projectId, datasetId]
+  );
+}
+
+/**
+ * POST /projects/:id/datasets/:datasetId/link — the dataset owner's Admin contributes a
+ * dataset to a project owned by their team or by a team that invited theirs (ADR-027 §2).
+ */
+async function linkProjectDataset(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  try {
+    const datasetId = String(req.params.datasetId || '').trim();
+    const ds = await query(
+      `SELECT id, team_id::text AS team_id, COALESCE(status, 'active') AS status
+       FROM w4h.datasets WHERE id = $1`,
+      [datasetId]
+    );
+    if (!ds.rowCount) return res.status(404).json({ error: 'Dataset not found' });
+    const dataset = ds.rows[0];
+    if (!dataset.team_id) {
+      return res.status(400).json({ error: 'Dataset has no owning team' });
+    }
+    if (dataset.status !== 'active') {
+      return res.status(400).json({ error: 'Archived datasets cannot be linked' });
+    }
+    if (!(await isTeamAdminOfTeam(req.user, dataset.team_id))) {
+      return res.status(403).json({ error: 'Only an Admin of the dataset\'s owning team can link it' });
+    }
+    const projectTeamIds = await getProjectTeamIds(projectId);
+    if (!projectTeamIds.includes(dataset.team_id)) {
+      return res.status(403).json({
+        error: 'The dataset\'s team is not the owning team or an active collaborating team of this project'
+      });
+    }
+    const owningTeamId = await getProjectTeamId(projectId);
+    if (String(dataset.team_id) !== String(owningTeamId)) {
+      await recordProjectShare(req, datasetId, owningTeamId, projectId, 'collaborator_contribution');
+    }
+    await query(
+      `INSERT INTO w4h.project_datasets (project_id, dataset_id, access_type, approved_by)
+       VALUES ($1::uuid, $2, 'read', $3)
+       ON CONFLICT (project_id, dataset_id)
+       DO UPDATE SET approved_by = EXCLUDED.approved_by, approved_at = NOW()`,
+      [projectId, datasetId, req.user.id]
+    );
+    auditProjectAction(req, 'project.dataset.link', projectId, {
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: { dataset_id: datasetId, dataset_team_id: dataset.team_id },
+    });
+    res.json({ ok: true, dataset_id: datasetId });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to link dataset' });
+  }
+}
+
+/** DELETE /projects/:id/datasets/:datasetId — owner's Admin, project Admin, or Super admin. */
+async function unlinkProjectDataset(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  try {
+    const datasetId = String(req.params.datasetId || '').trim();
+    const link = await query(
+      `SELECT d.team_id::text AS team_id
+       FROM w4h.project_datasets pd JOIN w4h.datasets d ON d.id = pd.dataset_id
+       WHERE pd.project_id = $1::uuid AND pd.dataset_id = $2`,
+      [projectId, datasetId]
+    );
+    if (!link.rowCount) return res.status(404).json({ error: 'Dataset is not linked to this project' });
+    const allowed =
+      (await isTeamAdminOfTeam(req.user, link.rows[0].team_id)) ||
+      (await canManageProject(projectId, req.user));
+    if (!allowed) return res.status(403).json({ error: 'Unauthorized' });
+    await removeProjectDatasetLink(projectId, datasetId);
+    auditProjectAction(req, 'project.dataset.unlink', projectId, {
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: { dataset_id: datasetId },
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to unlink dataset' });
+  }
+}
+
+/** GET /projects/:id/invitable-teams — active teams not yet on the project (id + name only). */
+async function listInvitableTeams(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canManageProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const rows = await query(
+      `SELECT t.id::text AS id, t.name
+       FROM w4h.teams t
+       WHERE COALESCE(t.status, 'active') = 'active'
+         AND t.id <> (SELECT team_id FROM w4h.projects WHERE id = $1::uuid)
+         AND NOT EXISTS (
+           SELECT 1 FROM w4h.project_teams pt WHERE pt.project_id = $1::uuid AND pt.team_id = t.id
+         )
+       ORDER BY t.name ASC`,
+      [projectId]
+    );
+    res.json(rows.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to list teams' });
+  }
+}
+
+/** POST /projects/:id/teams { team_id } — invite a collaborating team (ADR-027 §1–2). */
+async function inviteProjectTeam(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canManageProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const teamId = req.body?.team_id == null ? '' : String(req.body.team_id).trim();
+    if (!teamId) return res.status(400).json({ error: 'team_id is required' });
+    const team = await query(
+      `SELECT id::text AS id, name, COALESCE(status, 'active') AS status FROM w4h.teams WHERE id = $1::uuid`,
+      [teamId]
+    );
+    if (!team.rowCount) return res.status(400).json({ error: 'Unknown team_id' });
+    if (team.rows[0].status !== 'active') {
+      return res.status(400).json({ error: 'That team is deactivated' });
+    }
+    if (String(await getProjectTeamId(projectId)) === teamId) {
+      return res.status(400).json({ error: 'That is already the owning team' });
+    }
+    // The invited team's own Admin (or a Super admin) accepts; an Admin of both teams accepts at once.
+    const selfAccept = await isTeamAdminOfTeam(req.user, teamId);
+    const inserted = await query(
+      `INSERT INTO w4h.project_teams (project_id, team_id, status, invited_by, accepted_by, accepted_at)
+       VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
+       ON CONFLICT (project_id, team_id) DO NOTHING
+       RETURNING status`,
+      [
+        projectId,
+        teamId,
+        selfAccept ? 'active' : 'pending',
+        req.user.id,
+        selfAccept ? req.user.id : null,
+        selfAccept ? new Date() : null,
+      ]
+    );
+    if (!inserted.rowCount) {
+      return res.status(409).json({ error: 'That team is already invited to this project' });
+    }
+    auditProjectAction(req, 'project.team.invite', projectId, {
+      resourceType: 'team',
+      resourceId: teamId,
+      details: { team_id: teamId, status: inserted.rows[0].status },
+    });
+    res.status(201).json({ teams: await listProjectTeams(projectId) });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to invite team' });
+  }
+}
+
+/** POST /projects/:id/teams/:teamId/accept — the invited team's Admin (or Super admin). */
+async function acceptProjectTeam(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  const teamId = String(req.params.teamId || '').trim();
+  if (!(await isTeamAdminOfTeam(req.user, teamId))) {
+    return res.status(403).json({ error: 'Only an Admin of the invited team can accept' });
+  }
+  try {
+    const updated = await query(
+      `UPDATE w4h.project_teams
+       SET status = 'active', accepted_by = $3, accepted_at = NOW()
+       WHERE project_id = $1::uuid AND team_id = $2::uuid AND status = 'pending'
+       RETURNING team_id`,
+      [projectId, teamId, req.user.id]
+    );
+    if (!updated.rowCount) {
+      return res.status(404).json({ error: 'No pending invitation for that team' });
+    }
+    auditProjectAction(req, 'project.team.accept', projectId, {
+      resourceType: 'team',
+      resourceId: teamId,
+      details: { team_id: teamId },
+    });
+    res.json({ teams: await listProjectTeams(projectId) });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to accept invitation' });
+  }
+}
+
+/**
+ * DELETE /projects/:id/teams/:teamId — decline/leave (that team's Admin) or remove
+ * (owning side). Its people and its datasets leave the project immediately.
+ */
+async function removeProjectTeam(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  const teamId = String(req.params.teamId || '').trim();
+  const allowed =
+    (await canManageProject(projectId, req.user)) || (await isTeamAdminOfTeam(req.user, teamId));
+  if (!allowed) return res.status(403).json({ error: 'Unauthorized' });
+  try {
+    const removed = await query(
+      `DELETE FROM w4h.project_teams WHERE project_id = $1::uuid AND team_id = $2::uuid RETURNING team_id`,
+      [projectId, teamId]
+    );
+    if (!removed.rowCount) return res.status(404).json({ error: 'That team is not a collaborator' });
+
+    // Datasets the leaving team contributed.
+    const contributed = await query(
+      `SELECT pd.dataset_id FROM w4h.project_datasets pd
+       JOIN w4h.datasets d ON d.id = pd.dataset_id
+       WHERE pd.project_id = $1::uuid AND d.team_id = $2::uuid`,
+      [projectId, teamId]
+    );
+    for (const row of contributed.rows) {
+      await removeProjectDatasetLink(projectId, row.dataset_id);
+    }
+    // People who no longer belong to any team of the project.
+    const remaining = await getProjectTeamIds(projectId);
+    await query(
+      `DELETE FROM w4h.project_members pm
+       WHERE pm.project_id = $1::uuid
+         AND NOT EXISTS (
+           SELECT 1 FROM w4h.team_members tm
+           WHERE tm.user_id = pm.user_id AND tm.team_id = ANY($2::uuid[])
+         )`,
+      [projectId, remaining]
+    );
+    auditProjectAction(req, 'project.team.remove', projectId, {
+      resourceType: 'team',
+      resourceId: teamId,
+      details: { team_id: teamId, datasets_unlinked: contributed.rowCount },
+    });
+    res.json({ teams: await listProjectTeams(projectId), members: await listMembers(projectId) });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to remove team' });
+  }
+}
+
+/** GET /projects/collaboration-invites — pending and active collaborations for teams the caller administers. */
+async function listCollaborationInvites(req, res) {
+  try {
+    const adminTeamIds = await getAdminTeamIdsForUser(req.user);
+    const where = adminTeamIds === null ? '' : 'AND pt.team_id = ANY($1::uuid[])';
+    const params = adminTeamIds === null ? [] : [adminTeamIds];
+    if (adminTeamIds !== null && !adminTeamIds.length) return res.json([]);
+    const rows = await query(
+      `SELECT p.id::text AS project_id, p.name AS project_name,
+              ot.name AS owning_team_name,
+              pt.team_id::text AS team_id, it.name AS team_name, pt.status, pt.created_at
+       FROM w4h.project_teams pt
+       JOIN w4h.projects p ON p.id = pt.project_id
+       LEFT JOIN w4h.teams ot ON ot.id = p.team_id
+       JOIN w4h.teams it ON it.id = pt.team_id
+       WHERE TRUE ${where}
+       ORDER BY pt.status ASC, pt.created_at DESC`,
+      params
+    );
+    res.json(rows.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to list invitations' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Published notebook reports (ADR-029 §5)
+// ---------------------------------------------------------------------------
+
+const REPORT_META_COLS = `r.id, r.title, r.description, r.size_bytes, r.sha256, r.dataset_ids,
+  r.source, r.snapshot_at, r.created_at, r.created_by, u.name AS created_by_name`;
+
+async function listProjectReports(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canReadProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const rows = await query(
+      `SELECT ${REPORT_META_COLS}
+       FROM w4h.project_reports r LEFT JOIN w4h.users u ON u.id = r.created_by
+       WHERE r.project_id = $1::uuid ORDER BY r.created_at DESC`,
+      [projectId]
+    );
+    res.json(rows.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to list reports' });
+  }
+}
+
+async function publishProjectReport(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canManageProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Only a project Admin can publish a report' });
+  }
+  try {
+    const title = String(req.body?.title || '').trim().slice(0, 200);
+    const description = req.body?.description == null ? null : String(req.body.description).trim().slice(0, 1000);
+    const html = String(req.body?.html ?? '').replace(/^﻿/, '');
+    if (!title) return res.status(400).json({ error: 'title is required' });
+    if (!html.trim() || !looksLikeHtml(html)) {
+      return res.status(400).json({ error: 'html must be the report page (an HTML document)' });
+    }
+    const bytes = Buffer.byteLength(html, 'utf8');
+    if (bytes > REPORT_MAX_BYTES) {
+      return res.status(413).json({
+        error: `Report is ${(bytes / 1048576).toFixed(1)} MB; the limit is ${(REPORT_MAX_BYTES / 1048576).toFixed(0)} MB`,
+      });
+    }
+    // The HTML embeds whatever the notebook plotted — make the publisher say they know.
+    if (req.body?.acknowledge_embedded_data !== true) {
+      return res.status(400).json({
+        error: 'Confirm that you understand the report embeds the data it plots (acknowledge_embedded_data).',
+      });
+    }
+
+    // Provenance, and the cross-org rule (ADR-027): only datasets the publisher's own team owns,
+    // because another team could not revoke data embedded in a file.
+    const datasetIds = [...new Set((Array.isArray(req.body?.dataset_ids) ? req.body.dataset_ids : [])
+      .map((d) => String(d || '').trim()).filter(Boolean))];
+    if (!datasetIds.length) {
+      return res.status(400).json({ error: 'dataset_ids is required: list the datasets the report was built from' });
+    }
+    const found = await query(
+      `SELECT d.id, d.name, d.team_id::text AS team_id, t.name AS team_name,
+              EXISTS (SELECT 1 FROM w4h.project_datasets pd
+                      WHERE pd.project_id = $2::uuid AND pd.dataset_id = d.id) AS linked,
+              EXISTS (SELECT 1 FROM w4h.team_members tm
+                      WHERE tm.team_id = d.team_id AND tm.user_id = $3) AS mine
+       FROM w4h.datasets d LEFT JOIN w4h.teams t ON t.id = d.team_id
+       WHERE d.id = ANY($1::text[])`,
+      [datasetIds, projectId, req.user.id]
+    );
+    const byId = new Map(found.rows.map((r) => [r.id, r]));
+    for (const id of datasetIds) {
+      const row = byId.get(id);
+      if (!row) return res.status(400).json({ error: `Unknown dataset: ${id}` });
+      if (!row.linked) return res.status(400).json({ error: `Dataset "${row.name || id}" is not linked to this project` });
+      if (!row.mine && !isSuperAdmin(req.user.role)) {
+        return res.status(403).json({
+          error: `Dataset "${row.name || id}" belongs to ${row.team_name || 'another team'}. A report may only use datasets your own team owns.`,
+        });
+      }
+    }
+    const source = {
+      contribution: req.body?.contribution && typeof req.body.contribution === 'object'
+        ? {
+            slug: String(req.body.contribution.slug || '').slice(0, 120) || null,
+            version: String(req.body.contribution.version || '').slice(0, 60) || null,
+          }
+        : null,
+      datasets: datasetIds.map((id) => ({
+        id, name: byId.get(id).name, team_id: byId.get(id).team_id, team_name: byId.get(id).team_name,
+      })),
+    };
+    const snapshotAt = req.body?.snapshot_at && !Number.isNaN(Date.parse(req.body.snapshot_at))
+      ? new Date(req.body.snapshot_at) : new Date();
+
+    const inserted = await query(
+      `INSERT INTO w4h.project_reports
+         (project_id, title, description, html, size_bytes, sha256, dataset_ids, source, snapshot_at, created_by)
+       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::text[], $8::jsonb, $9, $10)
+       RETURNING id`,
+      [projectId, title, description, html, bytes, sha256(html), datasetIds, JSON.stringify(source), snapshotAt, req.user.id]
+    );
+    auditProjectAction(req, 'project.report.publish', projectId, {
+      resourceType: 'project_report',
+      resourceId: inserted.rows[0].id,
+      details: { title, size_bytes: bytes, dataset_ids: datasetIds, contribution: source.contribution?.slug || null },
+    });
+    const meta = await query(
+      `SELECT ${REPORT_META_COLS}
+       FROM w4h.project_reports r LEFT JOIN w4h.users u ON u.id = r.created_by
+       WHERE r.id = $1::uuid`,
+      [inserted.rows[0].id]
+    );
+    res.status(201).json(meta.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to publish report' });
+  }
+}
+
+/** The report page itself, with a strict CSP injected. Rendered by the app in a sandboxed iframe. */
+async function getProjectReportContent(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canReadProject(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const row = await query(
+      `SELECT ${REPORT_META_COLS}, r.html
+       FROM w4h.project_reports r LEFT JOIN w4h.users u ON u.id = r.created_by
+       WHERE r.id = $1::uuid AND r.project_id = $2::uuid`,
+      [req.params.reportId, projectId]
+    );
+    if (!row.rowCount) return res.status(404).json({ error: 'Report not found' });
+    const { html, ...meta } = row.rows[0];
+    auditProjectAction(req, 'project.report.view', projectId, {
+      resourceType: 'project_report',
+      resourceId: meta.id,
+      details: { title: meta.title },
+    });
+    res.json({ report: meta, html: injectReportCsp(html) });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load report' });
+  }
+}
+
+async function deleteProjectReport(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  try {
+    const row = await query(
+      `SELECT id, title, created_by FROM w4h.project_reports WHERE id = $1::uuid AND project_id = $2::uuid`,
+      [req.params.reportId, projectId]
+    );
+    if (!row.rowCount) return res.status(404).json({ error: 'Report not found' });
+    const allowed = (await canManageProject(projectId, req.user))
+      || Number(row.rows[0].created_by) === Number(req.user.id);
+    if (!allowed) return res.status(403).json({ error: 'Unauthorized' });
+    await query(`DELETE FROM w4h.project_reports WHERE id = $1::uuid`, [row.rows[0].id]);
+    auditProjectAction(req, 'project.report.delete', projectId, {
+      resourceType: 'project_report',
+      resourceId: row.rows[0].id,
+      details: { title: row.rows[0].title },
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to delete report' });
+  }
+}
+
 
 async function replaceProjectOrganizations(req, res) {
   const projectId = await resolveProjectId(req.params.id);

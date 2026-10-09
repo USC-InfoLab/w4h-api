@@ -3,7 +3,7 @@ const router = express.Router();
 import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { isSuperAdmin, canManageTeamAsync, isTeamAdmin } from '../lib/utils/user.js';
+import { isSuperAdmin, canManageTeamAsync } from '../lib/utils/user.js';
 import crypto from 'crypto';
 import pkg from 'pg';
 const { Pool } = pkg;
@@ -189,6 +189,7 @@ async function getAdminHome(req, res) {
       usage24hRes,
       usage7dRes,
       docsStatsRes,
+      accessRequestsRes,
     ] = await Promise.all([
       query(`SELECT COUNT(*)::int AS n FROM w4h.teams WHERE status = 'active'`).catch(() => ({ rows: [{ n: 0 }] })),
       query(`
@@ -221,10 +222,7 @@ async function getAdminHome(req, res) {
             FROM w4h.team_members tm
             JOIN w4h.users u ON u.id = tm.user_id
             WHERE tm.team_id = t.id
-              AND (
-                tm.role = 'team_admin'
-                OR u.role IN ('team_admin', 'admin')
-              )
+              AND tm.role = 'team_admin'
               AND COALESCE(u.status, 'active') = 'active'
           )
       `).catch(() => ({ rows: [{ n: 0 }] })),
@@ -296,6 +294,8 @@ async function getAdminHome(req, res) {
           projects_without_linked_docs: 0,
         }],
       })),
+      query(`SELECT COUNT(*)::int AS n FROM w4h.access_requests WHERE status = 'pending'`)
+        .catch(() => ({ rows: [{ n: 0 }] })),
     ]);
 
     const users = usersRes.rows[0] || {};
@@ -341,6 +341,7 @@ async function getAdminHome(req, res) {
       },
       attention: {
         invites_pending: invitesRes.rows[0]?.n ?? 0,
+        access_requests_pending: accessRequestsRes.rows[0]?.n ?? 0,
         datasets_without_team: orphanDatasetsRes.rows[0]?.n ?? 0,
         teams_without_admin: teamsWithoutAdminRes.rows[0]?.n ?? 0,
         projects_without_docs: docsStatsRes.rows[0]?.projects_without_linked_docs ?? 0,
@@ -366,8 +367,7 @@ async function getAdminHome(req, res) {
 }
 
 /**
- * Teams where the caller is Team admin (membership role), or all memberships
- * when legacy users.role = team_admin.
+ * Teams where the caller is Team admin (membership role); every active team for a Super admin.
  */
 async function getAdministeredTeamIds(user) {
   if (isSuperAdmin(user.role)) {
@@ -375,13 +375,6 @@ async function getAdministeredTeamIds(user) {
     return all.rows.map((r) => r.id);
   }
 
-  if (isTeamAdmin(user.role)) {
-    const legacy = await query(
-      `SELECT team_id::text AS id FROM w4h.team_members WHERE user_id = $1`,
-      [user.id]
-    );
-    if (legacy.rowCount) return legacy.rows.map((r) => r.id);
-  }
 
   const res = await query(
     `SELECT team_id::text AS id

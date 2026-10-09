@@ -4,8 +4,10 @@ CREATE SCHEMA IF NOT EXISTS w4h;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ---------------------------------------------------------------------------
--- Users — platform roles: super_admin · team_admin · project_user
--- (legacy values admin / researcher / clinician still accepted until migrated)
+-- Users — platform roles: super_admin · project_user. Team admin is NOT a platform role: it is
+-- team_members.role = 'team_admin' per team (ADR-004, R-09). The constraint below still accepts
+-- legacy values (team_admin / admin / researcher / clinician) so older rows load; the migration
+-- after team_members retires global team_admin.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS w4h.users (
   id SERIAL PRIMARY KEY,
@@ -410,6 +412,45 @@ VALUES
     'main',
     'README.md',
     'published'
+  ),
+  (
+    'w4h-fitbit-wear-compliance',
+    'usc-infolab',
+    'Fitbit wear compliance',
+    'Per-subject band wear-time protocol reports (heart rate as the wear proxy, daily windows and thresholds). Notebook + CLI (`report` / `sync`). The Analytics tab''s cohort wear tile is computed by the platform from the same protocol.',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-fitbit-wear-compliance',
+    'feature/wp2-cli',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-demo-approximate-queries',
+    'usc-infolab',
+    'Approximate range queries demo',
+    'Notebook demo of the fft_approximate PostgreSQL extension: approximate range-aggregate queries compared with exact ones. Install the extension on your own database first (not part of w4h-docker).',
+    'notebook',
+    ARRAY['notebook']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-demo-approximate-queries',
+    'master',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-hr-anomaly',
+    'usc-infolab',
+    'Resting heart-rate anomaly detector',
+    'Example model contribution (MVP M4): per-subject resting heart-rate baseline with a robust z-score and an Isolation Forest. Works on any dataset with a mapped heart_rate signal; reads the series API and writes a derived hr_anomaly table. Notebook + CLI. Research/demo only, not a diagnostic.',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-hr-anomaly',
+    'main',
+    'README.md',
+    'published'
   )
 ON CONFLICT (slug) DO UPDATE SET
   publisher = EXCLUDED.publisher,
@@ -653,6 +694,15 @@ ALTER TABLE w4h.team_members DROP CONSTRAINT IF EXISTS team_members_role_check;
 ALTER TABLE w4h.team_members ADD CONSTRAINT team_members_role_check
   CHECK (role IN ('team_admin', 'member'));
 
+-- Retire global users.role = team_admin (R-09): a legacy global Team admin was admin on all of
+-- their teams, so carry that onto team_members, then drop the global value. Idempotent — the
+-- API no longer writes users.role = 'team_admin'.
+UPDATE w4h.team_members tm
+SET role = 'team_admin'
+FROM w4h.users u
+WHERE u.id = tm.user_id AND u.role = 'team_admin' AND tm.role <> 'team_admin';
+UPDATE w4h.users SET role = 'project_user' WHERE role = 'team_admin';
+
 -- Projects belong to exactly one owning team (ADR-012)
 ALTER TABLE w4h.projects ADD COLUMN IF NOT EXISTS team_id uuid REFERENCES w4h.teams(id) ON DELETE RESTRICT;
 CREATE INDEX IF NOT EXISTS idx_projects_team_id ON w4h.projects(team_id);
@@ -781,3 +831,67 @@ CREATE TABLE IF NOT EXISTS w4h.ai_messages (
 
 CREATE INDEX IF NOT EXISTS idx_ai_messages_conversation
   ON w4h.ai_messages (conversation_id, created_at ASC);
+-- Cross-org project collaboration (ADR-027): teams other than the owning team that may
+-- contribute members and datasets to one project. 'pending' until a Team admin of the
+-- invited team accepts.
+CREATE TABLE IF NOT EXISTS w4h.project_teams (
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  team_id uuid NOT NULL REFERENCES w4h.teams(id) ON DELETE CASCADE,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'active')),
+  invited_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  accepted_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  accepted_at timestamptz,
+  PRIMARY KEY (project_id, team_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_teams_team_id ON w4h.project_teams(team_id);
+
+-- An approved Admin who has not created their team yet (ADR-028): they may create teams, but
+-- have no membership. Set when a Super admin approves an access request; never grants more.
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS can_create_teams boolean NOT NULL DEFAULT false;
+
+-- Published notebook reports (ADR-029): an Admin's interactive HTML snapshot, kept per project.
+CREATE TABLE IF NOT EXISTS w4h.project_reports (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES w4h.projects(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  description text,
+  html text NOT NULL,
+  size_bytes integer NOT NULL,
+  sha256 text NOT NULL,
+  dataset_ids text[] NOT NULL DEFAULT '{}',
+  source jsonb NOT NULL DEFAULT '{}'::jsonb,
+  snapshot_at timestamptz NOT NULL DEFAULT now(),
+  created_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_project_reports_project
+  ON w4h.project_reports (project_id, created_at DESC);
+
+-- Platform access requests (ADR-028): a prospective PI with a verified USC email asks for a
+-- Team admin account + initial team. Not an account until a Super admin fulfills it.
+CREATE TABLE IF NOT EXISTS w4h.access_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  email text NOT NULL,
+  affiliation text,
+  purpose text,
+  status text NOT NULL DEFAULT 'unverified'
+    CHECK (status IN ('unverified', 'pending', 'fulfilled', 'declined', 'spam')),
+  verify_token_hash text,
+  verify_expires_at timestamptz,
+  verified_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  handled_by integer REFERENCES w4h.users(id) ON DELETE SET NULL,
+  handled_at timestamptz,
+  note text,
+  user_id integer REFERENCES w4h.users(id) ON DELETE SET NULL
+);
+
+-- One open (unverified or pending) request per email.
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_access_requests_open_email
+  ON w4h.access_requests (lower(email))
+  WHERE status IN ('unverified', 'pending');
+CREATE INDEX IF NOT EXISTS idx_access_requests_status
+  ON w4h.access_requests (status, created_at DESC);
