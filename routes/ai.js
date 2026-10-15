@@ -4,7 +4,7 @@ import { isSuperAdmin } from '../lib/utils/user.js';
 import { recordUsageEventSafe } from '../lib/utils/usage.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { scanPhiMessages } from '../lib/ai/phi.js';
-import { createClaudeMessage } from '../lib/ai/claude.js';
+import { createClaudeMessage, streamClaudeMessage } from '../lib/ai/claude.js';
 import { buildSystemPrompt, normalizeMode } from '../lib/ai/prompt.js';
 import {
   authorizeAiCall,
@@ -43,6 +43,7 @@ function contextFromBody(body = {}) {
     contributionSlug: body.contribution_slug ? String(body.contribution_slug).slice(0, 200) : null,
     mode: normalizeMode(body.mode),
     confirmNoPhi: !!body.confirm_no_phi,
+    stream: body.stream === true,
   };
 }
 
@@ -255,8 +256,9 @@ router.post('/chat', authenticate, async (req, res) => {
     });
   }
 
+  let system;
   try {
-    const system = await buildSystemPrompt({
+    system = await buildSystemPrompt({
       mode: ctx.mode,
       shell: ctx.shell,
       route: ctx.route,
@@ -270,15 +272,20 @@ router.post('/chat', authenticate, async (req, res) => {
       contributionSlug: ctx.contributionSlug,
       phiFilter: auth.phiFilter,
     });
+  } catch (err) {
+    console.error('ai chat prompt:', err);
+    return res.status(500).json({ error: err.message || 'Chat error' });
+  }
 
-    const reply = await createClaudeMessage({
-      apiKey: auth.apiKey,
-      model: auth.model,
-      system,
-      messages: messages.map((m) => ({ role: m.role, content: m.content })),
-      maxTokens: ctx.mode === 'irb' || ctx.mode === 'analysis' ? 4096 : 2048,
-    });
+  const claudeArgs = {
+    apiKey: auth.apiKey,
+    model: auth.model,
+    system,
+    messages: messages.map((m) => ({ role: m.role, content: m.content })),
+    maxTokens: ctx.mode === 'irb' || ctx.mode === 'analysis' ? 4096 : 2048,
+  };
 
+  const persistAndRecord = async (reply) => {
     const lastUser = [...messages].reverse().find((m) => m.role === 'user')?.content || '';
     const conv = await appendTurn(req.user.id, req.body.conversation_id, {
       userContent: lastUser,
@@ -302,16 +309,65 @@ router.post('/chat', authenticate, async (req, res) => {
       },
     });
 
-    res.json({
-      reply: reply.text,
+    return conv;
+  };
+
+  if (!ctx.stream) {
+    try {
+      const reply = await createClaudeMessage(claudeArgs);
+      const conv = await persistAndRecord(reply);
+      res.json({
+        reply: reply.text,
+        conversation: conv,
+        model: reply.model,
+        usage: reply.usage,
+        phi_safe: auth.phiFilter !== 'permissive',
+      });
+    } catch (err) {
+      console.error('ai chat:', err);
+      res.status(err.status || 500).json({ error: err.message || 'Chat error' });
+    }
+    return;
+  }
+
+  // Streaming (SSE) path — same auth/PHI gate above, same persistence/usage
+  // accounting below, only the transport to the client differs.
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx/proxy response buffering
+  res.flushHeaders?.();
+
+  const abortController = new AbortController();
+  // res, not req: on Node >=16 req 'close' fires as soon as the POST body is read,
+  // which would abort the upstream Claude call immediately.
+  res.on('close', () => {
+    if (!res.writableFinished) abortController.abort();
+  });
+
+  const send = (event) => {
+    if (!res.writableEnded && !res.destroyed) res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+
+  try {
+    const reply = await streamClaudeMessage({
+      ...claudeArgs,
+      onDelta: (text) => send({ type: 'delta', text }),
+      signal: abortController.signal,
+    });
+    const conv = await persistAndRecord(reply);
+    send({
+      type: 'done',
       conversation: conv,
       model: reply.model,
       usage: reply.usage,
       phi_safe: auth.phiFilter !== 'permissive',
     });
   } catch (err) {
-    console.error('ai chat:', err);
-    res.status(err.status || 500).json({ error: err.message || 'Chat error' });
+    console.error('ai chat stream:', err);
+    send({ type: 'error', error: err.message || 'Chat error' });
+  } finally {
+    res.end();
   }
 });
 
