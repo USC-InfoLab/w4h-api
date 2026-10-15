@@ -339,7 +339,11 @@ router.post('/chat', authenticate, async (req, res) => {
   res.flushHeaders?.();
 
   const abortController = new AbortController();
-  req.on('close', () => abortController.abort());
+  // res, not req: on Node >=16 req 'close' fires as soon as the POST body is read,
+  // which would abort the upstream Claude call immediately.
+  res.on('close', () => {
+    if (!res.writableFinished) abortController.abort();
+  });
 
   const send = (event) => {
     if (!res.writableEnded && !res.destroyed) res.write(`data: ${JSON.stringify(event)}\n\n`);
