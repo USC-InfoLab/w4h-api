@@ -1,28 +1,6 @@
 # AGENTS.md — w4h-api
 
-Agent playbook for the **Wearables for Health (W4H) Toolkit** HTTP API: Node.js (ESM), Express 4, PostgreSQL (`w4h` schema). Human-oriented setup lives in [README.md](./README.md). Structural API map: [API_INDEX.md](./API_INDEX.md) (generated).
-
----
-
-## Using this file in Cursor
-
-| Mode | Does root `AGENTS.md` apply? | What you should do |
-|------|------------------------------|--------------------|
-| **Agent (Chat)** | **Yes** — Cursor loads project `AGENTS.md` automatically ([docs](https://cursor.com/docs/context/rules#agentsmd)). | Open the **`w4h-api`** folder (or a workspace where this repo is a root folder). Check **Customize → Rules** to confirm it appears. |
-| **Inline Edit (⌘K / Ctrl+K)** | **No** — rules and `AGENTS.md` are not applied to inline edit. | `@AGENTS.md` or paste the relevant section when needed. |
-| **Tab autocomplete** | **No**. | N/A |
-| **Multi-repo workspace** | Per-folder — each repo root has its own `AGENTS.md`. | When editing API code, ensure the agent’s context includes **this** repo (not only `w4h-app` / `w4h-docs`). |
-
-**Already configured here:** [CLAUDE.md](./CLAUDE.md) is `@AGENTS.md` for tools that read it.
-
-**Optional (only if agents keep missing file-specific rules):**
-
-- `.cursor/rules/*.mdc` in this repo — auto-attach when you touch matching paths (see [routes-and-handlers.mdc](./.cursor/rules/routes-and-handlers.mdc), [database-schema.mdc](./.cursor/rules/database-schema.mdc)).
-- **User Rules** (Cursor Settings → Rules) — your personal style, all projects; not a substitute for this file.
-
-**Filename:** must be exactly `AGENTS.md` (case-sensitive).
-
----
+Agent playbook for the **Wearables for Health (W4H) Toolkit** HTTP API: Node.js (ESM), Express 4, PostgreSQL (`w4h` schema). Human-oriented setup: [README.md](./README.md). Structural API map: [API_INDEX.md](./API_INDEX.md) (generated).
 
 ## Table of contents
 
