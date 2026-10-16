@@ -3,8 +3,8 @@ import { authenticate, requireTeamAdmin, requirePlatformAdmin } from '../auth.js
 import { query } from '../db.js';
 import {
   isSuperAdmin,
-  isTeamAdmin,
   canManageTeamAsync,
+  canCreateTeamsAsync,
   isTeamAdminOnTeam,
   normalizeTeamMemberRole,
   TEAM_MEMBER_ROLES,
@@ -14,7 +14,7 @@ const router = express.Router();
 const SCHEMA = 'w4h';
 
 router.get('/', authenticate, requireTeamAdmin, listTeams);
-router.post('/', authenticate, requireTeamAdmin, createTeam);
+router.post('/', authenticate, createTeam);
 router.get('/:id', authenticate, getTeam);
 router.patch('/:id', authenticate, requireTeamAdmin, updateTeam);
 router.post('/:id/members', authenticate, requireTeamAdmin, addTeamMember);
@@ -84,7 +84,9 @@ async function listTeams(req, res) {
         t.status,
         t.created_at,
         t.updated_at,
-        COUNT(DISTINCT tm.user_id)::int AS member_count
+        COUNT(DISTINCT tm.user_id)::int AS member_count,
+        (SELECT COUNT(*)::int FROM ${SCHEMA}.projects p
+          WHERE p.team_id = t.id AND p.status = 'active') AS project_count
       FROM ${SCHEMA}.teams t
       LEFT JOIN ${SCHEMA}.team_members tm ON tm.team_id = t.id
     `;
@@ -112,7 +114,14 @@ async function listTeams(req, res) {
 }
 
 async function createTeam(req, res) {
-  if (!(await canManageTeamAsync(req.user))) {
+  // Super admins do not create teams: they approve access requests and the approved Admin
+  // defines their own teams (ADR-028, T-15).
+  if (isSuperAdmin(req.user?.role)) {
+    return res.status(403).json({
+      error: 'Super admins do not create teams. Approve an access request; the Admin creates their own team.',
+    });
+  }
+  if (!(await canCreateTeamsAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
@@ -131,16 +140,13 @@ async function createTeam(req, res) {
 
     const team = result.rows[0];
 
-    // Creator membership: Team admin owns new trial teams; Super admin is listed as member for visibility only.
+    // The creator owns the new team.
     if (req.user?.id != null) {
-      const membershipRole = isSuperAdmin(req.user.role)
-        ? TEAM_MEMBER_ROLES.MEMBER
-        : TEAM_MEMBER_ROLES.TEAM_ADMIN;
       await query(
         `INSERT INTO ${SCHEMA}.team_members (team_id, user_id, role)
          VALUES ($1::uuid, $2, $3)
          ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
-        [team.id, req.user.id, membershipRole]
+        [team.id, req.user.id, TEAM_MEMBER_ROLES.TEAM_ADMIN]
       );
     }
 
@@ -275,14 +281,6 @@ async function addTeamMember(req, res) {
       return res.status(409).json({ error: 'User is already a member of this team' });
     }
 
-    // Keep legacy users.role aligned with any team_admin membership
-    if (teamRole === TEAM_MEMBER_ROLES.TEAM_ADMIN && !isTeamAdmin(target.role)) {
-      await query(
-        `UPDATE ${SCHEMA}.users SET role = 'team_admin' WHERE id = $1 AND role NOT IN ('super_admin', 'admin')`,
-        [target.id]
-      );
-    }
-
     const members = await listTeamMembers(teamId);
     res.status(201).json({
       success: true,
@@ -326,27 +324,6 @@ async function updateTeamMember(req, res) {
       return res.status(404).json({ error: 'Member not found on this team' });
     }
 
-    if (teamRole === TEAM_MEMBER_ROLES.TEAM_ADMIN) {
-      await query(
-        `UPDATE ${SCHEMA}.users SET role = 'team_admin'
-         WHERE id = $1 AND role NOT IN ('super_admin', 'admin')`,
-        [userId]
-      );
-    } else {
-      // Demote platform role only if they are not team_admin on any other team
-      await query(
-        `UPDATE ${SCHEMA}.users u
-         SET role = 'project_user'
-         WHERE u.id = $1
-           AND u.role = 'team_admin'
-           AND NOT EXISTS (
-             SELECT 1 FROM ${SCHEMA}.team_members tm
-             WHERE tm.user_id = u.id AND tm.role = 'team_admin'
-           )`,
-        [userId]
-      );
-    }
-
     const members = await listTeamMembers(teamId);
     res.json({ success: true, message: 'Member role updated', members });
   } catch (error) {
@@ -369,26 +346,45 @@ async function removeTeamMember(req, res) {
       return res.status(400).json({ error: 'Invalid user id' });
     }
 
-    const result = await query(
-      `DELETE FROM ${SCHEMA}.team_members
-       WHERE team_id = $1::uuid AND user_id = $2
-       RETURNING user_id`,
+    const current = await query(
+      `SELECT tm.role,
+              (SELECT COUNT(*)::int FROM ${SCHEMA}.team_members x WHERE x.user_id = tm.user_id) AS team_count,
+              (SELECT COUNT(*)::int FROM ${SCHEMA}.team_members x
+                WHERE x.team_id = tm.team_id AND x.role = 'team_admin') AS admin_count
+       FROM ${SCHEMA}.team_members tm
+       WHERE tm.team_id = $1::uuid AND tm.user_id = $2`,
       [teamId, userId]
     );
-    if (!result.rowCount) {
+    if (!current.rowCount) {
       return res.status(404).json({ error: 'Member not found on this team' });
+    }
+    // Everyone but a Super admin keeps at least one team (R-06); discontinue the account instead.
+    if (current.rows[0].team_count <= 1) {
+      return res.status(400).json({
+        error: 'A user must belong to at least one team. Add them to another team first, or discontinue the account.',
+      });
+    }
+    if (current.rows[0].role === TEAM_MEMBER_ROLES.TEAM_ADMIN && current.rows[0].admin_count <= 1) {
+      return res.status(400).json({ error: 'A team must keep at least one Admin. Make someone else an Admin first.' });
     }
 
     await query(
-      `UPDATE ${SCHEMA}.users u
-       SET role = 'project_user'
-       WHERE u.id = $1
-         AND u.role = 'team_admin'
+      `DELETE FROM ${SCHEMA}.team_members WHERE team_id = $1::uuid AND user_id = $2`,
+      [teamId, userId]
+    );
+
+    // Project access follows team membership (P-12): drop their seats on this team's projects
+    // unless they still belong to one of those projects' collaborating teams (ADR-027).
+    await query(
+      `DELETE FROM ${SCHEMA}.project_members pm
+       USING ${SCHEMA}.projects p
+       WHERE pm.project_id = p.id AND p.team_id = $1::uuid AND pm.user_id = $2
          AND NOT EXISTS (
-           SELECT 1 FROM ${SCHEMA}.team_members tm
-           WHERE tm.user_id = u.id AND tm.role = 'team_admin'
+           SELECT 1 FROM ${SCHEMA}.project_teams pt
+           JOIN ${SCHEMA}.team_members tm ON tm.team_id = pt.team_id AND tm.user_id = pm.user_id
+           WHERE pt.project_id = p.id AND pt.status = 'active'
          )`,
-      [userId]
+      [teamId, userId]
     );
 
     const members = await listTeamMembers(teamId);

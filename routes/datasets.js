@@ -4,16 +4,15 @@ const router = express.Router();
 import { authenticateJwtOrApiKey, requireTeamAdmin, requirePlatformAdmin } from '../auth.js';
 import {
   isSuperAdmin,
-  isTeamAdmin,
-  canManageTeam,
   canManageTeamAsync,
   isTeamAdminOnTeam,
 } from '../lib/utils/user.js';
 import { query } from '../db.js';
 import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLinkColumn.js';
+import { describeViz, runViz } from '../lib/viz-queries.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { importCsvBatch, assertCanIngestDataset } from '../lib/ingest-csv.js';
-import { computeMetsSummary, mergeMetsSummary } from '../lib/dataset-mets-summary.js';
+import { refreshDatasetSummaryData } from '../lib/dataset-summary-refresh.js';
 import { listDatasetSignals, runSqlContribution, assertCanViewDataset } from '../lib/sql-contribution-engine.js';
 import { getCohortAnalyticsSetup, runCohortComparison } from '../lib/cohort-analytics.js';
 import { attachMetadataSummaries } from '../lib/dataset-metadata-summary.js';
@@ -42,6 +41,8 @@ router.get('/:id/dependents', authenticateJwtOrApiKey, getDatasetDependents);
 router.get('/:id/signals', authenticateJwtOrApiKey, getDatasetSignals);
 router.get('/:id/analytics/cohort', authenticateJwtOrApiKey, getDatasetCohortAnalytics);
 router.post('/:id/analytics/cohort', authenticateJwtOrApiKey, postDatasetCohortAnalytics);
+router.get('/:id/analytics/catalog', authenticateJwtOrApiKey, getDatasetVizCatalog);
+router.post('/:id/analytics/series', authenticateJwtOrApiKey, postDatasetViz);
 router.get('/:id', authenticateJwtOrApiKey, getDataset);
 
 const STATUS_TABLE_NAME = 'w4h.status_log';
@@ -53,8 +54,8 @@ function canAccessDatasets(user) {
   return !!user && DATASET_ALLOWED_ROLES.has(user.role);
 }
 
-function canManageDatasets(user) {
-  return !!user && canManageTeam(user.role);
+async function canManageDatasets(user) {
+  return canManageTeamAsync(user);
 }
 
 function isAdmin(user) {
@@ -370,9 +371,12 @@ async function createDataset(req, res) {
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     let teamId = req.body?.team_id == null ? null : String(req.body.team_id).trim();
-    if (!teamId && isTeamAdmin(req.user.role) && !isSuperAdmin(req.user.role)) {
-      const myTeams = await getTeamIdsForUser(req.user.id);
-      if (myTeams.length === 1) teamId = myTeams[0];
+    if (!teamId && !isSuperAdmin(req.user.role)) {
+      const adminTeams = await query(
+        `SELECT team_id::text AS team_id FROM w4h.team_members WHERE user_id = $1 AND role = 'team_admin'`,
+        [req.user.id]
+      );
+      if (adminTeams.rowCount === 1) teamId = adminTeams.rows[0].team_id;
     }
     if (!teamId) return res.status(400).json({ error: 'team_id is required' });
 
@@ -437,7 +441,7 @@ async function createDataset(req, res) {
 }
 
 async function deleteDataset(req, res) {
-  if (!canManageDatasets(req.user)) {
+  if (!(await canManageDatasets(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -492,7 +496,7 @@ async function deleteDataset(req, res) {
 }
 
 async function updateDataset(req, res) {
-  if (!canManageDatasets(req.user)) {
+  if (!(await canManageDatasets(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   try {
@@ -1505,6 +1509,52 @@ async function postDatasetCohortAnalytics(req, res) {
   }
 }
 
+/** GET /datasets/:id/analytics/catalog — what the chart component can show (ADR-029). */
+async function getDatasetVizCatalog(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const access = await assertCanViewDataset(req.user, datasetId);
+    if (!access.ok) {
+      return res.status(access.status || 403).json({ error: access.error || 'Unauthorized' });
+    }
+    return res.json(await describeViz(datasetId));
+  } catch (error) {
+    console.error('getDatasetVizCatalog error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to describe chartable signals' });
+  }
+}
+
+/** POST /datasets/:id/analytics/series — aggregated data for one chart (ADR-029 §3). */
+async function postDatasetViz(req, res) {
+  try {
+    const datasetId = String(req.params.id || '').trim();
+    const access = await assertCanViewDataset(req.user, datasetId);
+    if (!access.ok) {
+      return res.status(access.status || 403).json({ error: access.error || 'Unauthorized' });
+    }
+    const body = req.body || {};
+    const result = await runViz(datasetId, body);
+    if (!result.ok) {
+      return res.status(result.status || 400).json({ error: result.error || 'Chart query failed' });
+    }
+    writeAuditLogSafe(req, {
+      action: 'dataset.query',
+      resourceType: 'dataset',
+      resourceId: datasetId,
+      details: {
+        analytics: 'viz',
+        kind: result.kind,
+        signal: body.signal || body.x?.signal || null,
+        subjects: Array.isArray(body.subjects) ? body.subjects.length : 0,
+      },
+    });
+    return res.json(result);
+  } catch (error) {
+    console.error('postDatasetViz error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to run chart query' });
+  }
+}
+
 /** GET /datasets/:id/signals — mapped signals from w4h.tables (ADR-023). */
 async function getDatasetSignals(req, res) {
   try {
@@ -1550,7 +1600,11 @@ async function runDatasetSqlContribution(req, res) {
   }
 }
 
-/** POST /datasets/:id/summary/refresh — recompute cached mets_summary (ADR-019). */
+/**
+ * POST /datasets/:id/summary/refresh — recompute the cached cohort summaries: `mets_summary` and
+ * `wear_compliance` (ADR-019). Body (optional): `wear_protocol` { daily_band_wear_percentage,
+ * overall_band_wear_percentage, daily_band_wear_hours: [["08:00","20:00"]] }.
+ */
 async function refreshDatasetSummary(req, res) {
   try {
     const datasetId = String(req.params.id || '').trim();
@@ -1558,40 +1612,26 @@ async function refreshDatasetSummary(req, res) {
     if (!access.ok) {
       return res.status(access.status || 403).json({ error: access.error || 'Unauthorized' });
     }
-
-    const currentRes = await query(
-      `SELECT summary FROM w4h.datasets WHERE id = $1`,
-      [datasetId]
-    );
-    if (!currentRes.rowCount) {
-      return res.status(404).json({ error: 'Dataset not found' });
+    const result = await refreshDatasetSummaryData(datasetId, { wearProtocol: req.body?.wear_protocol || null });
+    if (!result.ok) {
+      return res.status(result.status || 400).json({ error: result.error });
     }
-
-    const metsSummary = await computeMetsSummary(datasetId);
-    const nextSummary = mergeMetsSummary(currentRes.rows[0].summary, metsSummary);
-    const updated = await query(
-      `UPDATE w4h.datasets
-       SET summary = $2::jsonb, summary_updated_at = NOW()
-       WHERE id = $1
-       RETURNING summary, summary_updated_at`,
-      [datasetId, JSON.stringify(nextSummary)]
-    );
-
     writeAuditLogSafe(req, {
       action: 'dataset.summary.refresh',
       resourceType: 'dataset',
       resourceId: datasetId,
       details: {
-        mets_available: Boolean(metsSummary?.available),
-        mets_source: metsSummary?.source || null,
-        subjects_with_data: metsSummary?.subjects_with_data ?? 0,
+        mets_available: Boolean(result.mets?.available),
+        mets_source: result.mets?.source || null,
+        subjects_with_data: result.mets?.subjects_with_data ?? 0,
+        wear_available: Boolean(result.wear?.available),
+        wear_subjects: result.wear?.subjects_total ?? 0,
       },
     });
-
     return res.json({
       ok: true,
-      summary: updated.rows[0].summary,
-      summary_updated_at: updated.rows[0].summary_updated_at,
+      summary: result.summary,
+      summary_updated_at: result.summary_updated_at,
     });
   } catch (error) {
     console.error('refreshDatasetSummary error:', error);
@@ -1606,11 +1646,10 @@ async function importCsvBatchHandler(req, res) {
     if (!result.ok) {
       return res.status(result.status || 400).json({ error: result.error || 'Import failed' });
     }
-    await writeAuditLogSafe({
-      user_id: req.user?.id,
+    writeAuditLogSafe(req, {
       action: 'dataset.import.csv',
-      resource_type: 'dataset',
-      resource_id: req.params.id,
+      resourceType: 'dataset',
+      resourceId: req.params.id,
       details: {
         signal: req.body?.signal,
         mode: req.body?.mode,

@@ -26,6 +26,7 @@ import projects from './routes/projects.js';
 import teams from './routes/teams.js';
 import contributions from './routes/contributions.js';
 import ai from './routes/ai.js';
+import accessRequests from './routes/access-requests.js';
 import { isConfigured } from './db.js';
 import { ensureSchema } from './lib/db-init.js';
 import { attachApiKeyUsageLogger } from './lib/utils/usage.js';
@@ -83,6 +84,7 @@ app.use('/teams', teams);
 app.use('/contributions', contributions);
 app.use('/packages', contributions);
 app.use('/ai', ai);
+app.use('/access-requests', accessRequests);
 
 app.get('/', async function (req, res) {
   const baked = String(process.env.GIT_COMMIT || '').trim();

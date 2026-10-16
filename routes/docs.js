@@ -5,7 +5,7 @@ const router = express.Router();
 
 import { DOCS_TABLE, DOC_TYPES_TABLE, query } from '../db.js';
 import { authenticate, requirePlatformAdmin } from '../auth.js';
-import { USER_ROLES, isSuperAdmin, isTeamAdmin, canAccessAdminUi } from '../lib/utils/user.js';
+import { USER_ROLES, isSuperAdmin, canAccessAdminUi } from '../lib/utils/user.js';
 import { markdownPathFromDocType, markdownFileForExport, splitFrontmatter, shouldSkipImportBasename } from '../lib/utils/docs.js';
 import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
 
@@ -17,7 +17,6 @@ function canManageDocs(role) {
 
 function canReadDocs(role) {
   return canAccessAdminUi(role)
-    || isTeamAdmin(role)
     || role === USER_ROLES.PROJECT_USER
     || role === USER_ROLES.RESEARCHER
     || role === USER_ROLES.CLINICIAN;
