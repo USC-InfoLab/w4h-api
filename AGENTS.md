@@ -124,6 +124,7 @@ flowchart LR
 |------------|---------|
 | `authenticate` | JWT only |
 | `authenticateJwtOrApiKey` | JWT or `w4h_sk_` key |
+| `authenticateJwtApiKeyOrProjectDbToken` | JWT, user API key, or project DB token (`lib/middleware/projectDbTokenAuth.js`) |
 | `requirePlatformAdmin` | Super admin / platform admin UI (not team admin alone) |
 | `requireTeamAdmin` | Super admin or team `team_admin` membership |
 
