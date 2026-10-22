@@ -1,6 +1,33 @@
 # AGENTS.md — w4h-api
 
-Agent playbook for the **Wearables for Health (W4H) Toolkit** HTTP API: Node.js (ESM), Express 4, PostgreSQL (`w4h` schema). Human-oriented setup: [README.md](./README.md). Structural API map: [API_INDEX.md](./API_INDEX.md) (generated).
+Agent playbook for the **Wearables for Health (W4H) Toolkit** HTTP API: Node.js (ESM), Express 4, PostgreSQL (`w4h` schema). Human-oriented setup: [README.md](./README.md). Structural API map: [API_INDEX.md](./API_INDEX.md) (generated). The shared W4H architecture overview (all repos, concepts, flows) is at the end of this file.
+
+## Where this repo fits in W4H
+
+`w4h-api` is the **hub**. Every other repo either calls it, is executed by it, or is imported by it:
+
+| Relationship | Repos | Mechanism here |
+|---|---|---|
+| Calls it with a JWT | `w4h-app` | `POST /users/login`, then every UI request |
+| Calls it with a personal API key (`w4h_sk_…`) | Importers, `w4h-sql-compute-mets` notebook/CLI, any researcher notebook | `authenticateJwtOrApiKey` routes |
+| Executed by it as a subprocess | `runnable` Python contributions (`run.sh` in a sibling checkout) | `lib/contribution-runner.js` |
+| Executed by it in-process | `kind: sql` contributions (sibling `manifest.yaml` + `sql/*.sql`) | `lib/sql-contribution-engine.js` |
+| Imported by it | `w4h-docs` markdown → `w4h.docs`; media at `/docs-media` | `DOCS_REPO_PATH`, `bin/w4h`, `lib/utils/docs.js` |
+| Packaged by | `w4h-docker` (`api` image: `node:22`, **no Python**, docs baked at `/w4h-docs`) | `W4H_ENV_FILE=/app/persist/.env` |
+| Bypasses it | `fft_approximate` (Postgres extension) and `w4h-demo-approximate-queries` (direct `psycopg2`) | none |
+
+**Code that owns each platform flow:**
+
+| Flow | Route | Library |
+|---|---|---|
+| CSV ingest | `POST /datasets/:id/import/csv-batch` | `lib/ingest-csv.js`: ACL (`assertCanIngestDataset`), `ds_<id>` schema, `<prefix>_<signal>` table, `w4h.tables` upsert |
+| Signal discovery | `GET /datasets/:id/signals` | `lib/sql-contribution-engine.js` |
+| In-app Run | `POST /contributions/:slug/run`, `GET /contributions/runs/:id` | `lib/contribution-runner.js` (clone/fast-forward sibling, spawn `run.sh`, parse `@@PROGRESS@@`, write `w4h.contribution_runs`, refresh summary) |
+| SQL analytics | `POST /datasets/:id/contributions/:slug/sql` | `lib/sql-contribution-engine.js` (bind identifiers from `w4h.tables`, execute, materialize new table) |
+| Contributions catalog | `/contributions/*` | `lib/contributions.js`; seed rows + `runnable` flags in `data/schema.sql` |
+| Cohort / chart analytics | `/datasets/:id/analytics/*` | `lib/cohort-analytics.js`, `lib/viz-queries.js` |
+
+Because the runner and SQL engine read sibling folders (`CONTRIBUTION_RUNNER_REPO_ROOT`, default `..`), in-app Run only works when contribution repos can live next to this checkout, and on a host with Python. The Docker image has no Python, so in-app Run of importers there is designed but not built (ADR-022, MVP D-31).
 
 ## Table of contents
 
@@ -18,6 +45,7 @@ Agent playbook for the **Wearables for Health (W4H) Toolkit** HTTP API: Node.js 
 12. [Product and ADR pointers](#product-and-adr-pointers)
 13. [Sibling repositories](#sibling-repositories)
 14. [Git and PR expectations for agents](#git-and-pr-expectations-for-agents)
+15. [W4H system overview (shared across all repos)](#w4h-system-overview-shared-across-all-repos)
 
 ---
 
@@ -50,6 +78,9 @@ Run from repository root (`w4h-api/`).
 | `npm run start:sample` | API against DB `w4h-sample` |
 | `npm run index:api` | Regenerate `API_INDEX.md` after route/mount changes |
 | `npm test` | **Stub only** — does not run real tests |
+| `node --test lib/sql-ident.test.js` | The one unit-test file (identifier validation/quoting used by ingest and the SQL engine) |
+| `node scripts/smoke-test-csv-batch-insert.mjs` | Self-check of the `csv-batch` insert path against the `.env` database; creates and drops its own scratch dataset |
+| `node scripts/ensure-user-projects.mjs` | One-off repair: creates/backfills legacy `w4h.user_projects` on older databases |
 | `node bin/w4h` | CLI help |
 | `node bin/w4h configuration` | Print DB connection from env |
 | `node bin/w4h seed-docs` | Seed **`w4h-sample`** DB (does not touch `DB_DATABASE`) |
@@ -313,3 +344,35 @@ Use `w4h-repos.code-workspace` when a single feature spans API + app + docs.
 - Prefer matching existing code style over drive-by refactors.
 - When routes or schema change, include regenerated `API_INDEX.md` in the same change set.
 - Cross-repo follow-ups: call out required `w4h-app` / `w4h-docs` PRs in the summary.
+
+<!-- BEGIN w4h-system-overview: identical in every W4H repo's AGENTS.md. Edit all copies together. -->
+
+## W4H system overview (shared across all repos)
+
+**W4H (Wearables for Health) Toolkit** loads wearable-device data into PostgreSQL, organizes it by team, project and dataset, controls access, and runs curated analyses on it. Each signal is a **GeoMTS** (Geospatial Multivariate Time Series) table whose roles (`subject`, `time`, optional `geo`, `values[]`) are stored in `w4h.tables.mapping_json`, not in fixed column names. Three repos form the platform, one packages it, and the rest are **contributions** listed in the in-app catalog (`w4h.contributions`).
+
+| Repo | Role |
+|---|---|
+| `w4h-api` | Express API and Postgres DDL (`w4h` schema): auth, ACL, ingest, catalog, contribution runner, SQL engine. Port 2026 |
+| `w4h-app` | Vue 3 + Vite SPA; talks only to `w4h-api`. Port 5173 |
+| `w4h-docs` | Product rules, MVP, ADRs and guides; imported by the API as in-app Help. Owns product decisions |
+| `w4h-docker` | Compose stack (`api`, `app`, `notebooks`) built from sibling repos; Postgres is external |
+| `w4h-sample-fitbit-csv`, `w4h-sample-icde-demo-csv` | Synthetic sample CSVs plus `manifest.yaml` (ICDE includes a `gps_track` geo signal) |
+| `w4h-sample-fitbit-csv-importer`, `w4h-sample-icde-demo-csv-importer` | Runnable importers (notebook, CLI, `run.sh`) for those samples |
+| `w4h-fitbit-csv-file-importer` | Runnable importer for user-supplied Fitbit CSVs: profile headers, review a drafted mapping, ingest |
+| `w4h-sql-compute-mets` | SQL contribution (YAML + SQL template) that `w4h-api` executes in-process |
+| `fft_approximate` | Postgres C extension, catalog slug `fft-approximate`; no API involvement |
+| `w4h-demo-approximate-queries` | Notebook comparing `fft_approximate` with exact averages over direct Postgres |
+
+**Main flows:**
+
+1. **Ingest:** importers post 500-row chunks to `POST /datasets/:id/import/csv-batch`. `lib/ingest-csv.js` creates `ds_<dataset_id>.<table_prefix>_<signal>` and upserts its `w4h.tables` mapping.
+2. **In-app Run (ADR-022):** `POST /contributions/:slug/run` makes `lib/contribution-runner.js` spawn `../<slug>/run.sh` with the user's `W4H_API_KEY`, `W4H_API_BASE` and `W4H_DATASET_ID`. Stdout lines `@@PROGRESS@@ {json}` drive the progress bar.
+3. **SQL analytics (ADR-023):** `lib/sql-contribution-engine.js` reads `../<slug>/manifest.yaml` and `sql/`, binds identifiers from `w4h.tables`, and runs in-process. There is no free-SQL endpoint.
+4. **Extensions:** the operator installs `fft_approximate` on their Postgres; notebooks call it directly.
+
+**Layout:** clone every repo as a sibling in one folder. The API finds contributions at `../<slug>` (override `CONTRIBUTION_RUNNER_REPO_ROOT`) and docs at `DOCS_REPO_PATH=../w4h-docs`.
+
+**Cross-repo changes:** `w4h-api` first (regenerate `API_INDEX.md`), then `w4h-app`, then `w4h-docs`. Catalog rows are seeded in `w4h-api/data/schema.sql`. Start at `w4h-docs/dev/mvp.md` and `w4h-docs/dev/ADR-README.md` for decisions, and `w4h-docs/dev/developer-setup.md` for local setup, getting an API key, test personas, troubleshooting, per-repo test commands, default branches and a glossary. Do not commit or push unless asked; never commit `.env` files, API keys or participant data.
+
+<!-- END w4h-system-overview -->
