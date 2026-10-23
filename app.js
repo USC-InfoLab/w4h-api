@@ -30,12 +30,13 @@ import accessRequests from './routes/access-requests.js';
 import { isConfigured } from './db.js';
 import { ensureSchema } from './lib/db-init.js';
 import { attachApiKeyUsageLogger } from './lib/utils/usage.js';
+import { urlencodedBodyParser } from './lib/urlencoded-body-parser.js';
 
 const app = express();
 app.use(cors());
 
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(urlencodedBodyParser);
 app.use(attachApiKeyUsageLogger);
 
 app.use(express.static(path.join(__dirname, 'public')));
