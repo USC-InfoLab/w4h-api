@@ -172,8 +172,10 @@ async function userIsOnTeam(userId, teamId) {
 async function getTeam(req, res) {
   try {
     const teamId = req.params.id;
-    const allowed = isSuperAdmin(req.user.role) || (await userIsOnTeam(req.user.id, teamId));
-    if (!allowed) {
+    if (isSuperAdmin(req.user.role)) {
+      return res.status(403).json({ error: 'Super admin does not manage team membership' });
+    }
+    if (!(await userIsOnTeam(req.user.id, teamId))) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 

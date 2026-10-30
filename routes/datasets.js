@@ -80,13 +80,13 @@ async function getTeamIdsForUser(userId) {
 
 async function canAccessTeam(user, teamId) {
   if (!user || !teamId) return false;
-  if (isSuperAdmin(user.role)) return true;
+  if (isSuperAdmin(user.role)) return false;
   return (await getTeamIdsForUser(user.id)).includes(String(teamId));
 }
 
 async function actorCanManageCatalogOnTeam(user, teamId) {
   if (!user || !teamId) return false;
-  if (isSuperAdmin(user.role)) return true;
+  if (isSuperAdmin(user.role)) return false;
   if (await isTeamAdminOnTeam(user.id, teamId, user.role)) return true;
   const owner = await query(
     `SELECT 1
@@ -235,15 +235,7 @@ async function listDatasetsCatalog(req, res) {
     const statusFilter = parseCatalogStatusFilter(req.query?.status);
 
     if (isSuperAdmin(req.user.role)) {
-      const params = [];
-      let sql = `${CATALOG_SELECT}`;
-      const statusSql = sqlOwnedDatasetStatusFilter('d', statusFilter, params);
-      if (statusSql) {
-        sql += ` WHERE 1=1${statusSql}`;
-      }
-      sql += ` ORDER BY d.name ASC NULLS LAST, d.id ASC`;
-      const result = await query(sql, params);
-      return res.json(await attachTableCounts(result.rows));
+      return res.status(403).json({ error: 'Super admin does not browse team dataset catalogs' });
     }
 
     const teamIds = await getTeamIdsForUser(req.user.id);
@@ -371,7 +363,7 @@ async function createDataset(req, res) {
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     let teamId = req.body?.team_id == null ? null : String(req.body.team_id).trim();
-    if (!teamId && !isSuperAdmin(req.user.role)) {
+    if (!teamId) {
       const adminTeams = await query(
         `SELECT team_id::text AS team_id FROM w4h.team_members WHERE user_id = $1 AND role = 'team_admin'`,
         [req.user.id]
@@ -461,14 +453,14 @@ async function deleteDataset(req, res) {
     if (currentTeamId && !(await canAccessTeam(req.user, currentTeamId))) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
-    if (!currentTeamId && !isSuperAdmin(req.user.role)) {
+    if (!currentTeamId) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
-    if (!currentTeamId || !(await actorCanManageCatalogOnTeam(req.user, currentTeamId))) {
+    if (!(await actorCanManageCatalogOnTeam(req.user, currentTeamId))) {
       return res.status(403).json({ error: 'Only the owning team admin can delete this dataset' });
     }
-    if (isReadOnly && !isSuperAdmin(req.user.role)) {
-      return res.status(403).json({ error: 'Platform sample datasets cannot be deleted by team admins' });
+    if (isReadOnly) {
+      return res.status(403).json({ error: 'Platform sample datasets cannot be deleted via the API' });
     }
 
     const tableCountRes = await query(
@@ -515,7 +507,7 @@ async function updateDataset(req, res) {
     if (currentTeamId && !(await canAccessTeam(req.user, currentTeamId))) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
-    if (!currentTeamId && !isSuperAdmin(req.user.role)) {
+    if (!currentTeamId) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
@@ -557,41 +549,21 @@ async function updateDataset(req, res) {
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'read_only')) {
-      if (!isSuperAdmin(req.user.role)) {
-        return res.status(403).json({ error: 'Only Super admin can mark sample / read-only datasets' });
-      }
-      params.push(!!req.body.read_only);
-      fields.push(`read_only = $${params.length}`);
-      if (req.body.read_only && !Object.prototype.hasOwnProperty.call(req.body, 'origin')) {
-        params.push('W4H Samples');
-        fields.push(`origin = $${params.length}`);
-      }
+      return res.status(403).json({
+        error: 'read_only sample datasets are set by platform seed/migrations, not the API.',
+      });
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'origin')) {
-      if (!isSuperAdmin(req.user.role)) {
-        return res.status(403).json({ error: 'Only Super admin can set dataset origin' });
-      }
-      const origin = req.body.origin == null || req.body.origin === ''
-        ? null
-        : String(req.body.origin).trim();
-      params.push(origin);
-      fields.push(`origin = $${params.length}`);
+      return res.status(403).json({
+        error: 'Dataset origin is set by platform seed/migrations, not the API.',
+      });
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'team_id')) {
-      if (!isSuperAdmin(req.user.role)) {
-        return res.status(403).json({ error: 'Only Super admins can change the owning team' });
-      }
-      const teamId = req.body.team_id == null || req.body.team_id === ''
-        ? null
-        : String(req.body.team_id).trim();
-      if (teamId) {
-        const teamCheck = await query(`SELECT id FROM w4h.teams WHERE id = $1::uuid`, [teamId]);
-        if (!teamCheck.rowCount) return res.status(400).json({ error: 'Unknown team_id' });
-      }
-      params.push(teamId);
-      fields.push(`team_id = $${params.length}::uuid`);
+      return res.status(403).json({
+        error: 'Owning team is fixed at dataset creation; Super admin does not reassign catalogs.',
+      });
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) {
@@ -599,8 +571,8 @@ async function updateDataset(req, res) {
       if (!currentTeamId || !(await actorCanManageCatalogOnTeam(req.user, currentTeamId))) {
         return res.status(403).json({ error: 'Only the owning team admin can archive or restore this dataset' });
       }
-      if (nextStatus === 'archived' && isReadOnly && !isSuperAdmin(req.user.role)) {
-        return res.status(403).json({ error: 'Platform sample datasets cannot be archived by team admins' });
+      if (nextStatus === 'archived' && isReadOnly) {
+        return res.status(403).json({ error: 'Platform sample datasets cannot be archived via the API' });
       }
       params.push(nextStatus);
       fields.push(`status = $${params.length}`);
@@ -751,6 +723,9 @@ async function listProjects(req, res) {
   if (!canAccessDatasets(req.user)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
+  if (isSuperAdmin(req.user.role)) {
+    return res.status(403).json({ error: 'Super admin does not browse trial projects' });
+  }
 
   let sql = `
     SELECT id, name
@@ -758,17 +733,15 @@ async function listProjects(req, res) {
   `;
   const params = [];
 
-  if (!isSuperAdmin(req.user.role)) {
-    sql += `
-      WHERE EXISTS (
-        SELECT 1
-        FROM w4h.user_projects us
-        WHERE us.project_id = w4h.projects.id
-          AND us.user_id = $1
-      )
-    `;
-    params.push(req.user.id);
-  }
+  sql += `
+    WHERE EXISTS (
+      SELECT 1
+      FROM w4h.user_projects us
+      WHERE us.project_id = w4h.projects.id
+        AND us.user_id = $1
+    )
+  `;
+  params.push(req.user.id);
 
   sql += ` ORDER BY name ASC`;
   const result = await query(sql, params);
@@ -787,17 +760,15 @@ async function tableInfo(req, res) {
 
   try {
     const pc = await resolveDatasetProjectLinkColumn();
-    const datasetAccessResult = isSuperAdmin(req.user.role)
-      ? await query(
-        `SELECT id, ${pc} AS dataset_project_id FROM w4h.datasets WHERE id = $1`,
-        [req.query.dataset_id]
-      )
-      : await query(
-        `SELECT d.id, d.${pc} AS dataset_project_id
-         FROM w4h.datasets d
-         WHERE d.id = $1 AND ${sqlDatasetAccessibleToUser('$2')}`,
-        [req.query.dataset_id, req.user.id]
-      );
+    if (isSuperAdmin(req.user.role)) {
+      return res.status(403).json({ error: 'Super admin does not query trial dataset tables' });
+    }
+    const datasetAccessResult = await query(
+      `SELECT d.id, d.${pc} AS dataset_project_id
+       FROM w4h.datasets d
+       WHERE d.id = $1 AND ${sqlDatasetAccessibleToUser('$2')}`,
+      [req.query.dataset_id, req.user.id]
+    );
 
     if (datasetAccessResult.rows.length === 0) {
       return res.status(403).json({ error: 'Unauthorized for requested dataset' });
@@ -992,10 +963,11 @@ async function listDatasets(req, res) {
     const params = [];
     const where = [];
 
-    if (!isSuperAdmin(req.user.role)) {
-      params.push(req.user.id);
-      where.push(sqlDatasetAccessibleToUser(`$${params.length}`));
+    if (isSuperAdmin(req.user.role)) {
+      return res.status(403).json({ error: 'Super admin does not list trial datasets' });
     }
+    params.push(req.user.id);
+    where.push(sqlDatasetAccessibleToUser(`$${params.length}`));
 
     const filterProjectId = req.query.project_id;
     if (filterProjectId) {
@@ -1152,19 +1124,15 @@ async function getDataset(req, res) {
   }
 
   const pc = await resolveDatasetProjectLinkColumn();
-  const result = isSuperAdmin(req.user.role)
-    ? await query(
-      `SELECT id, ${pc} AS dataset_project_id, name, description
-       FROM w4h.datasets
-       WHERE id = $1`,
-      [id]
-    )
-    : await query(
-      `SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
-       FROM w4h.datasets d
-       WHERE d.id = $1 AND ${sqlDatasetAccessibleToUser('$2')}`,
-      [id, req.user.id]
-    );
+  if (isSuperAdmin(req.user.role)) {
+    return res.status(403).json({ error: 'Super admin does not open trial dataset records' });
+  }
+  const result = await query(
+    `SELECT d.id, d.${pc} AS dataset_project_id, d.name, d.description
+     FROM w4h.datasets d
+     WHERE d.id = $1 AND ${sqlDatasetAccessibleToUser('$2')}`,
+    [id, req.user.id]
+  );
 
   if (result.rows.length === 0) {
     return res.status(404).json({ error: 'Dataset not found' });
@@ -1439,7 +1407,7 @@ async function revokeDatasetShare(req, res) {
     const canOwner = share.owner_team_id
       && await isTeamAdminOnTeam(req.user.id, share.owner_team_id, req.user.role);
     const canRecipient = await isTeamAdminOnTeam(req.user.id, share.target_team_id, req.user.role);
-    if (!canOwner && !canRecipient && !isSuperAdmin(req.user.role)) {
+    if (!canOwner && !canRecipient) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 

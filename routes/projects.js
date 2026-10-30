@@ -115,10 +115,10 @@ async function isUserOnProjectTeams(userId, projectId) {
   return res.rowCount > 0;
 }
 
-/** Super admin, or Team admin by per-team membership role (never the legacy global role). */
+/** Team admin by per-team membership role (never Super admin). */
 async function isTeamAdminOfTeam(user, teamId) {
   if (!user || !teamId) return false;
-  if (isSuperAdmin(user.role)) return true;
+  if (isSuperAdmin(user.role)) return false;
   const res = await query(
     `SELECT 1 FROM w4h.team_members WHERE team_id = $1::uuid AND user_id = $2 AND role = 'team_admin'`,
     [teamId, user.id]
@@ -160,7 +160,7 @@ async function listProjectTeams(projectId) {
 
 async function canAccessTeam(user, teamId) {
   if (!user || !teamId) return false;
-  if (isSuperAdmin(user.role)) return true;
+  if (isSuperAdmin(user.role)) return false;
   return isUserOnTeam(user.id, teamId);
 }
 
@@ -174,10 +174,10 @@ async function getMembership(projectId, userId) {
   return res.rowCount ? res.rows[0] : null;
 }
 
-/** Project participant: Super admin, project member, or Admin (membership role) on the owning team. */
+/** Project participant: project member, or team Admin on the owning team (not Super admin). */
 async function canReadProject(projectId, user) {
   if (!user) return false;
-  if (isSuperAdmin(user.role)) return true;
+  if (isSuperAdmin(user.role)) return false;
   const member = await getMembership(projectId, user.id);
   if (member) return true;
   const teamId = await getProjectTeamId(projectId);
@@ -655,6 +655,9 @@ async function ensureUniqueSlug(base) {
 
 async function listProjects(req, res) {
   try {
+    if (isSuperAdmin(req.user.role)) {
+      return res.json([]);
+    }
     const userId = req.user.id;
     let sql = `
       SELECT p.id, p.slug, p.name, p.description, p.status, p.visibility,
@@ -914,7 +917,7 @@ async function createProject(req, res) {
 
     if (!name) return res.status(400).json({ error: 'name is required' });
 
-    if (!teamId && !isSuperAdmin(req.user.role)) {
+    if (!teamId) {
       const adminTeams = await getAdminTeamIdsForUser(req.user);
       if (adminTeams.length === 1) teamId = adminTeams[0];
     }
@@ -934,8 +937,10 @@ async function createProject(req, res) {
     }
 
     const isDemonstration = Boolean(req.body?.is_demonstration);
-    if (isDemonstration && !isSuperAdmin(req.user.role)) {
-      return res.status(403).json({ error: 'Only Super admin can create a demonstration project' });
+    if (isDemonstration) {
+      return res.status(403).json({
+        error: 'Demonstration projects are created by platform seed scripts, not the API.',
+      });
     }
 
     const slug = await ensureUniqueSlug(req.body?.slug || name);
@@ -1936,7 +1941,7 @@ async function publishProjectReport(req, res) {
       const row = byId.get(id);
       if (!row) return res.status(400).json({ error: `Unknown dataset: ${id}` });
       if (!row.linked) return res.status(400).json({ error: `Dataset "${row.name || id}" is not linked to this project` });
-      if (!row.mine && !isSuperAdmin(req.user.role)) {
+      if (!row.mine) {
         return res.status(403).json({
           error: `Dataset "${row.name || id}" belongs to ${row.team_name || 'another team'}. A report may only use datasets your own team owns.`,
         });

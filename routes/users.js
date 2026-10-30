@@ -52,7 +52,7 @@ router.delete('/user/:email/api-key', auth.authenticate, auth.requirePlatformAdm
 router.get('/', auth.authenticate, auth.requireTeamAdmin, list);
 router.get('/user/:email', auth.authenticate, auth.requireTeamAdmin, getByEmail);
 router.post('/profile', auth.authenticate, updateProfile);
-router.post('/add', auth.authenticate, auth.requireTeamAdmin, addUser);
+router.post('/add', auth.authenticate, addUser);
 router.post('/set', auth.authenticate, auth.requireTeamAdmin, setUser);
 router.post('/discontinue', auth.authenticate, auth.requireTeamAdmin, discontinueUser);
 router.post('/resume', auth.authenticate, auth.requireTeamAdmin, resumeUser);
@@ -247,10 +247,12 @@ async function buildUserSessionInfo(user) {
 
 function roles(req, res) {
   Promise.resolve(canManageTeamAsync(req.user)).then(async (ok) => {
-    if (!ok) {
+    if (!ok && !isSuperAdmin(req.user?.role)) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
-    let allowed = rolesAssignableBy(req.user.role);
+    let allowed = isSuperAdmin(req.user.role)
+      ? [USER_ROLES.TEAM_ADMIN]
+      : rolesAssignableBy(req.user.role);
     if (!allowed.length && await canManageTeamAsync(req.user) && !isSuperAdmin(req.user.role)) {
       allowed = [USER_ROLES.PROJECT_USER];
     }
@@ -731,9 +733,6 @@ async function setUser(req, res) {
 }
 
 async function addUser(req, res) {
-  if (!(await canManageTeamAsync(req.user))) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
   try {
     const { user } = req.body;
 
@@ -748,6 +747,21 @@ async function addUser(req, res) {
       defaultMemberRole
     );
     const teamIds = teams.map((t) => t.team_id);
+
+    const provisionsNewAdmin =
+      isSuperAdmin(req.user.role) && role === USER_ROLES.TEAM_ADMIN && teamIds.length === 0;
+
+    const canTeam = await canManageTeamAsync(req.user);
+    if (!canTeam && !provisionsNewAdmin) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    if (isSuperAdmin(req.user.role) && !provisionsNewAdmin) {
+      return res.status(403).json({
+        error:
+          'Super admin may only invite a new Admin with no team (they create their own on sign-in). '
+          + 'Use Requests for self-service access, or pick Admin with no team.',
+      });
+    }
 
     if (!email || !role) {
       return res.status(400).json({ error: 'email and role are required' });
@@ -771,7 +785,7 @@ async function addUser(req, res) {
       return res.status(403).json({ error: 'Cannot assign this role' });
     }
 
-    if (role !== USER_ROLES.SUPER_ADMIN && teamIds.length === 0) {
+    if (role !== USER_ROLES.SUPER_ADMIN && teamIds.length === 0 && !provisionsNewAdmin) {
       return res.status(400).json({ error: 'At least one team is required for this role' });
     }
 
@@ -783,15 +797,15 @@ async function addUser(req, res) {
     }
 
     const insertResult = await query(
-      `INSERT INTO ${SCHEMA}.${TABLE} (name, email, password, role, status)
-       VALUES ($1, $2, NULL, $3, 'invited')
+      `INSERT INTO ${SCHEMA}.${TABLE} (name, email, password, role, status, can_create_teams)
+       VALUES ($1, $2, NULL, $3, 'invited', $4)
        RETURNING id, role`,
-      [name, email, role]
+      [name, email, provisionsNewAdmin ? USER_ROLES.PROJECT_USER : role, provisionsNewAdmin]
     );
 
     const newUserId = insertResult.rows[0].id;
     await syncUserTeams(newUserId, teams, defaultMemberRole);
-    if (!isSuperAdmin(role)) {
+    if (!isSuperAdmin(role) && !provisionsNewAdmin) {
       await syncPlatformRoleFromMemberships(newUserId, role);
     }
 
@@ -808,7 +822,7 @@ async function addUser(req, res) {
     let mailWarning = null;
     if (isMailerConfigured()) {
       try {
-        await sendInviteEmail({ email, name, roleLabel, rawToken });
+        await sendInviteEmail({ email, name, roleLabel, rawToken, newAdmin: provisionsNewAdmin });
       } catch (mailError) {
         mailWarning = mailError.message;
       }
@@ -831,6 +845,34 @@ async function addUser(req, res) {
     });
   } catch (error) {
     if (error.code === '23505' || /users_email_key|duplicate key/i.test(error.message || '')) {
+      if (
+        isSuperAdmin(req.user?.role)
+        && req.body?.user?.role === USER_ROLES.TEAM_ADMIN
+        && !normalizeTeamsWithRoles(
+          req.body.user.teams ?? req.body.user.team_ids ?? req.body.user.team_id,
+          TEAM_MEMBER_ROLES.TEAM_ADMIN
+        ).length
+      ) {
+        const email = String(req.body.user.email || '').trim().toLowerCase();
+        const existing = await query(
+          `SELECT id, role FROM ${SCHEMA}.${TABLE} WHERE lower(email) = $1`,
+          [email]
+        );
+        if (existing.rowCount && !isSuperAdmin(existing.rows[0].role)) {
+          const userId = existing.rows[0].id;
+          await query(`UPDATE ${SCHEMA}.${TABLE} SET can_create_teams = true WHERE id = $1`, [userId]);
+          await writeAuthAudit(req, {
+            userId: req.user.id,
+            action: 'user.admin_provisioned',
+            details: { user_id: userId, email, existing: true },
+          });
+          return res.status(200).json({
+            success: true,
+            message: 'Existing account may now create a team (same as approving an access request).',
+            status: 'existing',
+          });
+        }
+      }
       return res.status(409).json({ error: 'A user with this email already exists' });
     }
 
@@ -848,7 +890,7 @@ async function getInvite(req, res) {
 
     const result = await query(
       `SELECT i.id, i.expires_at, i.used_at, i.revoked_at,
-              u.id AS user_id, u.name, u.email, u.status, u.role
+              u.id AS user_id, u.name, u.email, u.status, u.role, u.can_create_teams
        FROM ${SCHEMA}.invitations i
        JOIN ${SCHEMA}.${TABLE} u ON u.id = i.user_id
        WHERE i.token_hash = $1`,
@@ -877,6 +919,7 @@ async function getInvite(req, res) {
       email: row.email,
       name: row.name,
       role: row.role,
+      can_create_teams: !!row.can_create_teams,
       expires_at: row.expires_at
     });
   } catch (error) {
@@ -1013,7 +1056,7 @@ async function resendInvite(req, res) {
     const identifyClause = userId ? 'id = $1' : 'email = $1';
     const identifyValue = userId || email;
     const userResult = await query(
-      `SELECT id, name, email, role, status FROM ${SCHEMA}.${TABLE} WHERE ${identifyClause}`,
+      `SELECT id, name, email, role, status, can_create_teams FROM ${SCHEMA}.${TABLE} WHERE ${identifyClause}`,
       [identifyValue]
     );
 
@@ -1045,7 +1088,8 @@ async function resendInvite(req, res) {
           email: target.email,
           name: target.name,
           roleLabel,
-          rawToken
+          rawToken,
+          newAdmin: !!target.can_create_teams
         });
       } catch (mailError) {
         mailWarning = mailError.message;

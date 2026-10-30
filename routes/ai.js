@@ -10,7 +10,7 @@ import {
   authorizeAiCall,
   getAiStatus,
   getPlatformAiSettings,
-  publicPlatformSettings,
+  publicPlatformSettingsWithProbe,
   updatePlatformAiSettings,
   getTeamAiSettings,
   publicTeamSettings,
@@ -66,7 +66,7 @@ router.get('/settings/platform', authenticate, requirePlatformAdmin, async (_req
   try {
     const full = await getPlatformAiSettings();
     const teams = await listTeamQuotaRows();
-    res.json({ ...publicPlatformSettings(full), teams });
+    res.json({ ...(await publicPlatformSettingsWithProbe(full)), teams });
   } catch (err) {
     console.error('ai platform settings:', err);
     res.status(500).json({ error: err.message });
@@ -88,7 +88,8 @@ router.patch('/settings/platform', authenticate, requirePlatformAdmin, async (re
       },
     });
     const teams = await listTeamQuotaRows();
-    res.json({ ...settings, teams });
+    const full = await getPlatformAiSettings();
+    res.json({ ...(await publicPlatformSettingsWithProbe(full)), teams });
   } catch (err) {
     console.error('ai platform settings patch:', err);
     res.status(500).json({ error: err.message });

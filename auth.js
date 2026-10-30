@@ -166,7 +166,7 @@ const requirePlatformAdmin = function (req, res, next) {
   next();
 };
 
-/** Team-scoped management (Super admin, platform Team admin, or team_members.role = team_admin). */
+/** Team-scoped management (team_members.role = team_admin on at least one team — not Super admin). */
 const requireTeamAdmin = function (req, res, next) {
   if (!req.user) {
     return res.status(403).json({

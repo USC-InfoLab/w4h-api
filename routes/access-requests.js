@@ -293,6 +293,7 @@ async function fulfillRequest(req, res) {
         roleLabel: 'Admin',
         userId,
         invitedBy: req.user.id,
+        newAdmin: true,
       });
       inviteUrl = delivered.inviteUrl;
       mailWarning = delivered.mailWarning;
