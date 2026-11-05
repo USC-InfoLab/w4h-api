@@ -152,7 +152,9 @@ function authenticateJwtOrApiKey(req, res, next) {
 }
 
 const sign = function (user) {
-  return jwt.sign(user, process.env.TOKEN_SECRET, { expiresIn: 86400 });
+  // Preferences change while the token is valid; keep them out of the claims.
+  const { preferences, ...claims } = user || {};
+  return jwt.sign(claims, process.env.TOKEN_SECRET, { expiresIn: 86400 });
 };
 
 /** Platform Admin only (Super admin). Team admins must not pass this gate. */

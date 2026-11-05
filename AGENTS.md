@@ -63,7 +63,7 @@ Because the runner and SQL engine read sibling folders (`CONTRIBUTION_RUNNER_REP
 - Contribution **implementations** (Python/notebook repos); this repo **runs** and **catalogs** them.
 - Docker/production deploy definitions (`w4h-docker` owns API image/compose).
 
-**Tenancy model (API-relevant):** **Team** = tenancy. **Project** = primary access unit. Platform **super admin** is account-wide; team/project authority comes from memberships (`owner` / `editor` / `viewer`). No `project_notebooks` — use **Contributions** (ADR-018).
+**Tenancy model (API-relevant):** **Team** = tenancy. **Project** = primary access unit. Platform **super admin** is account-wide; team/project authority comes from memberships (`owner` / `editor` / `viewer`). A project has one owning team. Collaboration is People + linked datasets (ADR-027); `w4h.project_teams` / team-invite routes are leftover — not a product surface. Dataset data follows project membership (`assertCanViewDataset`). No `project_notebooks` — use **Contributions** (ADR-018). Super admin does not create or approve teams (`POST /teams` rejects them).
 
 ---
 
@@ -159,7 +159,7 @@ flowchart LR
 | `requirePlatformAdmin` | Super admin / platform admin UI (not team admin alone) |
 | `requireTeamAdmin` | Super admin or team `team_admin` membership |
 
-**Project-level checks:** inline in handlers — `isSuperAdmin`, `isTeamAdmin`, `isTeamAdminOnTeam`, project membership queries. **Reference:** `routes/projects.js` (members + ACL + datasets link).
+**Project-level checks:** inline in handlers — `isSuperAdmin`, `isTeamAdmin`, `isTeamAdminOnTeam`, project membership queries. Dataset reads: `assertCanViewDataset`. Ingest: `assertCanIngestDataset` (owning-team Admin, or a project owner of the dataset's own team). **Reference:** `routes/projects.js` (members + ACL + datasets link).
 
 **Audit:** sensitive actions → `writeAuditLog` or `writeAuditLogSafe` (`lib/utils/audit.js`, ADR-011).
 
@@ -295,6 +295,7 @@ Do **not** without explicit human/ADR approval:
 | Accept raw SQL from request bodies | ADR-023; use `sql-contribution-engine` + vetted YAML |
 | Add formula-owning `lib/dataset-*.js` | Analytics formulas belong in contribution repos |
 | Reintroduce `project_notebooks` | ADR-018 contributions model |
+| Treat collaborating-team / `project_teams` as a product surface | ADR-027 — People + linked datasets |
 | Treat in-schema `dataset_tables` as mapping SoT | ADR-003 — use `w4h.tables` |
 | Mount `routes/data.js` / `routes/subjects.js` | Legacy; unmounted intentionally |
 | Commit `.env` or expose API keys in logs/responses | Security |
@@ -314,6 +315,9 @@ Read sibling `w4h-docs` when behavior is ambiguous (paths relative to this repo)
 | ACL / roles | `../w4h-docs/dev/ADR-004-acl-roles.md` |
 | Dataset tables / `w4h.tables` | `../w4h-docs/dev/ADR-003-dataset-table-model.md` |
 | Project–dataset linking | `../w4h-docs/dev/ADR-012-project-dataset-linking.md` |
+| Projects / data access | `../w4h-docs/dev/ADR-027-cross-org-project-collaboration.md` (people + linked datasets; no collaborating-team product surface) |
+| Platform access requests | `../w4h-docs/dev/ADR-028-platform-access-requests.md` |
+| Charts and published reports | `../w4h-docs/dev/ADR-029-visualization-component-and-reports.md` |
 | GeoMTS roles | `../w4h-docs/dev/ADR-008-geomts-data-model.md` |
 | Contributions catalog | `../w4h-docs/dev/ADR-018-contributions-catalog.md` |
 | SQL analytics | `../w4h-docs/dev/ADR-023-sql-analytics-contributions.md` |

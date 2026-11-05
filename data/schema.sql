@@ -39,6 +39,9 @@ ALTER TABLE w4h.users ADD CONSTRAINT users_status_check
   CHECK (status IN ('invited', 'active', 'discontinued'));
 ALTER TABLE w4h.users ALTER COLUMN password DROP NOT NULL;
 
+-- Per-user UI preferences (e.g. last_project_id). Whitelisted keys only, see routes/users.js.
+ALTER TABLE w4h.users ADD COLUMN IF NOT EXISTS preferences jsonb NOT NULL DEFAULT '{}'::jsonb;
+
 -- ---------------------------------------------------------------------------
 -- Invitations — time-limited tokens for password set / account activation (U-14)
 -- ---------------------------------------------------------------------------
@@ -378,11 +381,24 @@ VALUES
     'w4h-data-recorder-csv-file-importer',
     'usc-infolab',
     'Data recorder CSV file importer',
-    'Import user-supplied Empatica E4 data-recorder CSV exports (ACC, EDA, HR, TEMP, merged physiology shapes). Notebook file chooser; in-app Run uses synthetic fixtures (Kaggle references in README).',
+    'Import user-supplied Empatica E4 exports: E4 Connect (headerless unix t0 + Hz), per-signal and merged research CSVs (nurse-stress, GalaxyPPG, pain-prediction). Notebook file chooser; in-app Run uses synthetic fixtures.',
     'notebook',
     ARRAY['notebook', 'cli']::text[],
     'python',
     'https://github.com/USC-InfoLab/w4h-data-recorder-csv-file-importer',
+    'main',
+    'README.md',
+    'published'
+  ),
+  (
+    'w4h-embraceplus-csv-file-importer',
+    'usc-infolab',
+    'EmbracePlus CSV file importer',
+    'Import Empatica EmbracePlus Cloud per-minute biomarker CSVs (aggregated_per_minute under participant_data). Not E4 Connect and not Avro raw. Notebook file chooser; in-app Run uses synthetic Cloud-tree fixtures.',
+    'notebook',
+    ARRAY['notebook', 'cli']::text[],
+    'python',
+    'https://github.com/USC-InfoLab/w4h-embraceplus-csv-file-importer',
     'main',
     'README.md',
     'published'
@@ -474,6 +490,7 @@ WHERE slug IN (
   'w4h-fitbit-csv-file-importer',
   'w4h-glucose-monitor-csv-file-importer',
   'w4h-data-recorder-csv-file-importer',
+  'w4h-embraceplus-csv-file-importer',
   'w4h-sql-compute-mets'
 );
 
@@ -528,6 +545,10 @@ CREATE TABLE IF NOT EXISTS w4h.project_pages (
 
 CREATE INDEX IF NOT EXISTS idx_project_pages_project_id
   ON w4h.project_pages(project_id, sort_order, title);
+
+-- ADR-030: 'html' pages are written in the rich-text editor (html is the source,
+-- md is a derived export copy); 'md' pages are older Markdown-sourced rows.
+ALTER TABLE w4h.project_pages ADD COLUMN IF NOT EXISTS body_format text NOT NULL DEFAULT 'md';
 
 -- ---------------------------------------------------------------------------
 -- Project Docs — LEGACY link of platform Help slugs to projects (Doc-16: retire)

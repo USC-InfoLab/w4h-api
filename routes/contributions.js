@@ -21,6 +21,7 @@ import {
   previewOrPinContributionVersion,
 } from '../lib/contributions-versions.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
+import { acceptsFileUpload, fileInputForSlug } from '../lib/contribution-inputs.js';
 
 const router = express.Router();
 
@@ -31,13 +32,23 @@ function requireSuperAdmin(req, res, next) {
   next();
 }
 
+function withFileInput(row) {
+  const fileInput = fileInputForSlug(row?.slug);
+  return fileInput ? { ...row, file_input: fileInput } : row;
+}
+
+function extensionsFor(upload) {
+  const accept = fileInputForSlug(upload?.owner?.slug)?.accept;
+  return Array.isArray(accept) && accept.length ? accept : ['csv'];
+}
+
 function presentRows(rows, req) {
   const includeAdminFields = isSuperAdmin(req.user?.role);
-  return rows.map((row) => presentContribution(row, { includeAdminFields }));
+  return rows.map((row) => withFileInput(presentContribution(row, { includeAdminFields })));
 }
 
 function presentRow(row, req) {
-  return presentContribution(row, { includeAdminFields: isSuperAdmin(req.user?.role) });
+  return withFileInput(presentContribution(row, { includeAdminFields: isSuperAdmin(req.user?.role) }));
 }
 
 router.get('/', authenticateJwtOrApiKey, list);
@@ -48,6 +59,7 @@ router.post('/:slug/update-version', authenticate, requireSuperAdmin, updateVers
 // Admin-chosen files for importers that take them: stage, then run with upload_id.
 router.post('/:slug/uploads', authenticateJwtOrApiKey, (req, res) => createUploadRoute(req, res));
 router.get('/uploads/:uploadId', authenticateJwtOrApiKey, (req, res) => getUploadRoute(req, res));
+router.put('/uploads/:uploadId/body', authenticateJwtOrApiKey, (req, res) => putUploadBody(req, res));
 router.put('/uploads/:uploadId/files/:name', authenticateJwtOrApiKey, (req, res) => putUploadFile(req, res));
 router.delete('/uploads/:uploadId/files/:name', authenticateJwtOrApiKey, (req, res) => deleteUploadFileRoute(req, res));
 router.delete('/uploads/:uploadId', authenticateJwtOrApiKey, (req, res) => deleteUploadRoute(req, res));
@@ -159,7 +171,6 @@ async function run(req, res) {
     const mode = req.body?.mode === 'full' ? 'full' : 'update';
     const slug = req.params.slug;
     const uploadId = req.body?.upload_id ? String(req.body.upload_id) : null;
-    if (!uploadId && UPLOAD_SLUGS.has(slug)) return res.status(400).json({ error: 'upload_id is required: this importer runs on uploaded files' });
     const result = await startContributionRun({ slug, datasetId, user: req.user, mode, uploadId });
     if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
     if (result.runKind === 'sql') {
@@ -191,15 +202,15 @@ async function run(req, res) {
   }
 }
 
-// ponytail: hardcoded slug; move to a contribution.yaml `inputs: files` flag when a 2nd module needs uploads
-const UPLOAD_SLUGS = new Set(['w4h-fitbit-csv-file-importer']);
+// A run without upload_id still loads the bundled example. Uploads are
+// accepted only when contribution.yaml declares an input of type `files`.
 
 async function createUploadRoute(req, res) {
   try {
     const datasetId = String(req.body?.dataset_id || '').trim();
     if (!datasetId) return res.status(400).json({ error: 'dataset_id is required' });
     const contribution = await getContribution(req.params.slug, { includeUnpublished: isSuperAdmin(req.user?.role) });
-    if (!contribution?.runnable || !UPLOAD_SLUGS.has(contribution.slug)) {
+    if (!contribution?.runnable || !acceptsFileUpload(contribution.slug)) {
       return res.status(404).json({ error: 'This contribution does not accept uploaded files' });
     }
     const access = await assertCanIngestDataset(req.user, datasetId);
@@ -233,7 +244,14 @@ const getUploadRoute = withUpload(async (_req, res, upload) => {
 });
 
 const putUploadFile = withUpload(async (req, res, upload) => {
-  const result = await saveUploadFile(upload.dir, req.params.name, req);
+  const result = await saveUploadFile(upload.dir, req.params.name, req, { extensions: extensionsFor(upload) });
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.json({ name: result.name, size: result.size });
+});
+
+const putUploadBody = withUpload(async (req, res, upload) => {
+  const rawName = Array.isArray(req.query.name) ? req.query.name[0] : req.query.name;
+  const result = await saveUploadFile(upload.dir, rawName, req, { relative: true, extensions: extensionsFor(upload) });
   if (!result.ok) return res.status(result.status).json({ error: result.error });
   res.json({ name: result.name, size: result.size });
 });

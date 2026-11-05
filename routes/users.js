@@ -44,6 +44,8 @@ router.post('/invite/accept', acceptInvite);
 router.post('/invite/resend', auth.authenticate, auth.requireTeamAdmin, resendInvite);
 router.post('/invite/revoke', auth.authenticate, auth.requireTeamAdmin, revokeInvite);
 router.get('/me/session', auth.authenticate, getMySession);
+router.get('/me/preferences', auth.authenticate, getMyPreferences);
+router.patch('/me/preferences', auth.authenticate, patchMyPreferences);
 router.get('/me/api-key', auth.authenticate, getMyApiKeyMeta);
 router.post('/me/api-key/reveal', auth.authenticate, revealMyApiKey);
 router.post('/me/api-key', auth.authenticate, rotateMyApiKey);
@@ -230,6 +232,54 @@ async function getMySession(req, res) {
   }
 }
 
+/** Whitelisted keys only; anything else in the body is ignored. */
+const PREFERENCE_KEYS = {
+  last_project_id: (v) => v === null || (typeof v === 'string' && v.length > 0 && v.length <= 64),
+};
+
+async function loadPreferences(userId) {
+  const r = await query(`SELECT preferences FROM ${SCHEMA}.${TABLE} WHERE id = $1`, [userId]);
+  const prefs = r.rows[0]?.preferences;
+  return prefs && typeof prefs === 'object' ? prefs : {};
+}
+
+/** GET /users/me/preferences */
+async function getMyPreferences(req, res) {
+  try {
+    res.json(await loadPreferences(req.user.id));
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load preferences' });
+  }
+}
+
+/** PATCH /users/me/preferences — merge known keys; null removes a key. */
+async function patchMyPreferences(req, res) {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const set = {};
+    const remove = [];
+    for (const [key, valid] of Object.entries(PREFERENCE_KEYS)) {
+      if (!(key in body)) continue;
+      let value = body[key];
+      if (typeof value === 'number') value = String(value);
+      if (!valid(value)) return res.status(400).json({ error: `Invalid ${key}` });
+      if (value === null) remove.push(key);
+      else set[key] = value;
+    }
+    const r = await query(
+      `UPDATE ${SCHEMA}.${TABLE}
+          SET preferences = (COALESCE(preferences, '{}'::jsonb) - $2::text[]) || $3::jsonb
+        WHERE id = $1
+        RETURNING preferences`,
+      [req.user.id, remove, JSON.stringify(set)]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'User not found' });
+    res.json(r.rows[0].preferences || {});
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to save preferences' });
+  }
+}
+
 async function buildUserSessionInfo(user) {
   const memberships = await getTeamMembershipsForUser(user.id);
   const teamIds = memberships.map((m) => m.team_id);
@@ -242,6 +292,8 @@ async function buildUserSessionInfo(user) {
     team_id: teamIds[0] || null,
     team_memberships: memberships,
     caps: await authCapabilities(user),
+    // Not signed into the JWT (auth.sign strips it). Never let it block sign-in.
+    preferences: await loadPreferences(user.id).catch(() => ({})),
   };
 }
 

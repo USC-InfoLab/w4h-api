@@ -10,7 +10,8 @@ import { resolveDatasetProjectLinkColumn } from '../lib/utils/datasetProjectLink
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { REPORT_MAX_BYTES, injectReportCsp, looksLikeHtml, sha256 } from '../lib/reports.js';
 import { renderDoc, stripLeadingTitleHeading } from '../lib/utils/md-render.js';
-import { attachMetadataSummaries } from '../lib/dataset-metadata-summary.js';
+import { preparePageHtml, sanitizePageHtml } from '../lib/utils/page-html.js';
+import { fetchIngestionSourcesForDatasets } from '../lib/dataset-metadata-summary.js';
 
 const router = express.Router();
 
@@ -59,6 +60,7 @@ router.post('/:id/pages', authenticateJwtOrApiKey, createProjectPage);
 router.get('/:id/pages/:slug', authenticateJwtOrApiKey, getProjectPage);
 router.put('/:id/pages/:slug', authenticateJwtOrApiKey, updateProjectPage);
 router.delete('/:id/pages/:slug', authenticateJwtOrApiKey, deleteProjectPage);
+router.patch('/:id/page-categories', authenticateJwtOrApiKey, renameProjectPageCategory);
 router.post('/:id/db-token', authenticateJwtOrApiKey, issueProjectDbToken);
 router.get('/:id/reports', authenticateJwtOrApiKey, listProjectReports);
 router.post('/:id/reports', authenticateJwtOrApiKey, publishProjectReport);
@@ -242,13 +244,29 @@ async function uniquePageSlug(projectId, title, excludeSlug = null) {
   return `${base}-${crypto.randomBytes(3).toString('hex')}`;
 }
 
-function normalizePageDocType(value) {
-  const t = String(value || '')
+/**
+ * Page category (`doc_type`): a free-form label per project, e.g. Report, Guide,
+ * "IRB documents". Trimmed, single-spaced, at most 40 characters.
+ */
+function cleanPageCategory(value) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/\s+/g, ' ')
     .trim()
-    .toLowerCase()
-    .replace(/s$/, '');
-  if (['guide', 'workflow', 'reference'].includes(t)) return t;
-  return 'guide';
+    .slice(0, 40);
+}
+
+/** Reuse the project's existing spelling when only the case differs. */
+async function resolvePageCategory(projectId, value, fallback = 'guide') {
+  const label = cleanPageCategory(value);
+  if (!label) return fallback;
+  const existing = await query(
+    `SELECT doc_type FROM w4h.project_pages
+     WHERE project_id = $1::uuid AND lower(doc_type) = lower($2)
+     LIMIT 1`,
+    [projectId, label]
+  );
+  return existing.rows[0]?.doc_type || label;
 }
 
 function mapPageRow(row) {
@@ -261,8 +279,10 @@ function mapPageRow(row) {
     doc_type: row.doc_type,
     sort_order: row.sort_order,
     md: row.md,
-    html: row.html,
+    // Sanitized on read too: older Markdown-sourced rows were rendered without it.
+    html: row.html != null ? sanitizePageHtml(row.html) : row.html,
     toc: row.toc,
+    body_format: row.body_format || 'md',
     created_by: row.created_by,
     updated_by: row.updated_by,
     created_at: row.created_at,
@@ -277,6 +297,29 @@ function mapPageRow(row) {
  * large wearable tables. A zero-observation summary is retried on later loads so a
  * dataset registered before ingestion can update automatically after data arrives.
  */
+/** Registered signal names and descriptions per dataset (w4h.tables only, no data scan). */
+async function fetchSignalNamesForDatasets(ids) {
+  const map = new Map();
+  if (!ids.length) return map;
+  try {
+    const res = await query(
+      `SELECT dataset_id, name, description
+       FROM w4h.tables
+       WHERE dataset_id = ANY($1::text[])
+       ORDER BY dataset_id, name`,
+      [ids]
+    );
+    for (const r of res.rows || []) {
+      const id = String(r.dataset_id);
+      if (!map.has(id)) map.set(id, []);
+      map.get(id).push({ name: r.name, description: r.description || '' });
+    }
+  } catch {
+    // Older installs may not have w4h.tables.
+  }
+  return map;
+}
+
 async function hydrateDatasetSummaries(rows) {
   if (!Array.isArray(rows) || !rows.length) return rows || [];
 
@@ -844,21 +887,31 @@ async function getProjectOverview(req, res) {
             sort_order: idx
           }));
 
-    const hydratedDatasetRows = await attachMetadataSummaries(
-      await hydrateDatasetSummaries(datasetsRes.rows)
-    );
+    // Cached / catalog estimates only. Do not run attachMetadataSummaries here —
+    // that scans physical tables for observed cadence and made an empty project
+    // wait on every dataset the Admin can link from their other labs.
+    const hydratedDatasetRows = await hydrateDatasetSummaries(datasetsRes.rows);
     const hydratedLinkable = canManage
-      ? await attachMetadataSummaries(
-          await hydrateDatasetSummaries(
-            linkableDatasets.map((d) => ({ ...d, dataset_id: d.id }))
-          )
+      ? await hydrateDatasetSummaries(
+          linkableDatasets.map((d) => ({ ...d, dataset_id: d.id }))
         )
       : [];
     const linkableById = new Map(hydratedLinkable.map((d) => [String(d.id), d]));
+    // What kind of data each dataset holds: the importer that last loaded it
+    // (Run import… preselects it) and its registered signals.
+    const linkedIds = hydratedDatasetRows.map((r) => String(r.dataset_id));
+    const [ingestionById, signalsById] = await Promise.all([
+      fetchIngestionSourcesForDatasets(linkedIds),
+      fetchSignalNamesForDatasets(linkedIds),
+    ]);
     const datasets = hydratedDatasetRows.map((row) => {
       const meta = linkableById.get(String(row.dataset_id));
+      const importer = ingestionById.get(String(row.dataset_id));
       return {
         ...row,
+        last_importer_slug: importer?.slug || null,
+        last_importer_title: importer?.label || null,
+        signals: signalsById.get(String(row.dataset_id)) || [],
         source_kind: row.read_only ? 'sample' : (meta?.source_kind || 'local'),
         source_label: row.read_only
           ? `${row.origin || 'W4H Samples'} · read-only`
@@ -1070,16 +1123,27 @@ async function updateProject(req, res) {
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'team_id')) {
-      if (!isSuperAdmin(req.user.role)) {
-        return res.status(403).json({ error: 'Only Super admins can change the owning team' });
-      }
       const teamId = req.body.team_id == null || req.body.team_id === ''
         ? null
         : String(req.body.team_id).trim();
-      if (teamId) {
-        const teamCheck = await query(`SELECT id FROM w4h.teams WHERE id = $1::uuid`, [teamId]);
-        if (!teamCheck.rowCount) {
-          return res.status(400).json({ error: 'Unknown team_id' });
+      if (!teamId) {
+        return res.status(400).json({ error: 'Owning team is required' });
+      }
+      const teamCheck = await query(`SELECT id FROM w4h.teams WHERE id = $1::uuid`, [teamId]);
+      if (!teamCheck.rowCount) {
+        return res.status(400).json({ error: 'Unknown team_id' });
+      }
+      if (!isSuperAdmin(req.user.role)) {
+        if (!(await isTeamAdminOfTeam(req.user, teamId))) {
+          return res.status(403).json({ error: 'You can only assign a team you administer' });
+        }
+        const current = await query(
+          `SELECT team_id::text AS team_id FROM w4h.projects WHERE id = $1::uuid`,
+          [projectId]
+        );
+        const currentId = current.rows[0]?.team_id || '';
+        if (currentId && currentId !== teamId && !(await isTeamAdminOfTeam(req.user, currentId))) {
+          return res.status(403).json({ error: 'Only an Admin of the current team can reassign this project' });
         }
       }
       params.push(teamId);
@@ -2102,6 +2166,25 @@ async function getProjectPage(req, res) {
   }
 }
 
+/**
+ * Page body from a create/update request. `html` (the rich-text editor) is the
+ * primary format (ADR-030): sanitized, with a derived Markdown copy for export.
+ * `md` is still accepted from older clients and rendered as before.
+ */
+function pageBodyFromRequest(body, title, row) {
+  if (body?.html != null) {
+    const { html, toc, md } = preparePageHtml(String(body.html));
+    return { md, html, toc, bodyFormat: 'html' };
+  }
+  if (body?.md != null || !row) {
+    const mdRaw = body?.md != null ? String(body.md) : '';
+    const md = stripLeadingTitleHeading(mdRaw, title);
+    const { html, toc } = renderDoc(md);
+    return { md, html, toc, bodyFormat: 'md' };
+  }
+  return { md: row.md, html: row.html, toc: row.toc, bodyFormat: row.body_format || 'md' };
+}
+
 async function createProjectPage(req, res) {
   const projectId = await resolveProjectId(req.params.id);
   if (!projectId) return res.status(404).json({ error: 'Project not found' });
@@ -2111,20 +2194,18 @@ async function createProjectPage(req, res) {
 
   try {
     const title = String(req.body?.title || '').trim() || 'Untitled document';
-    const docType = normalizePageDocType(req.body?.doc_type);
+    const docType = await resolvePageCategory(projectId, req.body?.doc_type);
     const slug = await uniquePageSlug(projectId, req.body?.slug || title);
-    const mdRaw = req.body?.md != null ? String(req.body.md) : `# ${title}\n\n`;
-    const md = stripLeadingTitleHeading(mdRaw, title);
-    const { html, toc } = renderDoc(md);
+    const { md, html, toc, bodyFormat } = pageBodyFromRequest(req.body, title, null);
     const sortOrder = Number.isFinite(Number(req.body?.sort_order))
       ? Number(req.body.sort_order)
       : 0;
 
     const inserted = await query(
       `INSERT INTO w4h.project_pages (
-         project_id, slug, title, doc_type, sort_order, md, html, toc, created_by, updated_by
+         project_id, slug, title, doc_type, sort_order, md, html, toc, created_by, updated_by, body_format
        )
-       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)
+       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
        RETURNING *`,
       [
         projectId,
@@ -2136,7 +2217,8 @@ async function createProjectPage(req, res) {
         html,
         JSON.stringify(toc || []),
         req.user.id,
-        req.user.email || null
+        req.user.email || null,
+        bodyFormat
       ]
     );
 
@@ -2171,14 +2253,14 @@ async function updateProjectPage(req, res) {
     const title =
       req.body?.title != null ? String(req.body.title).trim() || row.title : row.title;
     const docType =
-      req.body?.doc_type != null ? normalizePageDocType(req.body.doc_type) : row.doc_type;
+      req.body?.doc_type != null
+        ? await resolvePageCategory(projectId, req.body.doc_type, row.doc_type)
+        : row.doc_type;
     const sortOrder =
       req.body?.sort_order != null && Number.isFinite(Number(req.body.sort_order))
         ? Number(req.body.sort_order)
         : row.sort_order;
-    const mdRaw = req.body?.md != null ? String(req.body.md) : row.md;
-    const md = stripLeadingTitleHeading(mdRaw, title);
-    const { html, toc } = renderDoc(md);
+    const { md, html, toc, bodyFormat } = pageBodyFromRequest(req.body, title, row);
 
     let nextSlug = currentSlug;
     if (req.body?.slug != null && String(req.body.slug).trim()) {
@@ -2195,6 +2277,7 @@ async function updateProjectPage(req, res) {
            html = $8,
            toc = $9::jsonb,
            updated_by = $10,
+           body_format = $11,
            updated_at = NOW()
        WHERE project_id = $1::uuid AND slug = $2
        RETURNING *`,
@@ -2208,7 +2291,8 @@ async function updateProjectPage(req, res) {
         md,
         html,
         JSON.stringify(toc || []),
-        req.user.email || null
+        req.user.email || null,
+        bodyFormat
       ]
     );
 
@@ -2221,6 +2305,41 @@ async function updateProjectPage(req, res) {
     res.json(mapPageRow(updated.rows[0]));
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to update project page' });
+  }
+}
+
+/** PATCH /projects/:id/page-categories { from, to } — rename (or merge) a category on every page. */
+async function renameProjectPageCategory(req, res) {
+  const projectId = await resolveProjectId(req.params.id);
+  if (!projectId) return res.status(404).json({ error: 'Project not found' });
+  if (!(await canEditProjectPages(projectId, req.user))) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const from = cleanPageCategory(req.body?.from);
+  const toRaw = cleanPageCategory(req.body?.to);
+  if (!from || !toRaw) return res.status(400).json({ error: 'Both from and to are required' });
+
+  try {
+    // Merging into another existing category keeps that category's spelling.
+    const other = await query(
+      `SELECT doc_type FROM w4h.project_pages
+       WHERE project_id = $1::uuid AND lower(doc_type) = lower($2) AND lower(doc_type) <> lower($3)
+       LIMIT 1`,
+      [projectId, toRaw, from]
+    );
+    const to = other.rows[0]?.doc_type || toRaw;
+    const updated = await query(
+      `UPDATE w4h.project_pages SET doc_type = $3
+       WHERE project_id = $1::uuid AND lower(doc_type) = lower($2)`,
+      [projectId, from, to]
+    );
+    auditProjectAction(req, 'project.page.category.rename', projectId, {
+      resourceType: 'doc',
+      details: { from, to, pages: updated.rowCount },
+    });
+    res.json({ from, to, pages: updated.rowCount });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to rename category' });
   }
 }
 

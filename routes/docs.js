@@ -449,6 +449,9 @@ async function search(req, res) {
   // Transform 'Vega' into 'Vega:*' to allow prefix matching (Veg -> Vega)
   const tsQueryTerm = term.split(/\s+/).filter(t => t).map(t => `${t}:*`).join(' & ');
 
+  // Developer docs (dev/: ADRs, MVP, architecture) are opt-in for Help search.
+  const includeDev = ['1', 'true'].includes(String(req.query.include_dev || '').toLowerCase());
+
   try {
     const result = await query(
       `SELECT 
@@ -466,9 +469,10 @@ async function search(req, res) {
        WHERE 
          (to_tsvector('english', COALESCE(title, '')) || to_tsvector('english', COALESCE(md, ''))) @@ to_tsquery('english', $1)
          AND hidden = false
+         AND ($2::boolean OR COALESCE(doc_type, '') <> 'dev')
        ORDER BY rank DESC, updated_at DESC
        LIMIT 50`,
-      [tsQueryTerm] // Using the transformed term for better matching
+      [tsQueryTerm, includeDev]
     );
 
     res.json(result.rows.filter((doc) => !shouldSkipImportBasename(doc.slug)));
