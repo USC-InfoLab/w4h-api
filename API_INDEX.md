@@ -3,7 +3,7 @@
 Structural map of `w4h-api` for agents and humans. **Index only** — not API docs.
 
 - Regenerate: `npm run index:api`
-- Generated: 2026-11-05
+- Generated: 2026-11-06
 - Do not hand-edit the lists below; change code, then re-run the script.
 
 ## Orientation
