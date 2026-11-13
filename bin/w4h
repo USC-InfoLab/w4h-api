@@ -155,15 +155,15 @@ program
     // Write audit log — fall back to local file if table unavailable
     try {
       await db.query(
-        `INSERT INTO w4h.audit_log (action, performed_by, target_email, reason, created_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
-        ['BREAK_GLASS_PASSWORD_RESET', adminName.trim(), email.trim(), reason.trim()]
+        `INSERT INTO w4h.audit_log (user_id, action, resource_type, resource_id, details)
+         VALUES (NULL, 'BREAK_GLASS_PASSWORD_RESET', 'user', $1, $2)`,
+        [String(user.id), JSON.stringify({ via: 'cli', operator: adminName.trim(), reason: reason.trim(), email: user.email })]
       );
     } catch {
       const { appendFileSync } = await import('fs');
       const logEntry = `${timestamp} | BREAK_GLASS_PASSWORD_RESET | by: ${adminName.trim()} | target: ${email.trim()} | reason: ${reason.trim()}\n`;
       appendFileSync('./break-glass-audit.log', logEntry);
-      console.log(warning('\n⚠️  No audit_log table found — logged to break-glass-audit.log instead.'));
+      console.log(warning('\n⚠️  Could not write w4h.audit_log — logged to break-glass-audit.log instead.'));
     }
 
     console.log(success(`\n✅ Password reset successfully for ${user.email}`));
@@ -172,6 +172,128 @@ program
     console.log(important(`  Administrator : ${adminName.trim()}`));
     console.log(important(`  Target        : ${email.trim()}`));
     console.log(important(`  Reason        : ${reason.trim()}`));
+    console.log(important(`  Timestamp     : ${timestamp}\n`));
+
+    rl.close();
+    process.exit(0);
+  });
+
+////////////////////////////////////////////////////////////////////////////////////
+
+program
+  .command('promote-super-admin [email]')
+  .alias('psa')
+  .description('Break-glass: make an account a Super admin, or invite a new one (audited)')
+  .action(async (emailArg) => {
+    // Queue lines so answers piped from a script are not lost between prompts.
+    const rl = readline.createInterface({ input: process.stdin });
+    const lines = [];
+    const waiters = [];
+    let closed = false;
+    rl.on('line', (line) => (waiters.length ? waiters.shift()(line) : lines.push(line)));
+    rl.on('close', () => { closed = true; while (waiters.length) waiters.shift()(''); });
+    const ask = (question) => {
+      process.stdout.write(question);
+      if (lines.length) return Promise.resolve(lines.shift());
+      if (closed) return Promise.resolve('');
+      return new Promise(resolve => waiters.push(resolve));
+    };
+    const fail =(msg) => { console.log(danger(`\n❌ ${msg}`)); rl.close(); process.exit(1); };
+
+    console.log(boxen(danger('⚠  BREAK-GLASS PROCEDURE'), { padding: 1, borderStyle: 'round', borderColor: 'red' }));
+    console.log(danger('HIPAA Notice: granting Super admin is audited. Unauthorized use is a HIPAA violation.\n'));
+
+    const operator = (await ask(info('Your name (person performing this change): '))).trim();
+    const reason = (await ask(info('Reason: '))).trim();
+    if (!operator || !reason) fail('Your name and a reason are required for the audit trail.');
+
+    const email = (emailArg || await ask(info('Email of the account to make Super admin: '))).trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail('That is not a valid email address.');
+
+    // Loaded after dotenv so INVITE_TTL_HOURS / APP_URL come from .env.
+    const { appBaseUrl, createInvitation, inviteAcceptUrl } = await import('../lib/invitations.js');
+
+    const found = await db.query(
+      `SELECT u.id, u.name, u.email, u.role, u.status,
+         (SELECT COUNT(*)::int FROM w4h.team_members tm WHERE tm.user_id = u.id) AS team_count
+       FROM w4h.users u WHERE lower(u.email) = lower($1)`,
+      [email]
+    );
+    const user = found.rows[0];
+    let userId;
+    let action;
+
+    if (user) {
+      console.log(success(`\nFound: ${user.name || '(no name)'} (${user.email}) — role: ${user.role}, status: ${user.status}`));
+      if (user.status === 'discontinued') fail('This account is discontinued. Resume it first.');
+      if (user.role === 'super_admin' && user.status !== 'invited') {
+        console.log(success('Already an active Super admin. Nothing to do.'));
+        rl.close();
+        process.exit(0);
+      }
+      if (user.team_count > 0) {
+        fail(`This account belongs to ${user.team_count} team(s), and Super admins cannot be team members. `
+          + 'Use a separate email for the Super admin account.');
+      }
+      action = 'promote';
+      userId = user.id;
+    } else {
+      console.log(warning(`\nNo account for ${email}. A new Super admin account will be created with an invitation link.`));
+      action = 'create';
+    }
+
+    const needsInvite = action === 'create' || user.status === 'invited';
+    if (needsInvite && !appBaseUrl()) fail('APP_URL is not set in .env, so no invitation link can be made.');
+
+    const confirm = await ask(warning(`Make ${email} a Super admin? (yes/no): `));
+    if (confirm.trim().toLowerCase() !== 'yes') {
+      console.log(warning('Aborted.'));
+      rl.close();
+      process.exit(0);
+    }
+
+    if (action === 'create') {
+      const ins = await db.query(
+        `INSERT INTO w4h.users (name, email, password, role, status, can_create_teams)
+         VALUES ($1, $1, NULL, 'super_admin', 'invited', false) RETURNING id`,
+        [email]
+      );
+      userId = ins.rows[0].id;
+    } else {
+      await db.query(
+        `UPDATE w4h.users SET role = 'super_admin', can_create_teams = false, updated_at = NOW() WHERE id = $1`,
+        [userId]
+      );
+    }
+
+    const inviteUrl = needsInvite ? inviteAcceptUrl(await createInvitation(userId, null)) : null;
+    const timestamp = new Date().toISOString();
+    const details = { via: 'cli', operator, reason, email, previous_role: user?.role ?? null, created: action === 'create' };
+
+    try {
+      await db.query(
+        `INSERT INTO w4h.audit_log (user_id, action, resource_type, resource_id, details)
+         VALUES (NULL, 'user.break_glass.super_admin_granted', 'user', $1, $2)`,
+        [String(userId), JSON.stringify(details)]
+      );
+    } catch {
+      const { appendFileSync } = await import('fs');
+      appendFileSync('./break-glass-audit.log',
+        `${timestamp} | SUPER_ADMIN_GRANTED | by: ${operator} | target: ${email} | reason: ${reason}\n`);
+      console.log(warning('\n⚠️  Could not write w4h.audit_log — logged to break-glass-audit.log instead.'));
+    }
+
+    console.log(success(`\n✅ ${email} is now a Super admin.`));
+    if (inviteUrl) {
+      console.log(important('Send this invitation link to them securely (they set their own password):'));
+      console.log(`  ${inviteUrl}`);
+    } else {
+      console.log(info('They keep their current password; Super admin applies on their next sign-in.'));
+    }
+    console.log(important('\nREMINDER: Document this action in your HIPAA incident log:'));
+    console.log(important(`  Administrator : ${operator}`));
+    console.log(important(`  Target        : ${email}`));
+    console.log(important(`  Reason        : ${reason}`));
     console.log(important(`  Timestamp     : ${timestamp}\n`));
 
     rl.close();

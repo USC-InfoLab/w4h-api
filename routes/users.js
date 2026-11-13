@@ -39,6 +39,8 @@ router.post('/login', login);
 router.post('/send-code', sendLoginCode);
 router.post('/verify-code', verifyLoginCode);
 router.post('/token-valid', tokenValid);
+router.get('/dev/login-as', auth.authenticate, auth.requirePlatformAdmin, devLoginAsStatus);
+router.post('/dev/login-as', auth.authenticate, auth.requirePlatformAdmin, devLoginAs);
 router.get('/invite/:token', getInvite);
 router.post('/invite/accept', acceptInvite);
 router.post('/invite/resend', auth.authenticate, auth.requireTeamAdmin, resendInvite);
@@ -784,6 +786,58 @@ async function setUser(req, res) {
   }
 }
 
+/**
+ * Super admin invite for an email that already has an account. Only a never-activated
+ * account with no team gets a fresh invitation; active accounts are promoted from the
+ * server with `w4h promote-super-admin` (break-glass).
+ */
+async function reinviteSuperAdmin(req, res) {
+  const email = String(req.body.user.email || '').trim();
+  const existing = await query(
+    `SELECT u.id, u.name, u.status,
+       EXISTS (SELECT 1 FROM ${SCHEMA}.team_members tm WHERE tm.user_id = u.id) AS has_teams
+     FROM ${SCHEMA}.${TABLE} u WHERE lower(u.email) = lower($1)`,
+    [email]
+  );
+  const row = existing.rows[0];
+  if (!row || row.status !== 'invited' || row.has_teams) {
+    return res.status(409).json({
+      error: 'An account with this email already exists. Super admins need an email of their own; '
+        + 'to promote an existing account, run `w4h promote-super-admin` on the server.',
+    });
+  }
+  await query(
+    `UPDATE ${SCHEMA}.${TABLE} SET role = $1, can_create_teams = false WHERE id = $2`,
+    [USER_ROLES.SUPER_ADMIN, row.id]
+  );
+  await ensureAdminAssignedToAllProjects(row.id);
+  const name = String(req.body.user.name || row.name || email).trim();
+  const rawToken = await createInvitation(row.id, req.user.id);
+  const inviteUrl = inviteAcceptUrl(rawToken);
+  let mailWarning = null;
+  if (isMailerConfigured()) {
+    try {
+      await sendInviteEmail({ email, name, roleLabel: USER_ROLES_NAMES[USER_ROLES.SUPER_ADMIN], rawToken });
+    } catch (mailError) {
+      mailWarning = mailError.message;
+    }
+  } else {
+    mailWarning = 'SMTP is not configured; share the invitation link securely with the user.';
+  }
+  await writeAuthAudit(req, {
+    userId: req.user.id,
+    action: 'user.invite_sent',
+    details: { invited_user_id: row.id, email, role: USER_ROLES.SUPER_ADMIN, reinvite: true },
+  });
+  return res.status(201).json({
+    success: true,
+    message: 'Invitation created',
+    status: 'invited',
+    inviteUrl,
+    ...(mailWarning ? { mailWarning } : {}),
+  });
+}
+
 async function addUser(req, res) {
   try {
     const { user } = req.body;
@@ -802,16 +856,19 @@ async function addUser(req, res) {
 
     const provisionsNewAdmin =
       isSuperAdmin(req.user.role) && role === USER_ROLES.TEAM_ADMIN && teamIds.length === 0;
+    // Super admins have no team; there is no limit on how many there are.
+    const provisionsSuperAdmin =
+      isSuperAdmin(req.user.role) && role === USER_ROLES.SUPER_ADMIN && teamIds.length === 0;
 
     const canTeam = await canManageTeamAsync(req.user);
-    if (!canTeam && !provisionsNewAdmin) {
+    if (!canTeam && !provisionsNewAdmin && !provisionsSuperAdmin) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
-    if (isSuperAdmin(req.user.role) && !provisionsNewAdmin) {
+    if (isSuperAdmin(req.user.role) && !provisionsNewAdmin && !provisionsSuperAdmin) {
       return res.status(403).json({
         error:
-          'Super admin may only invite a new Admin with no team (they create their own on sign-in). '
-          + 'Use Requests for self-service access, or pick Admin with no team.',
+          'Super admin may only invite a new Admin with no team (they create their own on sign-in) '
+          + 'or another Super admin.',
       });
     }
 
@@ -897,6 +954,9 @@ async function addUser(req, res) {
     });
   } catch (error) {
     if (error.code === '23505' || /users_email_key|duplicate key/i.test(error.message || '')) {
+      if (isSuperAdmin(req.user?.role) && req.body?.user?.role === USER_ROLES.SUPER_ADMIN) {
+        return reinviteSuperAdmin(req, res);
+      }
       if (
         isSuperAdmin(req.user?.role)
         && req.body?.user?.role === USER_ROLES.TEAM_ADMIN
@@ -1695,6 +1755,81 @@ async function login(req, res) {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: error.message });
+  }
+}
+
+/**
+ * Dev-only "Log in as": a Super admin gets a session for another user.
+ * Off unless W4H_DEV_LOGIN_AS=true, and always off when NODE_ENV=production.
+ */
+function devLoginAsEnabled() {
+  return process.env.NODE_ENV !== 'production'
+    && String(process.env.W4H_DEV_LOGIN_AS || '').trim().toLowerCase() === 'true';
+}
+
+/** Also returns the users to pick from: GET /users/ is closed to the Super admin. */
+async function devLoginAsStatus(req, res) {
+  if (!devLoginAsEnabled()) return res.json({ enabled: false, users: [] });
+  try {
+    const result = await query(
+      `SELECT u.id, u.name, u.email, u.role, u.status,
+         COALESCE((
+           SELECT ARRAY_AGG(t.id::text ORDER BY t.name)
+           FROM ${SCHEMA}.team_members tm JOIN ${SCHEMA}.teams t ON t.id = tm.team_id
+           WHERE tm.user_id = u.id
+         ), '{}') AS team_ids,
+         COALESCE((
+           SELECT json_agg(json_build_object('team_id', t.id::text, 'name', t.name, 'role', tm.role) ORDER BY t.name)
+           FROM ${SCHEMA}.team_members tm JOIN ${SCHEMA}.teams t ON t.id = tm.team_id
+           WHERE tm.user_id = u.id
+         ), '[]'::json) AS team_memberships
+       FROM ${SCHEMA}.${TABLE} u
+       ORDER BY LOWER(COALESCE(NULLIF(u.name, ''), u.email))`
+    );
+    res.json({ enabled: true, users: result.rows });
+  } catch (error) {
+    console.error('devLoginAsStatus error:', error);
+    res.status(500).json({ error: { message: 'Could not list users.' } });
+  }
+}
+
+async function devLoginAs(req, res) {
+  if (!devLoginAsEnabled()) {
+    return res.status(404).json({ error: { message: 'Not found' } });
+  }
+  try {
+    const email = String(req.body?.email || '').trim();
+    if (!email) {
+      return res.status(400).json({ error: { message: 'Email is required' } });
+    }
+    const result = await query(
+      `SELECT id, name, email, password, role, status FROM ${SCHEMA}.${TABLE} WHERE email = $1`,
+      [email]
+    );
+    const user = result.rows[0];
+    if (!user) {
+      return res.status(404).json({ error: { message: 'User not found' } });
+    }
+    const authCheck = assertUserCanAuthenticate(user, { requirePassword: false });
+    if (!authCheck.ok) {
+      return res.status(409).json({ error: { message: authCheck.message } });
+    }
+
+    const userInfo = await buildUserSessionInfo(user);
+    userInfo.impersonated_by = { id: req.user.id, email: req.user.email };
+    userInfo.token = auth.sign(userInfo);
+
+    writeAuditLogSafe(req, {
+      action: 'user.dev_login_as',
+      resourceType: 'user',
+      resourceId: user.id,
+      details: { target_email: user.email },
+    });
+
+    res.json(userInfo);
+  } catch (error) {
+    console.error('devLoginAs error:', error);
+    res.status(500).json({ error: { message: 'Log in as failed.' } });
   }
 }
 
