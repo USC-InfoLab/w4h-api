@@ -703,7 +703,7 @@ async function getUsage(req, res) {
           (SELECT COUNT(DISTINCT user_id)::int FROM w4h.usage_events
             WHERE timestamp > now() - ($1 || ' days')::interval
               AND user_id IS NOT NULL
-              AND event_type = 'api.request') AS unique_users_api,
+              AND event_type = 'api.request' AND COALESCE(metadata->>'auth_method', 'api_key') = 'api_key') AS unique_users_api,
           (SELECT COUNT(DISTINCT user_id)::int FROM w4h.usage_events
             WHERE timestamp > now() - ($1 || ' days')::interval
               AND user_id IS NOT NULL
@@ -726,19 +726,19 @@ async function getUsage(req, res) {
           (SELECT COALESCE(AVG(duration_ms), 0)::int FROM w4h.usage_events
             WHERE timestamp > now() - ($1 || ' days')::interval
               AND duration_ms IS NOT NULL
-              AND event_type = 'api.request') AS avg_duration_ms,
+              AND event_type = 'api.request' AND COALESCE(metadata->>'auth_method', 'api_key') = 'api_key') AS avg_duration_ms,
           (SELECT COALESCE(
               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms), 0
             )::int FROM w4h.usage_events
             WHERE timestamp > now() - ($1 || ' days')::interval
               AND duration_ms IS NOT NULL
-              AND event_type = 'api.request') AS duration_p50_ms,
+              AND event_type = 'api.request' AND COALESCE(metadata->>'auth_method', 'api_key') = 'api_key') AS duration_p50_ms,
           (SELECT COALESCE(
               PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms), 0
             )::int FROM w4h.usage_events
             WHERE timestamp > now() - ($1 || ' days')::interval
               AND duration_ms IS NOT NULL
-              AND event_type = 'api.request') AS duration_p95_ms
+              AND event_type = 'api.request' AND COALESCE(metadata->>'auth_method', 'api_key') = 'api_key') AS duration_p95_ms
         `,
         [daysParam]
       ),
@@ -804,7 +804,7 @@ async function getUsage(req, res) {
           COUNT(*)::int AS total
         FROM w4h.usage_events
         WHERE timestamp > now() - ($1 || ' days')::interval
-          AND event_type = 'api.request'
+          AND event_type = 'api.request' AND COALESCE(metadata->>'auth_method', 'api_key') = 'api_key'
         `,
         [daysParam]
       ),

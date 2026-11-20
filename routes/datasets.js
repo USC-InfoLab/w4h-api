@@ -1614,6 +1614,7 @@ async function importCsvBatchHandler(req, res) {
     if (!result.ok) {
       return res.status(result.status || 400).json({ error: result.error || 'Import failed' });
     }
+    res.locals.usageRowCount = result.inserted; // row_count on the api.request usage row
     writeAuditLogSafe(req, {
       action: 'dataset.import.csv',
       resourceType: 'dataset',
