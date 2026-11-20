@@ -1633,6 +1633,23 @@ async function postAppSettings(req, res) {
  * Body: { host, port, database, user, password }
  */
 async function postInitDatabase(req, res) {
+  // Public only during first run: once the current database has users, an anonymous
+  // caller must not be able to re-point the API. Fail closed if that DB is unreachable;
+  // the operator then edits `.env` directly.
+  if (db.isConfigured()) {
+    try {
+      if ((await tableExists(USERS_TABLE_NAME)) && (await hasAnyUsers())) {
+        return res.status(409).json({ success: false, error: 'This installation is already set up' });
+      }
+    } catch (error) {
+      return res.status(503).json({
+        success: false,
+        error: `The configured database is not reachable. Fix the DB_* settings in ${ENV_PATH} and restart.`,
+        details: error.message,
+      });
+    }
+  }
+
   const { host, port, database, user, password } = req.body;
   const effectivePassword = password || process.env.DB_PASSWORD;
 
@@ -1910,16 +1927,51 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
     TOKEN_SECRET: process.env.TOKEN_SECRET || crypto.randomBytes(64).toString('hex'),
     W4H_DB_MODE: 'builtin',
   };
+  // Fail early if `.env` can't be saved: it is written only after the accounts commit.
   try {
-    await writeEnvValues(dbConfig);
+    await fs.access(fs.existsSync(ENV_PATH) ? ENV_PATH : path.dirname(ENV_PATH), fs.constants.W_OK);
   } catch (error) {
     return res.status(500).json({ success: false, error: envSaveError(error), code: error.code });
   }
 
+  // Probe first with a timeout: db.js's pool has none, so an unreachable host would hang
+  // the request and hold the setup lock.
+  const probe = new Pool({
+    host: dbConfig.DB_HOST,
+    port: Number(dbConfig.DB_PORT),
+    database: dbConfig.DB_DATABASE,
+    user: dbConfig.DB_USER,
+    password: dbPassword,
+    connectionTimeoutMillis: 10000,
+  });
   try {
+    await probe.query('SELECT 1');
+  } catch (error) {
+    return res.status(503).json({ success: false, error: 'The built-in database is not reachable yet. Wait a moment and try again.', details: error.message });
+  } finally {
+    await probe.end().catch(() => {});
+  }
+
+  // Connect with the built-in settings in memory only. `.env` stays untouched until the
+  // schema and accounts exist, so a failed attempt leaves the previous config intact.
+  // Swapping process.env affects every request in this process; safe only because this
+  // runs before any user exists (guarded above + setup lock). Don't reuse on a live install.
+  const previousEnv = Object.fromEntries(Object.keys(dbConfig).map((k) => [k, process.env[k]]));
+  const restoreEnv = async () => {
+    for (const [k, v] of Object.entries(previousEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    await db.resetPool().catch(() => {});
+  };
+  let committed = false;
+
+  try {
+    Object.assign(process.env, dbConfig);
     await db.resetPool();
     const initResult = await initializeDatabase();
     if (!initResult.success) {
+      await restoreEnv();
       return res.status(500).json({ success: false, error: 'Database schema initialization failed', details: initResult.error });
     }
 
@@ -1929,34 +1981,51 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
     let superAdminId;
     let personId;
     let team;
+    let alreadySetUp = false;
     try {
       await client.query('BEGIN');
       await client.query(`LOCK TABLE w4h.users IN EXCLUSIVE MODE`);
       const count = await client.query(`SELECT COUNT(*)::int AS n FROM w4h.users`);
       if (count.rows[0].n > 0) {
         await client.query('ROLLBACK');
-        return res.status(409).json({ success: false, error: 'This installation is already set up' });
+        alreadySetUp = true;
+      } else {
+        const run = client.query.bind(client);
+        superAdminId = await insertUser(run, {
+          name: 'Super admin',
+          email: BUILTIN_SUPER_ADMIN_EMAIL,
+          hash: bcrypt.hashSync(superAdminPassword, rounds),
+          role: USER_ROLES.SUPER_ADMIN,
+        });
+        personId = await insertUser(run, {
+          name,
+          email,
+          hash: bcrypt.hashSync(password, rounds),
+          role: USER_ROLES.PROJECT_USER,
+        });
+        team = await insertTeamWithAdmin(run, { name: `${name}'s team`, userId: personId });
+        await client.query('COMMIT');
+        committed = true;
       }
-      const run = client.query.bind(client);
-      superAdminId = await insertUser(run, {
-        name: 'Super admin',
-        email: BUILTIN_SUPER_ADMIN_EMAIL,
-        hash: bcrypt.hashSync(superAdminPassword, rounds),
-        role: USER_ROLES.SUPER_ADMIN,
-      });
-      personId = await insertUser(run, {
-        name,
-        email,
-        hash: bcrypt.hashSync(password, rounds),
-        role: USER_ROLES.PROJECT_USER,
-      });
-      team = await insertTeamWithAdmin(run, { name: `${name}'s team`, userId: personId });
-      await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       throw error;
     } finally {
       client.release();
+    }
+    if (alreadySetUp) {
+      await restoreEnv();
+      return res.status(409).json({ success: false, error: 'This installation is already set up' });
+    }
+
+    // Persist the built-in settings now that the install is real. On failure the API keeps
+    // running on the in-memory settings; the recovery record is still returned.
+    let envWarning = null;
+    try {
+      await writeEnvValues(dbConfig);
+    } catch (error) {
+      envWarning = `${envSaveError(error)}. Setup worked, but the API will lose its database settings on restart.`;
+      console.error('init-builtin:', envWarning);
     }
 
     // D-16a: personal API keys, best-effort like createInitialAdmin.
@@ -2005,8 +2074,10 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
       session,
       team: { id: team.id, name: team.name, slug: team.slug },
       samples: loadSamples ? { requested: true, notebook: SAMPLE_NOTEBOOK } : { requested: false },
+      ...(envWarning ? { warning: envWarning } : {}),
     });
   } catch (error) {
+    if (!committed) await restoreEnv();
     // Never echo the request body: it holds the person's password.
     console.error('init-builtin error:', error.message);
     return res.status(500).json({ success: false, error: 'Built-in setup failed', details: error.message });
