@@ -20,6 +20,7 @@ import { getMailerConfig, isMailerConfigured, sendMail } from '../lib/mailer.js'
 import { normalizeClientUsageEvent, recordUsageEventSafe } from '../lib/utils/usage.js';
 import { writeAuditLog, writeAuditLogSafe } from '../lib/utils/audit.js';
 import { envFilePath, envExamplePath } from '../lib/env-path.js';
+import { buildUsageExport, clampDays, toCsv } from '../lib/usage-export.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -123,6 +124,9 @@ router.get('/team-home', auth.authenticate, auth.requireTeamAdmin, getTeamHome);
 router.get('/usage', auth.authenticate, auth.requirePlatformAdmin, getUsage);
 router.get('/api-usage', auth.authenticate, auth.requirePlatformAdmin, getUsage); // legacy alias
 router.post('/client-usage', auth.authenticate, postClientUsage);
+// ADR-031 §7 pseudonymous export. Super admin only for now (G5: Admin team scoping pending).
+router.get('/usage-export', auth.authenticate, auth.requirePlatformAdmin, getUsageExport);
+router.post('/usage-export/send', auth.authenticate, auth.requirePlatformAdmin, postUsageExportSend);
 router.post('/report-issue', auth.authenticate, postReportIssue);
 router.get('/audit-log', auth.authenticate, getAuditLog);
 router.get('/database-settings', auth.authenticate, auth.requirePlatformAdmin, getDatabaseSettings);
@@ -592,6 +596,89 @@ async function postClientUsage(req, res) {
   } catch (error) {
     console.error('postClientUsage error:', error);
     res.status(500).json({ error: error.message || 'Failed to record usage' });
+  }
+}
+
+/** Random per-install id for export pseudonyms; created once and kept in `.env`. */
+async function getInstallId() {
+  if (process.env.W4H_INSTALL_ID) return process.env.W4H_INSTALL_ID;
+  const id = crypto.randomUUID();
+  await writeEnvValues({ W4H_INSTALL_ID: id });
+  return id;
+}
+
+async function usageExportFile(daysInput, formatInput) {
+  const days = clampDays(daysInput);
+  const format = formatInput === 'csv' ? 'csv' : 'json';
+  const installId = await getInstallId();
+  const { meta, rows } = await buildUsageExport({
+    days,
+    installId,
+    version: appVersion(),
+    dbMode: process.env.W4H_DB_MODE || null,
+  });
+  const date = new Date().toISOString().slice(0, 10);
+  return {
+    days,
+    meta,
+    filename: `w4h-usage-${installId.slice(0, 8)}-${date}.${format}`,
+    contentType: format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json',
+    body: format === 'csv' ? toCsv(meta, rows) : JSON.stringify({ meta, rows }, null, 2),
+  };
+}
+
+/** GET /config/usage-export?days=N&format=csv|json — pseudonymous usage download (ADR-031 §7). */
+async function getUsageExport(req, res) {
+  try {
+    const file = await usageExportFile(req.query.days, req.query.format);
+    writeAuditLogSafe(req, {
+      action: 'usage.exported',
+      resourceType: 'usage_events',
+      details: { row_count: file.meta.row_count, days: file.days },
+    });
+    res.set('Content-Type', file.contentType);
+    res.set('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.send(file.body);
+  } catch (error) {
+    console.error('getUsageExport error:', error);
+    res.status(500).json({ error: error.message || 'Failed to export usage' });
+  }
+}
+
+/** POST /config/usage-export/send { days } — email the JSON export to TELEMETRY_TO. */
+async function postUsageExportSend(req, res) {
+  const to = String(process.env.TELEMETRY_TO || '').trim();
+  if (!isMailerConfigured() || !to) {
+    return res.status(503).json({
+      error: !to
+        ? 'Sending usage is not set up on this installation (TELEMETRY_TO is empty)'
+        : 'Set up email in Settings to send usage data',
+    });
+  }
+  try {
+    const file = await usageExportFile(req.body?.days, 'json');
+    await sendMail({
+      to,
+      subject: `[W4H usage] ${file.meta.install_id.slice(0, 8)} ${file.meta.window_start.slice(0, 10)}..${file.meta.window_end.slice(0, 10)}`,
+      text: [
+        'Pseudonymous W4H usage export (ADR-031).',
+        `install_id: ${file.meta.install_id}`,
+        `version: ${file.meta.version}`,
+        `db_mode: ${file.meta.db_mode || ''}`,
+        `window: ${file.meta.window_start} .. ${file.meta.window_end}`,
+        `rows: ${file.meta.row_count}`,
+      ].join('\n'),
+      attachments: [{ filename: file.filename, content: file.body, contentType: file.contentType }],
+    });
+    writeAuditLogSafe(req, {
+      action: 'usage.sent',
+      resourceType: 'usage_events',
+      details: { row_count: file.meta.row_count, days: file.days },
+    });
+    res.json({ sent: true, row_count: file.meta.row_count });
+  } catch (error) {
+    console.error('postUsageExportSend error:', error);
+    res.status(500).json({ error: error.message || 'Failed to send usage' });
   }
 }
 
