@@ -1522,17 +1522,16 @@ async function writeAuthAudit(req, { userId, action, details }) {
 
 async function sendLoginCode(req, res) {
   try {
+    // U-19 / ADR-031 §5: email-code sign-in needs SMTP; the app hides it when mail is off.
+    if (!isMailerConfigured()) {
+      return res.status(503).json({
+        error: { message: 'Email sign-in is not set up on this installation' }
+      });
+    }
+
     const email = (req.body.email || '').trim().toLowerCase();
     if (!email) {
       return res.status(400).json({ error: { message: 'Email is required.' } });
-    }
-
-    if (!isMailerConfigured()) {
-      return res.status(503).json({
-        error: {
-          message: 'Email is not configured. Ask your administrator to set up SMTP, or sign in with your password.'
-        }
-      });
     }
 
     const userResult = await query(

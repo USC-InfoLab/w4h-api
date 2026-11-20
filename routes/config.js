@@ -92,12 +92,19 @@ async function writeEnvValues(keyValues) {
     out = out.trimEnd() + `\n${extra}\n`;
   }
 
-  await fs.writeFile(ENV_PATH, out.trimEnd() + '\n');
+  // Holds DB_PASSWORD / TOKEN_SECRET: owner-only. `mode` applies on create only, so chmod too.
+  await fs.writeFile(ENV_PATH, out.trimEnd() + '\n', { mode: 0o600 });
+  await fs.chmod(ENV_PATH, 0o600);
 
   // Keep runtime env in sync for keys we just changed
   Object.keys(keyValues).forEach((key) => {
     process.env[key] = String(keyValues[key] ?? '');
   });
+}
+
+/** Message for a failed `.env` save (e.g. EACCES on a root-owned Docker volume). */
+function envSaveError(error) {
+  return `Settings could not be saved to ${ENV_PATH}: ${error.code || error.message}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +136,22 @@ export default router;
 // Handlers
 // ---------------------------------------------------------------------------
 
+const BUILTIN_PG_PASSWORD_FILE = '/run/secrets/pg_password';
+
+/** ADR-031: the Docker kit mounts the generated Postgres password and names the `db` host. */
+function builtinAvailable() {
+  return !!process.env.W4H_BUILTIN_DB_HOST && fs.existsSync(BUILTIN_PG_PASSWORD_FILE);
+}
+
+/** Install facts the setup wizard and login screen gate on (ADR-031). */
+function installFlags() {
+  return {
+    builtin_available: builtinAvailable(),
+    db_mode: process.env.W4H_DB_MODE || null,
+    mail_configured: isMailerConfigured(),
+  };
+}
+
 /** GET /config/status — Check if database is configured. */
 async function getStatus(req, res) {
   const envConfigured = !!(
@@ -147,19 +170,19 @@ async function getStatus(req, res) {
   };
 
   if (!envConfigured) {
-    return res.json({ configured: false, requiresAdminSetup: false, details });
+    return res.json({ configured: false, requiresAdminSetup: false, details, ...installFlags() });
   }
 
   // Env vars are set — verify the DB is actually reachable and schema is initialized
   try {
     const initialized = await tableExists(USERS_TABLE_NAME);
     if (!initialized) {
-      return res.json({ configured: false, requiresAdminSetup: false, details });
+      return res.json({ configured: false, requiresAdminSetup: false, details, ...installFlags() });
     }
     const requiresAdminSetup = !(await hasAnyUsers());
-    return res.json({ configured: true, requiresAdminSetup, details });
+    return res.json({ configured: true, requiresAdminSetup, details, ...installFlags() });
   } catch {
-    return res.json({ configured: false, requiresAdminSetup: false, details });
+    return res.json({ configured: false, requiresAdminSetup: false, details, ...installFlags() });
   }
 }
 
@@ -1412,7 +1435,7 @@ async function postMailerSettings(req, res) {
   } catch (error) {
     return res.status(500).json({
       success: false,
-      error: 'Failed to save SMTP settings',
+      error: error.code ? envSaveError(error) : 'Failed to save SMTP settings',
       details: error.message
     });
   }
@@ -1494,7 +1517,7 @@ async function postAppSettings(req, res) {
     await writeEnvValues({ HELP_EMAIL: helpEmail, USAGE_TRACKING: usageTracking ? 'true' : 'false' });
     return res.json({ success: true, message: 'App settings saved.' });
   } catch (error) {
-    return res.status(500).json({ success: false, error: 'Failed to save app settings.', details: error.message });
+    return res.status(500).json({ success: false, error: error.code ? envSaveError(error) : 'Failed to save app settings.', details: error.message });
   }
 }
 
@@ -1615,10 +1638,9 @@ async function postInitDatabase(req, res) {
       await testPool.end();
     }
 
-    // Generate TOKEN_SECRET if it doesn't exist
-    if (!process.env.TOKEN_SECRET) {
-      process.env.TOKEN_SECRET = crypto.randomBytes(64).toString('hex');
-    }
+    // Generate TOKEN_SECRET if it doesn't exist. process.env is synced by
+    // writeEnvValues only after the file write succeeds.
+    const tokenSecret = process.env.TOKEN_SECRET || crypto.randomBytes(64).toString('hex');
 
     // Update or add database config
     const dbConfig = {
@@ -1627,11 +1649,21 @@ async function postInitDatabase(req, res) {
       DB_DATABASE: database,
       DB_USER: user,
       DB_PASSWORD: effectivePassword,
-      TOKEN_SECRET: process.env.TOKEN_SECRET
+      TOKEN_SECRET: tokenSecret,
+      W4H_DB_MODE: 'external'
     };
 
     // Connection successful — update `.env` in a stable, template-driven way
-    await writeEnvValues(dbConfig);
+    try {
+      await writeEnvValues(dbConfig);
+    } catch (envError) {
+      return res.status(500).json({
+        success: false,
+        error: `Database reachable but settings could not be saved to ${ENV_PATH}: ${envError.code || envError.message}`,
+        details: envError.message,
+        code: envError.code
+      });
+    }
 
     // Reset the database pool with new credentials
     await db.resetPool();

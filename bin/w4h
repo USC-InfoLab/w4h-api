@@ -9,6 +9,7 @@ import { dirname } from 'path';
 import readline from 'readline';
 import bcrypt from 'bcrypt';
 import db from '../db.js';
+import { envFilePath } from '../lib/env-path.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -20,7 +21,8 @@ const danger = chalk.bold.red;
 const important = chalk.yellow;
 
 process.chdir(__dirname + '/..');
-dotenv.config();
+// Docker keeps the env at W4H_ENV_FILE (/app/persist/.env), not /app/.env.
+dotenv.config({ path: envFilePath() });
 
 ////////////////////////////////////////////////////////////////////////////////////
 
