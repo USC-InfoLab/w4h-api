@@ -100,8 +100,9 @@ async function writeEnvValues(keyValues) {
   }
 
   // Holds DB_PASSWORD / TOKEN_SECRET: owner-only. `mode` applies on create only, so chmod too.
+  // chmod first so an existing 644 file never holds the new secrets world-readable.
+  if (await fs.pathExists(ENV_PATH)) await fs.chmod(ENV_PATH, 0o600);
   await fs.writeFile(ENV_PATH, out.trimEnd() + '\n', { mode: 0o600 });
-  await fs.chmod(ENV_PATH, 0o600);
 
   // Keep runtime env in sync for keys we just changed
   Object.keys(keyValues).forEach((key) => {
@@ -616,6 +617,7 @@ async function usageExportFile(daysInput, formatInput) {
     installId,
     version: appVersion(),
     dbMode: process.env.W4H_DB_MODE || null,
+    tokenSecret: process.env.TOKEN_SECRET,
   });
   const date = new Date().toISOString().slice(0, 10);
   return {
@@ -1865,14 +1867,30 @@ async function postInitBuiltin(req, res) {
     return res.status(400).json({ success: false, error: passwordCheck.message });
   }
 
-  // Refuse once any user exists (same rule as /config/admin-setup).
+  // One bootstrap at a time per process (TOKEN_SECRET / .env must not race).
+  if (initBuiltinRunning) {
+    return res.status(409).json({ success: false, error: 'Setup is already in progress' });
+  }
+  initBuiltinRunning = true;
+  try {
+    return await runInitBuiltin(req, res, { started, name, email, password, loadSamples });
+  } finally {
+    initBuiltinRunning = false;
+  }
+}
+
+let initBuiltinRunning = false;
+
+async function runInitBuiltin(req, res, { started, name, email, password, loadSamples }) {
+  // Refuse once any user exists (same rule as /config/admin-setup). Fail closed: a
+  // configured but unreachable database must not let an anonymous caller re-point it.
   if (db.isConfigured()) {
     try {
       if ((await tableExists(USERS_TABLE_NAME)) && (await hasAnyUsers())) {
         return res.status(409).json({ success: false, error: 'This installation is already set up' });
       }
-    } catch {
-      /* not reachable yet — continue with built-in settings */
+    } catch (error) {
+      return res.status(503).json({ success: false, error: 'The configured database is not reachable', details: error.message });
     }
   }
 
@@ -1950,8 +1968,15 @@ async function postInitBuiltin(req, res) {
       }
     }
 
-    const session = await buildUserSessionInfo({ id: personId, name, email, role: USER_ROLES.PROJECT_USER });
-    session.token = auth.sign(session);
+    // Accounts are committed: from here on never fail without returning the recovery
+    // record, or the random Super admin password is lost.
+    let session = null;
+    try {
+      session = await buildUserSessionInfo({ id: personId, name, email, role: USER_ROLES.PROJECT_USER });
+      session.token = auth.sign(session);
+    } catch (err) {
+      console.error('init-builtin: session build failed (person can sign in normally):', err.message);
+    }
 
     writeAuditLogSafe(req, {
       userId: personId,
