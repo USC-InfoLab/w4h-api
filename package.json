@@ -12,7 +12,7 @@
   "scripts": {
     "start": "node app.js",
     "start:sample": "DB_DATABASE=w4h-sample node app.js",
-    "test": "echo \"Error: no test specified\" && exit 0",
+    "test": "node --test 'lib/**/*.test.js'",
     "index:api": "node scripts/generate-api-index.mjs"
   },
   "license": "© USC IMSC 2026-",
