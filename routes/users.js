@@ -282,7 +282,7 @@ async function patchMyPreferences(req, res) {
   }
 }
 
-async function buildUserSessionInfo(user) {
+export async function buildUserSessionInfo(user) {
   const memberships = await getTeamMembershipsForUser(user.id);
   const teamIds = memberships.map((m) => m.team_id);
   return {

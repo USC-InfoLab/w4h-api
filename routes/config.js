@@ -9,7 +9,13 @@ import pkg from 'pg';
 const { Pool } = pkg;
 import db, { tableExists, USERS_TABLE_NAME, query } from '../db.js';
 import * as auth from '../auth.js';
-import { initializeDatabase, createInitialAdmin, hasAnyUsers } from '../lib/db-init.js';
+import bcrypt from 'bcrypt';
+import { initializeDatabase, createInitialAdmin, hasAnyUsers, insertUser } from '../lib/db-init.js';
+import { validatePassword } from '../lib/utils/password-validator.js';
+import { issueApiKeyForUser } from '../lib/utils/apiKeys.js';
+import { USER_ROLES } from '../lib/utils/user.js';
+import { insertTeamWithAdmin } from './teams.js';
+import { buildUserSessionInfo } from './users.js';
 import { getMailerConfig, isMailerConfigured, sendMail } from '../lib/mailer.js';
 import { normalizeClientUsageEvent, recordUsageEventSafe } from '../lib/utils/usage.js';
 import { writeAuditLog, writeAuditLogSafe } from '../lib/utils/audit.js';
@@ -127,6 +133,7 @@ router.get('/app-settings', auth.authenticate, auth.requirePlatformAdmin, getApp
 router.post('/app-settings', auth.authenticate, auth.requirePlatformAdmin, postAppSettings);
 router.post('/init-database', postInitDatabase);
 router.post('/admin-setup', postAdminSetup);
+router.post('/init-builtin', postInitBuiltin);
 router.get('/test', auth.authenticate, auth.requirePlatformAdmin, getTest);
 router.post('/reset', auth.authenticate, auth.requirePlatformAdmin, postReset);
 
@@ -136,7 +143,17 @@ export default router;
 // Handlers
 // ---------------------------------------------------------------------------
 
-const BUILTIN_PG_PASSWORD_FILE = '/run/secrets/pg_password';
+// Override only for tests outside Docker; the kit mounts the secret at the default path.
+const BUILTIN_PG_PASSWORD_FILE = process.env.W4H_BUILTIN_DB_PASSWORD_FILE || '/run/secrets/pg_password';
+const BUILTIN_SUPER_ADMIN_EMAIL = 'superadmin@w4h.local';
+const SAMPLE_NOTEBOOK = 'import_fitbit_csv.ipynb';
+const PACKAGE_VERSION = fs.readJsonSync(path.join(__dirname, '../package.json')).version;
+
+/** W4H version for recovery records and usage exports: package version + build commit. */
+export function appVersion() {
+  const commit = String(process.env.GIT_COMMIT || '').trim();
+  return commit && commit !== 'unknown' ? `${PACKAGE_VERSION}+${commit.slice(0, 7)}` : PACKAGE_VERSION;
+}
 
 /** ADR-031: the Docker kit mounts the generated Postgres password and names the `db` host. */
 function builtinAvailable() {
@@ -1730,6 +1747,157 @@ async function postInitDatabase(req, res) {
       details: errorMessage,
       code: error.code
     });
+  }
+}
+
+/**
+ * POST /config/init-builtin — ADR-031 §4 single-user bootstrap on the built-in database.
+ * Body: { name, email, password, load_samples }. Public only while no user exists.
+ * Creates, in one transaction: a Super admin with a random password, the person's account,
+ * and their team with them as Admin. Returns the recovery record ONCE; never logged.
+ */
+async function postInitBuiltin(req, res) {
+  res.set('Cache-Control', 'no-store');
+  const started = Date.now();
+  const name = String(req.body?.name || '').trim();
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  const loadSamples = !!req.body?.load_samples;
+
+  if (!builtinAvailable()) {
+    return res.status(400).json({ success: false, error: 'Built-in database is not available on this installation' });
+  }
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ success: false, error: 'name and a valid email are required' });
+  }
+  if (email === BUILTIN_SUPER_ADMIN_EMAIL) {
+    return res.status(400).json({ success: false, error: 'That email is reserved' });
+  }
+  const passwordCheck = validatePassword(password);
+  if (!passwordCheck.valid) {
+    return res.status(400).json({ success: false, error: passwordCheck.message });
+  }
+
+  // Refuse once any user exists (same rule as /config/admin-setup).
+  if (db.isConfigured()) {
+    try {
+      if ((await tableExists(USERS_TABLE_NAME)) && (await hasAnyUsers())) {
+        return res.status(409).json({ success: false, error: 'This installation is already set up' });
+      }
+    } catch {
+      /* not reachable yet — continue with built-in settings */
+    }
+  }
+
+  let dbPassword;
+  try {
+    dbPassword = (await fs.readFile(BUILTIN_PG_PASSWORD_FILE, 'utf8')).trim();
+  } catch (error) {
+    return res.status(500).json({ success: false, error: 'Cannot read the built-in database password', code: error.code });
+  }
+
+  const dbConfig = {
+    DB_HOST: process.env.W4H_BUILTIN_DB_HOST,
+    DB_PORT: '5432',
+    DB_DATABASE: 'w4h',
+    DB_USER: 'w4h',
+    DB_PASSWORD: dbPassword,
+    TOKEN_SECRET: process.env.TOKEN_SECRET || crypto.randomBytes(64).toString('hex'),
+    W4H_DB_MODE: 'builtin',
+  };
+  try {
+    await writeEnvValues(dbConfig);
+  } catch (error) {
+    return res.status(500).json({ success: false, error: envSaveError(error), code: error.code });
+  }
+
+  try {
+    await db.resetPool();
+    const initResult = await initializeDatabase();
+    if (!initResult.success) {
+      return res.status(500).json({ success: false, error: 'Database schema initialization failed', details: initResult.error });
+    }
+
+    const superAdminPassword = crypto.randomBytes(18).toString('base64url');
+    const rounds = +process.env.BCRYPT_ROUNDS || 12;
+    const client = await db.getPool().connect();
+    let superAdminId;
+    let personId;
+    let team;
+    try {
+      await client.query('BEGIN');
+      await client.query(`LOCK TABLE w4h.users IN EXCLUSIVE MODE`);
+      const count = await client.query(`SELECT COUNT(*)::int AS n FROM w4h.users`);
+      if (count.rows[0].n > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ success: false, error: 'This installation is already set up' });
+      }
+      const run = client.query.bind(client);
+      superAdminId = await insertUser(run, {
+        name: 'Super admin',
+        email: BUILTIN_SUPER_ADMIN_EMAIL,
+        hash: bcrypt.hashSync(superAdminPassword, rounds),
+        role: USER_ROLES.SUPER_ADMIN,
+      });
+      personId = await insertUser(run, {
+        name,
+        email,
+        hash: bcrypt.hashSync(password, rounds),
+        role: USER_ROLES.PROJECT_USER,
+      });
+      team = await insertTeamWithAdmin(run, { name: `${name}'s team`, userId: personId });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    // D-16a: personal API keys, best-effort like createInitialAdmin.
+    for (const id of [superAdminId, personId]) {
+      try {
+        await issueApiKeyForUser(id);
+      } catch (err) {
+        console.error('init-builtin: auto-issue API key failed:', err.message);
+      }
+    }
+
+    const session = await buildUserSessionInfo({ id: personId, name, email, role: USER_ROLES.PROJECT_USER });
+    session.token = auth.sign(session);
+
+    writeAuditLogSafe(req, {
+      userId: personId,
+      action: 'platform.bootstrap.single_user',
+      resourceType: 'user',
+      resourceId: String(personId),
+      details: { team_id: team.id, super_admin_id: superAdminId, load_samples: loadSamples },
+    });
+    recordUsageEventSafe({
+      userId: personId,
+      eventType: 'setup.complete',
+      durationMs: Date.now() - started,
+      metadata: { method: 'POST', route: '/config/init-builtin', status: 201 },
+    });
+
+    return res.status(201).json({
+      success: true,
+      recovery: {
+        super_admin_email: BUILTIN_SUPER_ADMIN_EMAIL,
+        super_admin_password: superAdminPassword,
+        db_user: dbConfig.DB_USER,
+        db_password: dbPassword,
+        version: appVersion(),
+        created_at: new Date().toISOString(),
+      },
+      session,
+      team: { id: team.id, name: team.name, slug: team.slug },
+      samples: loadSamples ? { requested: true, notebook: SAMPLE_NOTEBOOK } : { requested: false },
+    });
+  } catch (error) {
+    // Never echo the request body: it holds the person's password.
+    console.error('init-builtin error:', error.message);
+    return res.status(500).json({ success: false, error: 'Built-in setup failed', details: error.message });
   }
 }
 

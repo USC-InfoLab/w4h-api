@@ -71,6 +71,32 @@ async function ensureUniqueSlug(base) {
   }
 }
 
+/**
+ * Create a team and make `userId` its Admin (`team_admin`). `run` is `query` or a
+ * transaction client's bound `query` (used by built-in bootstrap, ADR-031 §4).
+ */
+export async function insertTeamWithAdmin(run, { name, slug, userId }) {
+  const uniqueSlug = await ensureUniqueSlug(slug || name);
+  const result = await run(
+    `INSERT INTO ${SCHEMA}.teams (slug, name)
+     VALUES ($1, $2)
+     RETURNING id, slug, name, status, created_at, updated_at`,
+    [uniqueSlug, name]
+  );
+  const team = result.rows[0];
+
+  // The creator owns the new team.
+  if (userId != null) {
+    await run(
+      `INSERT INTO ${SCHEMA}.team_members (team_id, user_id, role)
+       VALUES ($1::uuid, $2, $3)
+       ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [team.id, userId, TEAM_MEMBER_ROLES.TEAM_ADMIN]
+    );
+  }
+  return team;
+}
+
 async function listTeams(req, res) {
   if (!(await canManageTeamAsync(req.user))) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -129,26 +155,11 @@ async function createTeam(req, res) {
     if (!name) {
       return res.status(400).json({ error: 'name is required' });
     }
-    const slug = await ensureUniqueSlug(req.body?.slug || name);
-
-    const result = await query(
-      `INSERT INTO ${SCHEMA}.teams (slug, name)
-       VALUES ($1, $2)
-       RETURNING id, slug, name, status, created_at, updated_at`,
-      [slug, name]
-    );
-
-    const team = result.rows[0];
-
-    // The creator owns the new team.
-    if (req.user?.id != null) {
-      await query(
-        `INSERT INTO ${SCHEMA}.team_members (team_id, user_id, role)
-         VALUES ($1::uuid, $2, $3)
-         ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
-        [team.id, req.user.id, TEAM_MEMBER_ROLES.TEAM_ADMIN]
-      );
-    }
+    const team = await insertTeamWithAdmin(query, {
+      name,
+      slug: req.body?.slug,
+      userId: req.user?.id,
+    });
 
     res.status(201).json(team);
   } catch (error) {
