@@ -20,7 +20,7 @@ import { getMailerConfig, isMailerConfigured, sendMail } from '../lib/mailer.js'
 import { normalizeClientUsageEvent, recordUsageEventSafe } from '../lib/utils/usage.js';
 import { writeAuditLog, writeAuditLogSafe } from '../lib/utils/audit.js';
 import { envFilePath, envExamplePath } from '../lib/env-path.js';
-import { buildUsageExport, clampDays, toCsv } from '../lib/usage-export.js';
+import { buildUsageExport, clampDays, clampWindowEnd, toCsv } from '../lib/usage-export.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -125,9 +125,9 @@ router.get('/team-home', auth.authenticate, auth.requireTeamAdmin, getTeamHome);
 router.get('/usage', auth.authenticate, auth.requirePlatformAdmin, getUsage);
 router.get('/api-usage', auth.authenticate, auth.requirePlatformAdmin, getUsage); // legacy alias
 router.post('/client-usage', auth.authenticate, postClientUsage);
-// ADR-031 §7 pseudonymous export. Super admin only for now (G5: Admin team scoping pending).
-router.get('/usage-export', auth.authenticate, auth.requirePlatformAdmin, getUsageExport);
-router.post('/usage-export/send', auth.authenticate, auth.requirePlatformAdmin, postUsageExportSend);
+// ADR-031 §7 pseudonymous export: Super admin = platform, Admin = their teams (requireUsageExportScope).
+router.get('/usage-export', auth.authenticate, requireUsageExportScope, getUsageExport);
+router.post('/usage-export/send', auth.authenticate, requireUsageExportScope, postUsageExportSend);
 router.post('/report-issue', auth.authenticate, postReportIssue);
 router.get('/audit-log', auth.authenticate, getAuditLog);
 router.get('/database-settings', auth.authenticate, auth.requirePlatformAdmin, getDatabaseSettings);
@@ -171,6 +171,8 @@ function installFlags() {
     builtin_available: builtinAvailable(),
     db_mode: process.env.W4H_DB_MODE || null,
     mail_configured: isMailerConfigured(),
+    // Usage "Send to W4H team" needs mail and a TELEMETRY_TO mailbox; the address itself stays server-side.
+    telemetry_configured: isMailerConfigured() && !!String(process.env.TELEMETRY_TO || '').trim(),
   };
 }
 
@@ -608,46 +610,85 @@ async function getInstallId() {
   return id;
 }
 
-async function usageExportFile(daysInput, formatInput) {
+/**
+ * ADR-031 §7 scope: Super admin = whole platform; Admin (team_admin on >= 1 team) = events by
+ * members of the teams they administer (themselves included). Sets req.usageScope; else 403.
+ */
+async function requireUsageExportScope(req, res, next) {
+  try {
+    if (isSuperAdmin(req.user?.role)) {
+      req.usageScope = { scope: 'platform', teamIds: undefined };
+      return next();
+    }
+    const r = await query(
+      `SELECT team_id FROM w4h.team_members WHERE user_id = $1 AND role = 'team_admin'`,
+      [req.user?.id]
+    );
+    if (!r.rows.length) {
+      return res.status(403).json({ success: false, error: 'Access denied. Team admin privileges required.' });
+    }
+    req.usageScope = { scope: 'teams', teamIds: r.rows.map((row) => row.team_id) };
+    return next();
+  } catch (error) {
+    console.error('requireUsageExportScope error:', error);
+    return res.status(500).json({ error: 'Failed to check export access' });
+  }
+}
+
+async function usageExportFile({ days: daysInput, format: formatInput, windowEnd }, { teamIds }) {
   const days = clampDays(daysInput);
   const format = formatInput === 'csv' ? 'csv' : 'json';
   const installId = await getInstallId();
-  const { meta, rows } = await buildUsageExport({
+  const { meta, columns, rows } = await buildUsageExport({
     days,
+    end: clampWindowEnd(windowEnd),
     installId,
     version: appVersion(),
     dbMode: process.env.W4H_DB_MODE || null,
     tokenSecret: process.env.TOKEN_SECRET,
+    teamIds,
   });
   const date = new Date().toISOString().slice(0, 10);
   return {
-    days,
+    format,
     meta,
     filename: `w4h-usage-${installId.slice(0, 8)}-${date}.${format}`,
     contentType: format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json',
-    body: format === 'csv' ? toCsv(meta, rows) : JSON.stringify({ meta, rows }, null, 2),
+    body: format === 'csv' ? toCsv(meta, rows) : JSON.stringify({ meta, columns, rows }, null, 2),
   };
 }
 
-/** GET /config/usage-export?days=N&format=csv|json — pseudonymous usage download (ADR-031 §7). */
+const exportAuditDetails = (file) => ({
+  row_count: file.meta.row_count,
+  scope: file.meta.scope,
+  window: file.meta.window,
+  format: file.format,
+});
+
+/** GET /config/usage-export?days=N&format=csv|json&window_end=ISO — pseudonymous usage download (ADR-031 §7). */
 async function getUsageExport(req, res) {
   try {
-    const file = await usageExportFile(req.query.days, req.query.format);
-    writeAuditLogSafe(req, {
-      action: 'usage.exported',
-      resourceType: 'usage_events',
-      details: { row_count: file.meta.row_count, days: file.days },
-    });
+    const file = await usageExportFile(
+      { days: req.query.days, format: req.query.format, windowEnd: req.query.window_end },
+      req.usageScope
+    );
+    writeAuditLogSafe(req, { action: 'usage.exported', resourceType: 'usage_events', details: exportAuditDetails(file) });
     res.set('Content-Type', file.contentType);
     res.set('Content-Disposition', `attachment; filename="${file.filename}"`);
     res.send(file.body);
   } catch (error) {
+    if (error.status === 400) return res.status(400).json({ error: error.message });
     console.error('getUsageExport error:', error);
     res.status(500).json({ error: error.message || 'Failed to export usage' });
   }
 }
 
-/** POST /config/usage-export/send { days } — email the JSON export to TELEMETRY_TO. */
+/**
+ * POST /config/usage-export/send { days, format: csv|json, window_end, expected_row_count? } — email
+ * the export to TELEMETRY_TO. ADR-031 §7: the person previews exactly what is sent, so window_end
+ * (the preview's meta.window.to) is required, and expected_row_count (the preview's meta.row_count)
+ * refuses with 409 when the rows changed since the preview (members joined or left the team).
+ */
 async function postUsageExportSend(req, res) {
   const to = String(process.env.TELEMETRY_TO || '').trim();
   if (!isMailerConfigured() || !to) {
@@ -657,28 +698,37 @@ async function postUsageExportSend(req, res) {
         : 'Set up email in Settings to send usage data',
     });
   }
+  if (!req.body?.window_end) {
+    return res.status(400).json({ error: 'window_end is required: preview the export first and send its meta.window.to' });
+  }
   try {
-    const file = await usageExportFile(req.body?.days, 'json');
+    const file = await usageExportFile(
+      { days: req.body.days, format: req.body.format, windowEnd: req.body.window_end },
+      req.usageScope
+    );
+    const { meta } = file;
+    const expected = req.body.expected_row_count;
+    if (expected != null && Number(expected) !== meta.row_count) {
+      return res.status(409).json({ error: 'The usage data changed since the preview. Preview again before sending.' });
+    }
     await sendMail({
       to,
-      subject: `[W4H usage] ${file.meta.install_id.slice(0, 8)} ${file.meta.window_start.slice(0, 10)}..${file.meta.window_end.slice(0, 10)}`,
+      subject: `[W4H usage] ${meta.install_id.slice(0, 8)} ${meta.scope} ${meta.window.from.slice(0, 10)}..${meta.window.to.slice(0, 10)}`,
       text: [
         'Pseudonymous W4H usage export (ADR-031).',
-        `install_id: ${file.meta.install_id}`,
-        `version: ${file.meta.version}`,
-        `db_mode: ${file.meta.db_mode || ''}`,
-        `window: ${file.meta.window_start} .. ${file.meta.window_end}`,
-        `rows: ${file.meta.row_count}`,
+        `install_id: ${meta.install_id}`,
+        `version: ${meta.version}`,
+        `db_mode: ${meta.db_mode || ''}`,
+        `scope: ${meta.scope}`,
+        `window: ${meta.window.from} .. ${meta.window.to} (${meta.window.days} days)`,
+        `rows: ${meta.row_count}`,
       ].join('\n'),
       attachments: [{ filename: file.filename, content: file.body, contentType: file.contentType }],
     });
-    writeAuditLogSafe(req, {
-      action: 'usage.sent',
-      resourceType: 'usage_events',
-      details: { row_count: file.meta.row_count, days: file.days },
-    });
-    res.json({ sent: true, row_count: file.meta.row_count });
+    writeAuditLogSafe(req, { action: 'usage.sent', resourceType: 'usage_events', details: exportAuditDetails(file) });
+    res.json({ success: true, row_count: meta.row_count, format: file.format });
   } catch (error) {
+    if (error.status === 400) return res.status(400).json({ error: error.message });
     console.error('postUsageExportSend error:', error);
     res.status(500).json({ error: error.message || 'Failed to send usage' });
   }
@@ -1899,6 +1949,7 @@ async function postInitBuiltin(req, res) {
 let initBuiltinRunning = false;
 
 async function runInitBuiltin(req, res, { started, name, email, password, loadSamples }) {
+  const wasConfigured = db.isConfigured();
   // Refuse once any user exists (same rule as /config/admin-setup). Fail closed: a
   // configured but unreachable database must not let an anonymous caller re-point it.
   if (db.isConfigured()) {
@@ -1934,8 +1985,8 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
     return res.status(500).json({ success: false, error: envSaveError(error), code: error.code });
   }
 
-  // Probe first with a timeout: db.js's pool has none, so an unreachable host would hang
-  // the request and hold the setup lock.
+  // Probe with its own short-lived pool before touching process.env or the shared pool, so an
+  // unreachable host fails this request in 10 s and releases the setup lock.
   const probe = new Pool({
     host: dbConfig.DB_HOST,
     port: Number(dbConfig.DB_PORT),
@@ -2014,8 +2065,28 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
       client.release();
     }
     if (alreadySetUp) {
-      await restoreEnv();
-      return res.status(409).json({ success: false, error: 'This installation is already set up' });
+      if (wasConfigured) {
+        await restoreEnv();
+        return res.status(409).json({ success: false, error: 'This installation is already set up' });
+      }
+      // The built-in DB already holds the accounts but the API had no DB settings: an
+      // earlier setup committed and then failed to save `.env`, and the API restarted.
+      // Re-save the built-in settings (same DB, nothing created or revealed) so sign-in works.
+      const warnings = [];
+      if (!previousEnv.TOKEN_SECRET) {
+        warnings.push('A new TOKEN_SECRET was saved: existing API keys must be re-issued (Profile, API keys)');
+      }
+      try {
+        await writeEnvValues(dbConfig);
+      } catch (error) {
+        warnings.push(`${envSaveError(error)}. Sign-in works now, but the API will lose its database settings on restart`);
+        console.error('init-builtin (self-heal): saving settings failed:', error);
+      }
+      return res.status(409).json({
+        success: false,
+        error: 'This installation is already set up. Sign in.',
+        ...(warnings.length ? { warning: warnings.join('. ') } : {}),
+      });
     }
 
     // Persist the built-in settings now that the install is real. On failure the API keeps
@@ -2042,6 +2113,7 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
     let session = null;
     try {
       session = await buildUserSessionInfo({ id: personId, name, email, role: USER_ROLES.PROJECT_USER });
+      session.firstTimeLogin = true; // same as /config/admin-setup (A2)
       session.token = auth.sign(session);
     } catch (err) {
       console.error('init-builtin: session build failed (person can sign in normally):', err.message);
@@ -2058,10 +2130,10 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
       userId: personId,
       eventType: 'setup.complete',
       durationMs: Date.now() - started,
-      metadata: { method: 'POST', route: '/config/init-builtin', status: 201 },
+      metadata: { method: 'POST', route: '/config/init-builtin', status: 200 },
     });
 
-    return res.status(201).json({
+    return res.status(200).json({
       success: true,
       recovery: {
         super_admin_email: BUILTIN_SUPER_ADMIN_EMAIL,
@@ -2072,7 +2144,6 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
         created_at: new Date().toISOString(),
       },
       session,
-      team: { id: team.id, name: team.name, slug: team.slug },
       samples: loadSamples ? { requested: true, notebook: SAMPLE_NOTEBOOK } : { requested: false },
       ...(envWarning ? { warning: envWarning } : {}),
     });

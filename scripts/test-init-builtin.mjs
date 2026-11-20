@@ -10,7 +10,7 @@
  *
  * Row counts need W4H_TEST_PSQL (see below).
  *
- * Asserts: first call 201 with a recovery record; second call refused (409);
+ * Asserts: first call 200 with a recovery record; second call refused (409);
  * exactly 2 users (Super admin + the person); the person is team_admin of one team;
  * the recovery password signs in; .env is mode 600 with W4H_DB_MODE=builtin;
  * the plain passwords never appear in the api log.
@@ -35,7 +35,7 @@ async function call(method, path, body, token) {
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* not JSON */ }
-  return { status: res.status, json, text };
+  return { status: res.status, json, text, headers: res.headers };
 }
 
 const person = {
@@ -51,13 +51,17 @@ assert.equal(status.json.builtin_available, true, 'builtin_available must be tru
 assert.equal(status.json.requiresAdminSetup || !status.json.configured, true, 'install must be fresh');
 
 const first = await call('POST', '/config/init-builtin', person);
-assert.equal(first.status, 201, `init-builtin failed: ${first.text}`);
+assert.equal(first.status, 200, `init-builtin failed: ${first.text}`);
 const { recovery, session, samples } = first.json;
 assert.equal(recovery.super_admin_email, 'superadmin@w4h.local');
 assert.ok(recovery.super_admin_password?.length >= 20, 'random Super admin password');
 assert.ok(recovery.db_password, 'db password in recovery record');
 assert.ok(session.token, 'session token');
 assert.equal(samples.notebook, 'import_fitbit_csv.ipynb');
+assert.equal(first.json.team, undefined, 'no top-level team field (contract)');
+assert.equal(session.firstTimeLogin, true, 'session.firstTimeLogin (A2)');
+assert.equal(first.json.success, true);
+assert.match(first.headers.get('cache-control') || '', /no-store/);
 const memberships = session.team_memberships || [];
 assert.equal(memberships.length, 1, 'person is on exactly one team');
 assert.equal(memberships[0].role, 'team_admin', 'person is Admin of their team');
@@ -108,6 +112,49 @@ if (LOG_FILE) {
   assert.ok(!log.includes(person.password), 'person password leaked to log');
 } else {
   console.log('skip: W4H_TEST_LOG_FILE not set (password-in-log check)');
+}
+
+// F6 self-heal: accounts exist but `.env` lost its DB settings (an earlier write failed,
+// then the api restarted). Kit: W4H_TEST_RESTART_API='docker compose restart api'.
+const RESTART = process.env.W4H_TEST_RESTART_API || '';
+async function restartApi() {
+  execSync(RESTART, { stdio: 'ignore' });
+  for (let i = 0; i < 60; i++) {
+    try { if ((await fetch(`${BASE}/config/status`)).ok) return; } catch { /* starting */ }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error('api did not come back after restart');
+}
+if (RESTART && ENV_FILE) {
+  const keep = fs.readFileSync(ENV_FILE, 'utf8').split('\n').filter((l) => !/^(DB_|W4H_DB_MODE=)/.test(l));
+  fs.writeFileSync(ENV_FILE, keep.join('\n'));
+  await restartApi();
+  const lost = (await call('GET', '/config/status')).json;
+  assert.equal(lost.configured, false);
+  assert.equal(lost.db_mode, null);
+  const heal = await call('POST', '/config/init-builtin', { ...person, email: `heal-${person.email}` });
+  assert.equal(heal.status, 409, heal.text);
+  assert.match(heal.json.error, /Sign in/);
+  assert.equal(heal.json.recovery, undefined, 'self-heal reveals nothing');
+  assert.equal(heal.json.session, undefined);
+  const healed = (await call('GET', '/config/status')).json;
+  assert.equal(healed.configured, true, 'settings live again without a restart');
+  assert.equal(healed.db_mode, 'builtin');
+  const env = fs.readFileSync(ENV_FILE, 'utf8');
+  assert.match(env, /^DB_PASSWORD=/m);
+  assert.match(env, /^W4H_DB_MODE=builtin$/m);
+  assert.equal(fs.statSync(ENV_FILE).mode & 0o777, 0o600);
+  if (PSQL) {
+    const sql = (q) => execSync(`${PSQL} ${JSON.stringify(q)}`, { encoding: 'utf8' }).trim();
+    assert.equal(sql('SELECT count(*) FROM w4h.users'), '2', 'self-heal creates nothing');
+    assert.equal(sql('SELECT count(*) FROM w4h.teams'), '1');
+  }
+  await restartApi();
+  const relog = await call('POST', '/users/login', { email: person.email, password: person.password });
+  assert.ok(relog.json?.token, 'settings were saved, not only kept in memory');
+  console.log('OK — self-heal: 409 Sign in, nothing revealed or created, .env restored and survives restart');
+} else {
+  console.log('skip: W4H_TEST_RESTART_API not set (self-heal check)');
 }
 
 console.log('OK — init-builtin: recovery once, refused twice, 2 users, team_admin, recovery login, env 600');

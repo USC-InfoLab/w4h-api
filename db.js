@@ -52,6 +52,9 @@ function createPool() {
     database: process.env.DB_DATABASE,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
+    // Fail in 10 s instead of waiting forever (pg default) for a connection: covers a database
+    // that is down and also a pool whose clients (max 10) are all busy with long jobs.
+    connectionTimeoutMillis: 10000,
   };
 
   if (process.env.W4H_DEBUG) {
