@@ -69,13 +69,30 @@ function applyValuesToTemplate(templateContent, mergedValues, templateKeys) {
     if (!Object.prototype.hasOwnProperty.call(mergedValues, key)) continue;
     const value = mergedValues[key] ?? '';
     const lineRe = new RegExp(`^${key}=.*$`, 'm');
-    out = out.replace(lineRe, `${key}=${value}`);
+    // Replacer function: a `$` in the value must not act as a replacement pattern.
+    out = out.replace(lineRe, () => `${key}=${value}`);
   }
 
   return out;
 }
 
-async function writeEnvValues(keyValues) {
+// One write at a time: each call reads `.env`, merges and writes it back, so overlapping
+// calls would drop each other's keys on disk.
+let envWriteQueue = Promise.resolve();
+function writeEnvValues(keyValues) {
+  const run = envWriteQueue.then(() => writeEnvValuesNow(keyValues));
+  envWriteQueue = run.catch(() => {});
+  return run;
+}
+
+function envQuote(value) {
+  const v = String(value ?? '');
+  if (!/[#'"`\s\\]/.test(v)) return v;
+  const q = ["'", '`', '"'].find((c) => !v.includes(c));
+  return q ? `${q}${v}${q}` : v;
+}
+
+async function writeEnvValuesNow(keyValues) {
   if (!(await fs.pathExists(ENV_EXAMPLE_PATH))) {
     throw new Error(`Missing ${path.basename(ENV_EXAMPLE_PATH)} — cannot preserve formatting`);
   }
@@ -87,7 +104,10 @@ async function writeEnvValues(keyValues) {
     ? parseEnvValues(await fs.readFile(ENV_PATH, 'utf8'))
     : {};
 
-  const mergedValues = { ...existingValues, ...keyValues };
+  // Existing values pass through as written; new ones are quoted when dotenv would cut them
+  // (`#` starts a comment in an unquoted value, e.g. a database password).
+  const quotedNew = Object.fromEntries(Object.entries(keyValues).map(([k, v]) => [k, envQuote(v)]));
+  const mergedValues = { ...existingValues, ...quotedNew };
 
   // Rewrite `.env` from `.env.example` to guarantee stable ordering/comments
   let out = applyValuesToTemplate(template, mergedValues, templateKeys);
@@ -95,14 +115,16 @@ async function writeEnvValues(keyValues) {
   // If callers pass keys not present in the template, append them.
   const missingKeys = Object.keys(keyValues).filter(k => !templateKeys.includes(k));
   if (missingKeys.length) {
-    const extra = missingKeys.map(k => `${k}=${keyValues[k] ?? ''}`).join('\n');
+    const extra = missingKeys.map(k => `${k}=${quotedNew[k]}`).join('\n');
     out = out.trimEnd() + `\n${extra}\n`;
   }
 
-  // Holds DB_PASSWORD / TOKEN_SECRET: owner-only. `mode` applies on create only, so chmod too.
-  // chmod first so an existing 644 file never holds the new secrets world-readable.
-  if (await fs.pathExists(ENV_PATH)) await fs.chmod(ENV_PATH, 0o600);
-  await fs.writeFile(ENV_PATH, out.trimEnd() + '\n', { mode: 0o600 });
+  // Holds DB_PASSWORD / TOKEN_SECRET: owner-only. Write a temp file and rename it over `.env`,
+  // so a failed or interrupted write never leaves `.env` empty or half written.
+  const tmp = `${ENV_PATH}.tmp`;
+  await fs.writeFile(tmp, out.trimEnd() + '\n', { mode: 0o600 });
+  await fs.chmod(tmp, 0o600);
+  await fs.rename(tmp, ENV_PATH);
 
   // Keep runtime env in sync for keys we just changed
   Object.keys(keyValues).forEach((key) => {
@@ -1916,7 +1938,8 @@ async function postInitBuiltin(req, res) {
   res.set('Cache-Control', 'no-store');
   const started = Date.now();
   const name = String(req.body?.name || '').trim();
-  const email = String(req.body?.email || '').trim().toLowerCase();
+  // Stored as typed, like admin-setup: POST /users/login matches the email exactly.
+  const email = String(req.body?.email || '').trim();
   const password = String(req.body?.password || '');
   const loadSamples = !!req.body?.load_samples;
 
@@ -1926,7 +1949,7 @@ async function postInitBuiltin(req, res) {
   if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ success: false, error: 'name and a valid email are required' });
   }
-  if (email === BUILTIN_SUPER_ADMIN_EMAIL) {
+  if (email.toLowerCase() === BUILTIN_SUPER_ADMIN_EMAIL) {
     return res.status(400).json({ success: false, error: 'That email is reserved' });
   }
   const passwordCheck = validatePassword(password);
@@ -1980,7 +2003,8 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
   };
   // Fail early if `.env` can't be saved: it is written only after the accounts commit.
   try {
-    await fs.access(fs.existsSync(ENV_PATH) ? ENV_PATH : path.dirname(ENV_PATH), fs.constants.W_OK);
+    // writeEnvValues writes a temp file and renames it: the folder must be writable.
+    await fs.access(path.dirname(ENV_PATH), fs.constants.W_OK);
   } catch (error) {
     return res.status(500).json({ success: false, error: envSaveError(error), code: error.code });
   }
@@ -1998,6 +2022,16 @@ async function runInitBuiltin(req, res, { started, name, email, password, loadSa
   try {
     await probe.query('SELECT 1');
   } catch (error) {
+    // 28P01: the w4h_pgdata volume was created by an earlier install with another
+    // secrets/pg_password (e.g. the kit folder was deleted and unzipped again). Retrying never helps.
+    if (error.code === '28P01') {
+      return res.status(500).json({
+        success: false,
+        error: 'The built-in database belongs to an earlier W4H install on this computer (its password is not '
+          + 'this folder\'s secrets/pg_password). Put back that install\'s secrets/ and data/ folders.',
+        details: error.message,
+      });
+    }
     return res.status(503).json({ success: false, error: 'The built-in database is not reachable yet. Wait a moment and try again.', details: error.message });
   } finally {
     await probe.end().catch(() => {});

@@ -18,6 +18,7 @@ import { recordUsageEventSafe } from '../lib/utils/usage.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { decryptUserApiKey } from '../lib/utils/apiKeyCrypto.js';
 import { issueApiKeyForUser } from '../lib/utils/apiKeys.js';
+import { forgetNotebookKey } from '../lib/utils/notebook-key.js';
 import {
   USER_ROLES,
   USER_ROLES_NAMES,
@@ -413,6 +414,7 @@ async function discontinueUser(req, res) {
        WHERE id = $1`,
       [target.id]
     );
+    forgetNotebookKey(target.id);
 
     // Invalidate any unused invite tokens so the account cannot be activated while discontinued.
     await query(
@@ -628,6 +630,7 @@ async function revokeMyApiKey(req, res) {
        WHERE id = $1`,
       [req.user.id]
     );
+    forgetNotebookKey(req.user.id);
     writeAuditLogSafe(req, {
       action: 'user.api_key.revoke',
       resourceType: 'user',
@@ -660,6 +663,7 @@ async function revokeUserApiKeyByEmail(req, res) {
     if (!result.rowCount) {
       return res.status(404).json({ error: 'User not found' });
     }
+    forgetNotebookKey(result.rows[0].id);
     res.json({ success: true });
   } catch (error) {
     console.error('revokeUserApiKeyByEmail:', error);

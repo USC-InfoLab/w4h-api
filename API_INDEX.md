@@ -3,7 +3,7 @@
 Structural map of `w4h-api` for agents and humans. **Index only** — not API docs.
 
 - Regenerate: `npm run index:api`
-- Generated: 2026-11-20
+- Generated: 2026-11-21
 - Do not hand-edit the lists below; change code, then re-run the script.
 
 ## Orientation
@@ -51,12 +51,12 @@ Unmounted route modules: `routes/data.js`, `routes/subjects.js`
 - **`/ai`:** GET `/ai/status` · GET `/ai/settings/platform` · PATCH `/ai/settings/platform` · GET `/ai/settings/team/:teamId` · PATCH `/ai/settings/team/:teamId` · GET `/ai/conversations` · POST `/ai/conversations` · GET `/ai/conversations/:id` · PATCH `/ai/conversations/:id` · DELETE `/ai/conversations/:id` · POST `/ai/chat`
 - **`/access-requests`:** POST `/access-requests/` · POST `/access-requests/verify` · GET `/access-requests/count` · GET `/access-requests/` · POST `/access-requests/:id/fulfill` · POST `/access-requests/:id/decline` · POST `/access-requests/:id/spam`
 
-## Lib (48)
+## Lib (50)
 
 - `lib/`: `access-requests.js`, `cohort-analytics.js`, `config.js`, `contribution-inputs.js`, `contribution-runner.js`, `contribution-uploads.js`, `contributions-manifest.js`, `contributions-versions.js`, `contributions.js`, `dataset-metadata-summary.js`, `dataset-mets-summary.js`, `dataset-summary-refresh.js`, `dataset-wear-summary.js`, `db-init.js`, `docs-mermaid-render.js`, `env-path.js`, `github-client.js`, `ingest-csv.js`, `invitations.js`, `mailer.js`, `reports.js`, `seed-docs-fixtures.js`, `sql-contribution-engine.js`, `sql-ident.js`, `sql-ident.test.js`, `usage-export.js`, `usage-export.test.js`, `viz-display.js`, `viz-queries.js`
 - `lib/ai/`: `claude.js`, `conversations.js`, `keys.js`, `phi.js`, `prompt.js`
 - `lib/middleware/`: `projectDbTokenAuth.js`
-- `lib/utils/`: `apiKeyCrypto.js`, `apiKeys.js`, `audit.js`, `datasetProjectLinkColumn.js`, `defs.js`, `docs.js`, `md-paths.js`, `md-render.js`, `page-html.js`, `password-validator.js`, `usage.js`, `usage.test.js`, `user.js`
+- `lib/utils/`: `apiKeyCrypto.js`, `apiKeys.js`, `audit.js`, `datasetProjectLinkColumn.js`, `defs.js`, `docs.js`, `md-paths.js`, `md-render.js`, `notebook-key.js`, `notebook-key.test.js`, `page-html.js`, `password-validator.js`, `usage.js`, `usage.test.js`, `user.js`
 
 ## Schema tables (31)
 

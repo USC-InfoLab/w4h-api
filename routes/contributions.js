@@ -9,7 +9,7 @@ import {
   deleteContribution,
   presentContribution,
 } from '../lib/contributions.js';
-import { startContributionRun, getContributionRun } from '../lib/contribution-runner.js';
+import { startContributionRun, getContributionRun, pythonRunUnavailable } from '../lib/contribution-runner.js';
 import { assertCanIngestDataset } from '../lib/ingest-csv.js';
 import {
   createUpload, loadUpload, saveUploadFile, deleteUploadFile, listUploadFiles, removeUpload,
@@ -213,6 +213,8 @@ async function createUploadRoute(req, res) {
     if (!contribution?.runnable || !acceptsFileUpload(contribution.slug)) {
       return res.status(404).json({ error: 'This contribution does not accept uploaded files' });
     }
+    const unavailable = pythonRunUnavailable();
+    if (unavailable) return res.status(unavailable.status).json({ error: unavailable.error });
     const access = await assertCanIngestDataset(req.user, datasetId);
     if (!access.ok) return res.status(access.status).json({ error: access.error });
     const { id } = createUpload({ user: req.user, slug: contribution.slug, datasetId });
