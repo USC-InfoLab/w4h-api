@@ -29,6 +29,7 @@ import ai from './routes/ai.js';
 import accessRequests from './routes/access-requests.js';
 import { isConfigured } from './db.js';
 import { ensureSchema } from './lib/db-init.js';
+import { reapOrphanedRuns } from './lib/contribution-runner.js';
 import { attachApiKeyUsageLogger } from './lib/utils/usage.js';
 
 const app = express();
@@ -70,6 +71,12 @@ app.listen(process.env.PORT, async () => {
       console.log('✓ Database schema ensured');
     } catch (err) {
       console.warn('⚠ Schema ensure skipped/failed:', err.message);
+    }
+    // ponytail: assumes one API process; scope by instance if the API ever runs replicated
+    try {
+      await reapOrphanedRuns();
+    } catch (err) {
+      console.warn('⚠ Orphaned contribution run reap skipped/failed:', err.message);
     }
   }
 });
