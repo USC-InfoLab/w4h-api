@@ -22,8 +22,12 @@ import {
 } from '../lib/contributions-versions.js';
 import { writeAuditLogSafe } from '../lib/utils/audit.js';
 import { acceptsFileUpload, fileInputForSlug } from '../lib/contribution-inputs.js';
+import { loadDelegateModules } from '../lib/contribution-delegate.js';
 
 const router = express.Router();
+
+// In Docker the runner's /modules holds each importer's contribution.yaml; a no-op without CONTRIBUTION_RUNNER_URL.
+router.use((req, res, next) => { loadDelegateModules().then(() => next(), next); });
 
 function requireSuperAdmin(req, res, next) {
   if (!isSuperAdmin(req.user?.role)) {
