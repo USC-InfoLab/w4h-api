@@ -32,6 +32,7 @@ import { ensureSchema } from './lib/db-init.js';
 import { reapOrphanedRuns } from './lib/contribution-runner.js';
 import { attachApiKeyUsageLogger } from './lib/utils/usage.js';
 
+const BOOTED_AT = new Date();
 const app = express();
 app.use(cors());
 
@@ -74,7 +75,7 @@ app.listen(process.env.PORT, async () => {
     }
     // ponytail: assumes one API process; scope by instance if the API ever runs replicated
     try {
-      await reapOrphanedRuns();
+      await reapOrphanedRuns({ before: BOOTED_AT });
     } catch (err) {
       console.warn('⚠ Orphaned contribution run reap skipped/failed:', err.message);
     }

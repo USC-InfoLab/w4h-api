@@ -27,7 +27,7 @@ Agent playbook for the **Wearables for Health (W4H) Toolkit** HTTP API: Node.js 
 | Contributions catalog | `/contributions/*` | `lib/contributions.js`; seed rows + `runnable` flags in `data/schema.sql` |
 | Cohort / chart analytics | `/datasets/:id/analytics/*` | `lib/cohort-analytics.js`, `lib/viz-queries.js` |
 
-Because the runner and SQL engine read sibling folders (`CONTRIBUTION_RUNNER_REPO_ROOT`, default `..`), in-app Run only works when contribution repos can live next to this checkout, and on a host with Python. The Docker image has no Python, so in-app Run of importers there is designed but not built (ADR-022, MVP D-31).
+Because the runner and SQL engine read sibling folders (`CONTRIBUTION_RUNNER_REPO_ROOT`, default `..`), in-app Run only works when contribution repos can live next to this checkout, and on a host with Python. The Docker image has no Python, so there `CONTRIBUTION_RUNNER_URL` is set (to `http://runner:8890`) and `startContributionRun` delegates importer runs to the runner service (`lib/contribution-delegate.js`): file inputs come from the runner's `GET /modules`, and the runner pulls the upload files via `GET /contributions/uploads/:uploadId/file`. Unset means the local `run.sh` spawn above (ADR-022, MVP D-31).
 
 ## Table of contents
 
