@@ -12,7 +12,7 @@ import {
 import { startContributionRun, getContributionRun, pythonRunUnavailable } from '../lib/contribution-runner.js';
 import { assertCanIngestDataset } from '../lib/ingest-csv.js';
 import {
-  createUpload, loadUpload, saveUploadFile, deleteUploadFile, listUploadFiles, removeUpload,
+  createUpload, loadUpload, saveUploadFile, deleteUploadFile, listUploadFiles, removeUpload, sendUploadFile,
   MAX_FILES, MAX_FILE_SIZE_BYTES, MAX_TOTAL_SIZE_BYTES,
 } from '../lib/contribution-uploads.js';
 import { inspectRepository } from '../lib/contributions-manifest.js';
@@ -59,6 +59,8 @@ router.post('/:slug/update-version', authenticate, requireSuperAdmin, updateVers
 // Admin-chosen files for importers that take them: stage, then run with upload_id.
 router.post('/:slug/uploads', authenticateJwtOrApiKey, (req, res) => createUploadRoute(req, res));
 router.get('/uploads/:uploadId', authenticateJwtOrApiKey, (req, res) => getUploadRoute(req, res));
+// The importer runner pulls each staged file with the uploader's own API key.
+router.get('/uploads/:uploadId/file', authenticateJwtOrApiKey, (req, res) => getUploadFileRoute(req, res));
 router.put('/uploads/:uploadId/body', authenticateJwtOrApiKey, (req, res) => putUploadBody(req, res));
 router.put('/uploads/:uploadId/files/:name', authenticateJwtOrApiKey, (req, res) => putUploadFile(req, res));
 router.delete('/uploads/:uploadId/files/:name', authenticateJwtOrApiKey, (req, res) => deleteUploadFileRoute(req, res));
@@ -243,6 +245,10 @@ function withUpload(handler) {
 
 const getUploadRoute = withUpload(async (_req, res, upload) => {
   res.json({ files: listUploadFiles(upload.dir) });
+});
+
+const getUploadFileRoute = withUpload(async (req, res, upload) => {
+  sendUploadFile(res, upload.dir, req.query.name);
 });
 
 const putUploadFile = withUpload(async (req, res, upload) => {
